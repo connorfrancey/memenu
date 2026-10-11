@@ -1,0 +1,259 @@
+#include "game.h"
+
+#include <Windows.h>
+
+#include <MinHook.h>
+#include <spdlog/spdlog.h>
+#include <mirrorsedge_sdk.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace {
+    std::atomic<bool> g_ready{false};
+    std::atomic<bool> g_loading{false};
+    std::atomic<unsigned long long> g_ticks{0};
+    std::atomic<bool> g_hasPawn{false};
+    std::atomic<int> g_health{0}, g_maxHealth{0};
+
+    std::mutex g_mutex;     // Guards the two vectors below
+    std::vector<game::TickCallback> g_tickCallbacks;
+    std::vector<std::function<void()>> g_queue;
+
+    // Cached lookups, game thread only. Cleared whenever a level starts loading.
+    Classes::AWorldInfo* g_world      = nullptr;
+    Classes::ATdPlayerController* g_controller = nullptr;
+
+    void (__thiscall *oTick)(float*, int, float) = nullptr;
+    int  (__thiscall *oLevelLoad)(void*, void*, unsigned long long) = nullptr;
+
+    // ---- Pattern scan over the main executable's image ----
+    // Pattern/mask as used by mmultiplayer: 'x' = byte must match, '?' = wildcard.
+    void* FindPattern(const char* pattern, const char* mask)
+    {
+        const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        const std::size_t imageSize = nt->OptionalHeader.SizeOfImage;
+        const std::size_t len = std::strlen(mask);
+
+        for (std::size_t off = 0; off + len <= imageSize;) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(base + off, &mbi, sizeof mbi)) break;
+
+            const auto regionStart = static_cast<std::size_t>(static_cast<std::uint8_t*>(mbi.BaseAddress) - base);
+            const std::size_t regionEnd = regionStart + mbi.RegionSize;
+            const bool readable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+
+            if (readable) {
+                for (std::size_t i = off; i + len <= regionEnd; ++i) {
+                    bool match = true;
+                    for (std::size_t j = 0; j < len && match; ++j)
+                        match = mask[j] != 'x' || base[i + j] == static_cast<std::uint8_t>(pattern[j]);
+                    if (match) return base + i;
+                }
+            }
+            off = regionEnd;
+        }
+        return nullptr;
+    }
+
+    // ---- Hooks ------------------------------------------------------------------
+    void DrainQueue()
+    {
+        std::vector<std::function<void()>> work;
+        {
+            std::lock_guard lock(g_mutex);
+            work.swap(g_queue);
+        }
+        for (auto& fn : work) fn();
+    }
+
+    void UpdateStatus()
+    {
+        const auto pawn = game::Pawn();
+        if ((pawn != nullptr) != g_hasPawn.load())
+            spdlog::info(pawn ? "Player pawn found" : "Player pawn lost");
+        g_hasPawn = pawn != nullptr;
+        if (pawn)
+        {
+            g_health = pawn->Health;
+            g_maxHealth = pawn->MaxHealth;
+        }
+    }
+
+    void __fastcall TickHook(float* scales, void* /*edx*/, int arg, float delta)
+    {
+        ++g_ticks;
+        if (!g_loading)
+        {
+            // Look the world/controller up every tick (lazily, on first use): a respawn or level restart can
+            // replace them without going through the level-load hook, and a stale pointer would be a crash.
+            g_world = nullptr;
+            g_controller = nullptr;
+
+            DrainQueue();
+
+            std::vector<game::TickCallback> callbacks;
+            {
+                std::lock_guard lock(g_mutex);
+                callbacks = g_tickCallbacks;
+            }
+            for (auto cb : callbacks) cb(delta);
+
+            if (g_ticks % 15 == 0) UpdateStatus();
+        }
+        oTick(scales, arg, delta);
+    }
+
+    int __fastcall LevelLoadHook(void* self, void* /*edx*/, void** levelInfo, unsigned long long arg)
+    {
+        g_loading = true;
+        g_world = nullptr;
+        g_controller = nullptr;
+        const int ret = oLevelLoad(self, levelInfo, arg);
+        g_loading = false;
+        return ret;
+    }
+
+    bool HookAt(void* target, void* detour, void** original, const char* what)
+    {
+        if (MH_CreateHook(target, detour, original) != MH_OK || MH_EnableHook(target) != MH_OK) {
+            spdlog::error("Could not hook {}", what);
+            return false;
+        }
+        return true;
+    }
+
+}
+
+bool game::Init()
+{
+    void* ptr = nullptr;
+
+    // These byte patterns identify the game's own code, so they only match the game version they were made for
+    // (copied verbatim from mmultiplayer's engine.cpp).
+    ptr = FindPattern(
+        "\x8B\x0D\x00\x00\x00\x00\x8B\x84\x24\x00"
+        "\x00\x00\x00\x8B\x04\x81",
+        "xx????xxx????xxx");
+    if (!ptr) { spdlog::error("GNames pattern not found: unsupported game version?"); return false; }
+    Classes::FName::GNames = reinterpret_cast<decltype(Classes::FName::GNames)>(
+        *reinterpret_cast<void**>(static_cast<std::uint8_t*>(ptr) + 2));
+
+    ptr = FindPattern(
+        "\x8B\x15\x00\x00\x00\x00\x8B\x0C\xB2\x8D\x44\x24\x30",
+        "xx????xxxxxxx");
+    if (!ptr) { spdlog::error("GObjects pattern not found: unsupported game version?"); return false; }
+    Classes::UObject::GObjects = reinterpret_cast<decltype(Classes::UObject::GObjects)>(
+        *reinterpret_cast<void**>(static_cast<std::uint8_t*>(ptr) + 2));
+
+    spdlog::info("SDK globals: GNames={} entries, GObjects={} objects",
+                 Classes::FName::GetGlobalNames().Num(), Classes::UObject::GetGlobalObjects().Num());
+
+    ptr = FindPattern(
+        "\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x81\xEC"
+        "\x00\x00\x00\x00\x53\x55\x56\x57\xA1\x00\x00\x00\x00\x33\xC4\x50"
+        "\x8D\x84\x24\x00\x00\x00\x00\x64\xA3\x00\x00\x00\x00\x8B\xE9\x89"
+        "\x6C\x24\x00\x00\xFF\x89",
+        "???????xxxxxxxxx?xxxxxxxx????xxxxxx?xxxxxxxxxxxxxx??xx");
+    if (!ptr) { spdlog::error("LevelLoad pattern not found"); return false; }
+    if (!HookAt(ptr, reinterpret_cast<void*>(&LevelLoadHook), reinterpret_cast<void**>(&oLevelLoad), "LevelLoad")) return false;
+
+    ptr = FindPattern(
+        "\x83\xEC\x48\x53\x55\x56\x57\x8B\xF9\xE8\x00\x00\x00\x00\x8B\x0D"
+        "\x00\x00\x00\x00\x8B\x15\x00\x00\x00\x00\x8B\xE8",
+        "xxxxxxxxxx????xx????xx????xx");
+    if (!ptr) { spdlog::error("Tick pattern not found"); return false; }
+    if (!HookAt(ptr, reinterpret_cast<void*>(&TickHook), reinterpret_cast<void**>(&oTick), "Tick")) return false;
+
+    g_ready = true;
+    spdlog::info("Game integration ready");
+    return true;
+}
+
+void game::Shutdown()
+{
+    // The queue is drained by the game's tick; give it a moment so modules can undo their changes.
+    for (int i = 0; i < 100; ++i) {
+        {
+            std::lock_guard lock(g_mutex);
+            if (g_queue.empty()) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    g_ready = false;
+}
+
+game::Status game::GetStatus()
+{
+    Status s;
+    s.ready = g_ready;
+    s.loading = g_loading;
+    s.hasPawn = g_hasPawn;
+    s.health = g_health;
+    s.maxHealth = g_maxHealth;
+    s.ticks = g_ticks;
+    return s;
+}
+
+bool game::Ready()     { return g_ready; }
+bool game::IsLoading() { return g_loading; }
+
+void game::OnTick(TickCallback callback)
+{
+    std::lock_guard lock(g_mutex);
+    g_tickCallbacks.push_back(callback);
+}
+
+void game::RunOnGameThread(std::function<void()> fn)
+{
+    if (!g_ready) return;                // Nothing would ever run it
+    std::lock_guard lock(g_mutex);
+    g_queue.push_back(std::move(fn));
+}
+
+// ---- Lookups ----
+Classes::ATdPlayerController* game::Controller()
+{
+    if (!g_ready || g_loading) return nullptr;
+
+    if (!g_controller) {
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        for (std::size_t i = 0; i < objects.Num() && !g_controller; ++i) {
+            const auto object = objects.GetByIndex(i);
+            if (!object || !object->IsA(Classes::AWorldInfo::StaticClass())) continue;
+
+            const auto world = static_cast<Classes::AWorldInfo*>(object);
+            for (auto c = world->ControllerList; c; c = c->NextController) {
+                if (!c->IsA(Classes::ATdPlayerController::StaticClass())) continue;
+                const auto pc = static_cast<Classes::ATdPlayerController*>(c);
+                if (!pc->PlayerCamera) break;                 // Level not fully set up yet
+                g_world = world;
+                g_controller = pc;
+                break;
+            }
+        }
+    }
+
+    return g_controller;
+}
+
+Classes::AWorldInfo* game::World()
+{
+    Controller();
+    return g_world;
+}
+
+Classes::ATdPlayerPawn* game::Pawn()
+{
+    const auto controller = Controller();
+    if (!controller || !controller->AcknowledgedPawn) return nullptr;
+    if (!controller->AcknowledgedPawn->IsA(Classes::ATdPlayerPawn::StaticClass())) return nullptr;
+    return static_cast<Classes::ATdPlayerPawn*>(controller->AcknowledgedPawn);
+}

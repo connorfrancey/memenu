@@ -17,6 +17,9 @@
 namespace {
     std::atomic<bool> g_ready{false};
     std::atomic<bool> g_loading{false};
+    std::atomic<bool> g_blockInput{false};      // Menu open: ignore look input
+    std::atomic<bool> g_inputApplied{false};    // We currently own the controller's bIgnoreLookInput
+    bool g_prevIgnoreLook = false;
     std::atomic<unsigned long long> g_ticks{0};
     std::atomic<bool> g_hasPawn{false};
     std::atomic<int> g_health{0}, g_maxHealth{0};
@@ -74,6 +77,26 @@ namespace {
         for (auto& fn : work) fn();
     }
 
+    // Game thread. Sets the controller's bIgnoreLookInput while the menu is open and puts the old value back after.
+    void ApplyInputBlock()
+    {
+        const bool want = g_blockInput;
+        if (!want && !g_inputApplied) return;   // Nothing to do, don't even look the controller up
+
+        auto* pc = game::Controller();
+        if (!pc) return;    // Retry next tick
+
+        if (want)
+        {
+            if (!g_inputApplied) { g_prevIgnoreLook = pc->bIgnoreLookInput != 0; g_inputApplied = true; }
+            pc->bIgnoreLookInput = 1;   // Re-applied every tick: a level change replaces the controller
+        } else
+        {
+            pc->bIgnoreLookInput = g_prevIgnoreLook ? 1 : 0;
+            g_inputApplied = false;
+        }
+    }
+
     void UpdateStatus()
     {
         const auto pawn = game::Pawn();
@@ -98,6 +121,7 @@ namespace {
             g_controller = nullptr;
 
             DrainQueue();
+            ApplyInputBlock();
 
             std::vector<game::TickCallback> callbacks;
             {
@@ -187,7 +211,15 @@ void game::Shutdown()
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+
+    g_blockInput = false;   // Let the tick hook hand the controller its look input back
+    for (int i = 0; i < 40 && g_inputApplied; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     g_ready = false;
+}
+
+void game::SetInputBlocked(bool blocked)
+{
+    g_blockInput = blocked;
 }
 
 game::Status game::GetStatus()

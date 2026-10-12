@@ -10,9 +10,9 @@ struct Module;
 
 // One control inside a module's expanded panel.
 struct Setting {
-    enum class Type { Bool, Float, Int, Combo, Color, Key, Button, Label, Separator };
+    enum class Type { Bool, Float, Int, Combo, Color, Key, Button, Label, Separator, Custom };
 
-    Type        type = Type::Bool;
+    Type type = Type::Bool;
     std::string name;
     std::string tooltip;
 
@@ -23,7 +23,7 @@ struct Setting {
     std::vector<std::string> options;         // Combo
     std::array<float, 4> color{1.f, 1.f, 1.f, 1.f};   // Color (RGBA)
 
-    bool persist = true;                      // saved to / loaded from the config file
+    bool persist = true;                      // Saved to / loaded from the config file
 
     // Combo whose options/selection live elsewhere (e.g. the theme list). When set, `options` and
     // `i` are ignored and the control is never saved.
@@ -32,13 +32,16 @@ struct Setting {
     std::function<void(int)>                  setIndex;
 
     std::function<void(Module&)> onClick;     // Button click | Key press (fires while module is on)
-    std::function<void(Module&)> onChange;    // any value change made through the GUI
-    std::function<bool(Module&)> visibleIf;   // hide the control when this returns false
+    std::function<void(Module&)> onChange;    // Any value change made through the GUI
+    std::function<bool(Module&)> visibleIf;   // Hide the control when this returns false
+
+    // Custom: draws arbitrary ImGui context (e.g. a dynamic list of buttons). `width` is the usable width.
+    std::function<void(Module&, float width)> draw;
 };
 
 struct Module {
     std::string name, description;
-    bool isAction = false;          // true: row is a button (runs onClick) instead of a toggle
+    bool isAction = false;          // True: row is a button (runs onClick) instead of a toggle
     bool enabledByDefault = false;
     bool enabled = false;
     int  key = 0;                   // VK code of the module hotkey, 0 = unbound
@@ -46,12 +49,12 @@ struct Module {
 
     std::function<void(Module&)> onEnable;
     std::function<void(Module&)> onDisable;
-    std::function<void(Module&)> onTick;     // every frame while enabled (game-side logic)
-    std::function<void(Module&)> onRender;   // every frame while enabled, inside the ImGui frame (HUD)
-    std::function<void(Module&)> onClick;    // action modules
+    std::function<void(Module&)> onTick;     // Every frame while enabled (game-side logic)
+    std::function<void(Module&)> onRender;   // Every frame while enabled, inside the ImGui frame (HUD)
+    std::function<void(Module&)> onClick;    // Action modules
 
     // GUI state
-    bool  expanded = false;
+    bool expanded = false;
     float anim = 0.f, hover = 0.f;
 
     void SetEnabled(bool v)
@@ -61,6 +64,7 @@ struct Module {
         const auto& cb = v ? onEnable : onDisable;
         if (cb) cb(*this);
     }
+
     void Toggle()
     {
         if (isAction) { if (onClick) onClick(*this); }
@@ -86,26 +90,27 @@ struct Module {
         if (!s || s->i < 0 || s->i >= static_cast<int>(s->options.size())) return {};
         return s->options[static_cast<size_t>(s->i)];
     }
-    bool KeyDown(std::string_view n);   // is the key bound to Key setting `n` currently held?
+    bool KeyDown(std::string_view n);   // Is the key bound to Key setting `n` currently held?
 };
 
 struct Tab {
     std::string name;
+    float width = 200.f;
     std::vector<std::unique_ptr<Module>> modules;
 };
 
 namespace modules {
     std::vector<std::unique_ptr<Tab>>& Tabs();
-    Tab&    AddTab(std::string name);          // returns the existing tab if the name is taken
-    Module* Find(std::string_view name);       // first module with this name, any tab
+    Tab&    AddTab(std::string name);          // Returns the existing tab if the name is taken
+    Module* Find(std::string_view name);       // First module with this name, any tab
 
     template <class F>
     void ForEachModule(F&& f) { for (auto& t : Tabs()) for (auto& m : t->modules) f(*t, *m); }
 
-    void Init();            // defined in definitions.cpp: builds the whole menu
-    void ApplyDefaults();   // turns on modules flagged enabledByDefault (call after Init, before config load)
+    void Init();            // Defined in definitions.cpp: builds the whole menu
+    void ApplyDefaults();   // Turns on modules flagged enabledByDefault (call after Init, before config load)
     void Tick();            // onTick of enabled modules
     void Render();          // onRender of enabled modules
-    void OnKey(int vk);     // module hotkeys + Key-setting callbacks
-    void DisableAll();      // call on unload so modules can undo their changes
+    void OnKey(int vk);     // Module hotkeys + Key-setting callbacks
+    void DisableAll();      // Call on unload so modules can undo their changes
 }

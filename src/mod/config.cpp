@@ -16,7 +16,7 @@ static std::filesystem::path ConfigPath() { return paths::Dir() / "MedgeMenu.jso
 static bool Persistent(const Setting& s)
 {
     if (!s.persist) return false;
-    return s.type != Setting::Type::Button && s.type != Setting::Type::Label && s.type != Setting::Type::Separator;
+    return s.type != Setting::Type::Button && s.type != Setting::Type::Label && s.type != Setting::Type::Separator && s.type != Setting::Type::Custom;
 }
 
 // Keyed by "Tab/Module" so equal module names in different tabs don't collide.
@@ -29,15 +29,15 @@ static json ToJson(const Setting& s)
 {
     switch (s.type)
     {
-    case Setting::Type::Bool:  return s.b;
-    case Setting::Type::Float: return Round(s.f);
-    case Setting::Type::Color:
+        case Setting::Type::Bool:  return s.b;
+        case Setting::Type::Float: return Round(s.f);
+        case Setting::Type::Color:
         {
             json a = json::array();
             for (float c : s.color) a.push_back(Round(c));
             return a;
         }
-    default:                   return s.i;   // Int, Combo, Key
+        default: return s.i;   // Int, Combo, Key
     }
 }
 
@@ -100,13 +100,16 @@ bool config::Load()
                     if (Persistent(s))
                         if (const auto v = sj->find(s.name); v != sj->end()) FromJson(s, *v);
             }
+
             // After the settings, so onEnable sees them
             if (const auto e = mi->find("enabled"); e != mi->end() && e->is_boolean()) m.SetEnabled(e->get<bool>());
         });
 
         spdlog::info("Config loaded");
         return true;
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e)
+        {
         spdlog::error("Config error: {}", e.what());
         return false;
     }
@@ -115,7 +118,8 @@ bool config::Load()
 bool config::Save()
 {
     json mods = json::object();
-    modules::ForEachModule([&](Tab& t, Module& m) {
+    modules::ForEachModule([&](Tab& t, Module& m)
+    {
         json settings = json::object();
         for (const auto& s : m.settings)
             if (Persistent(s)) settings[s.name] = ToJson(s);
@@ -132,7 +136,8 @@ bool config::Save()
     root["modules"] = std::move(mods);
 
     std::ofstream out(ConfigPath());
-    if (!out) {
+    if (!out)
+    {
         spdlog::error("Cannot write config to {}", ConfigPath().string());
         return false;
     }

@@ -2,7 +2,8 @@
 #include <Windows.h>
 #include <filesystem>
 
-namespace paths {
+namespace paths
+{
     inline std::filesystem::path g_dir;
 
     // Remember the folder the DLL lives in (log + config are stored there).

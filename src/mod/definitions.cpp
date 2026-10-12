@@ -4,6 +4,7 @@
 #include "builder.h"
 #include "config.h"
 #include "game/game.h"
+#include "game/levels.h"
 #include "theme.h"
 
 #include <Windows.h>
@@ -14,6 +15,49 @@
 #include <imgui.h>
 
 namespace {
+
+// Level list: one collapsible header per level, with a button for the start of the level and one per checkpoint.
+void DrawLevelList(Module& m, float width)
+{
+    const auto method = m.GetBool("Console load") ? levels::Method::Console : levels::Method::Game;
+    const bool save = m.GetBool("Save progress");
+
+    const auto maps = levels::Maps();
+    if (maps.empty()) { ImGui::TextDisabled("No maps yet"); return; }
+
+    for (int i = 0; i < static_cast<int>(maps.size()); ++i) {
+        const auto& map = maps[static_cast<size_t>(i)];
+        ImGui::PushID(i);
+        if (ImGui::CollapsingHeader(map.label.c_str())) {
+            if (ImGui::Button("Start of level", {width, 0.f})) levels::Load(i, 0, method, save);
+            for (int j = 0; j < static_cast<int>(map.checkpoints.size()); ++j) {
+                ImGui::PushID(j);
+                if (ImGui::Button(map.checkpoints[static_cast<size_t>(j)].c_str(), {width, 0.f}))
+                    levels::Load(i, j + 1, method, save);
+                ImGui::PopID();
+            }
+        }
+        ImGui::PopID();
+    }
+}
+
+// Sublevel list: name button toggles load + show / unload, the small button toggles visibility.
+void DrawSublevelList(Module&, float width)
+{
+    const auto subs = levels::Sublevels();
+    if (subs.empty()) { ImGui::TextDisabled("No sublevels (open a level)"); return; }
+
+    constexpr float kToggleW = 54.f, kGap = 4.f;
+    for (size_t i = 0; i < subs.size(); ++i) {
+        const auto& s = subs[i];
+        ImGui::PushID(static_cast<int>(i));
+        const std::string label = s.name + (s.loaded ? " [L]" : "") + (s.visible ? " [V]" : "");
+        if (ImGui::Button(label.c_str(), {width - kToggleW - kGap, 0.f})) levels::ToggleSublevelLoaded(s.name);
+        ImGui::SameLine(0.f, kGap);
+        if (ImGui::Button(s.visible ? "Hide" : "Show", {kToggleW, 0.f})) levels::ToggleSublevelVisible(s.name);
+        ImGui::PopID();
+    }
+}
 
 ImU32 ToU32(const std::array<float, 4>& c)
 {
@@ -148,6 +192,27 @@ void modules::Init()
             })
 
     // ---------------------------------------------------------------------------------------
+    .tab("Levels").tabWidth(280.f)
+        // Click a level's header to open it, then click "Start of level" or a checkpoint to load it. Maps and
+        // checkpoints come from the game's own level-select data; loads use the same StartGame() the menu does.
+        .action("Levels", "Left click: refresh the lists. Click a level below to load it", [](Module&) { levels::Refresh(); })
+            .startExpanded()
+            .custom("Level list", DrawLevelList)
+            .checkbox("Console load", false)
+                .tooltip("Use the console command 'open <map>' instead of the game's StartGame. Ignores checkpoints")
+            .checkbox("Save progress", false)
+                .tooltip("Let loads made here overwrite your saved checkpoint progress")
+
+        .action("Restart Checkpoint", "Reload from the last checkpoint", [](Module&) { levels::RestartFromLastCheckpoint(); })
+        .action("Main Menu", "Quit to the main menu", [](Module&) { levels::QuitToMainMenu(); })
+
+        .action("Sublevels", "Streaming sublevels of this level. Left click: refresh the list", [](Module&) { levels::Refresh(); })
+            .startExpanded()
+            .custom("Sublevel list", DrawSublevelList)
+            .label("Name button: load + show / unload. Show/Hide button: visibility. [L] loaded, [V] visible. "
+                   "Streaming volumes can override these.")
+
+    // ---------------------------------------------------------------------------------------
     .tab("Misc")
         .module("Watermark", "Small text in the bottom-left corner")
             .slider("Opacity", 0.6f, 0.1f, 1.f)
@@ -174,6 +239,12 @@ void modules::Init()
                 ImDrawList* dl = ImGui::GetBackgroundDrawList();
                 dl->AddText({11.f, 31.f}, IM_COL32(0, 0, 0, 200), line);
                 dl->AddText({10.f, 30.f}, st.ready ? IM_COL32(120, 230, 120, 255) : IM_COL32(255, 110, 100, 255), line);
+
+                const std::string msg = levels::LastMessage();     // result of the last level/sublevel action
+                if (!msg.empty()) {
+                    dl->AddText({11.f, 47.f}, IM_COL32(0, 0, 0, 200), msg.c_str());
+                    dl->AddText({10.f, 46.f}, IM_COL32(230, 230, 230, 255), msg.c_str());
+                }
             })
 
         .action("Themes", "Left click: reload theme files from disk",
@@ -188,6 +259,6 @@ void modules::Init()
                 .tooltip("Theme files live in the themes/ folder next to the DLL")
             .button("Open themes folder", [](Module&) { theme::OpenFolder(); })
 
-        .action("Save Config", "Write settings to MedgeMenu.json", [](Module&) { config::Save(); })
-        .action("Load Config", "Reload settings from MedgeMenu.json", [](Module&) { config::Load(); });
+        .action("Save Config", "Write settings to MirrorsEdgeMenu.json", [](Module&) { config::Save(); })
+        .action("Load Config", "Reload settings from MirrorsEdgeMenu.json", [](Module&) { config::Load(); });
 }

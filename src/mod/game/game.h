@@ -38,6 +38,10 @@ namespace game {
     };
     Status GetStatus();
 
+    // While blocked, the local player's look input is ignored (menu open). Restored when unblocked and on Shutdown().
+    // This also covers gamepad sticks; mouse/keyboard messages are filtered separately in hooks.cpp.
+    void SetInputBlocked(bool blocked);
+
     bool Ready();                       // SDK globals resolved and hooks installed
     bool IsLoading();                   // A level is being loaded
 

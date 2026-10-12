@@ -31,6 +31,14 @@ public:
         return *this;
     }
 
+    Builder& tabWidth(float width)
+    {
+        assert(tab_ && "call tab() first");
+        tab_->width = width;
+        return *this;
+
+    }
+
     Builder& module(std::string name, std::string description = {})
     {
         assert(tab_ && "call tab() before module()");
@@ -53,7 +61,8 @@ public:
 
     // ---- Module Options --------------------------------------------------------------------
     Builder& enabledByDefault(bool v = true) { cur().enabledByDefault = v; return *this; }
-    Builder& hotkey(int vk)                  { cur().key = vk; return *this; }
+    Builder& startExpanded(bool v = true) { cur().expanded = v; return *this; }
+    Builder& hotkey(int vk) { cur().key = vk; return *this; }
     Builder& onEnable (std::function<void(Module&)> f) { cur().onEnable  = std::move(f); return *this; }
     Builder& onDisable(std::function<void(Module&)> f) { cur().onDisable = std::move(f); return *this; }
     Builder& onTick   (std::function<void(Module&)> f) { cur().onTick    = std::move(f); return *this; }
@@ -120,6 +129,14 @@ public:
     {
         auto& s = add(Setting::Type::Button, std::move(name));
         s.onClick = std::move(onClick);
+        return *this;
+    }
+    // Whatever `draw` renders inside the module's panel, every frame (not saved). `width` is the usable width.
+    Builder& custom(std::string name, std::function<void(Module&, float width)> draw)
+    {
+        auto& s = add(Setting::Type::Custom, std::move(name));
+        s.draw = std::move(draw);
+        s.persist = false;
         return *this;
     }
     Builder& label(std::string text)               { add(Setting::Type::Label, std::move(text)); return *this; }

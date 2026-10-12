@@ -3,12 +3,12 @@
 
 #include "config.h"
 #include "game/game.h"
+#include "game/levels.h"
 #include "hooks.h"
 #include "log.h"
 #include "modules.h"
 #include "paths.h"
 #include "theme.h"
-
 
 static DWORD WINAPI MainThread(LPVOID module)
 {
@@ -25,9 +25,14 @@ static DWORD WINAPI MainThread(LPVOID module)
     {
         // Module logic runs on the game thread through the engine tick; the menu itself stays on the render thread.
         if (game::Init())
+        {
             game::OnTick([](float) { modules::Tick(); });
+            levels::Init();
+        }
         else
+        {
             spdlog::error("Game integration unavailable: the menu works, game modules do nothing");
+        }
 
         while (!(GetAsyncKeyState(VK_END) & 1))
             Sleep(50);

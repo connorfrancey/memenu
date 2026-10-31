@@ -56,4 +56,4 @@ include(cmake/Libraries.cmake)
 
 # -------------------------------------------------------------------------------------------------
 # Launcher (injects the DLL into the game)
-#add_subdirectory(launcher)
+add_subdirectory(launcher)

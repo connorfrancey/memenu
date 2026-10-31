@@ -39,7 +39,8 @@ if(imgui_ADDED)
             ${imgui_SOURCE_DIR}
             ${imgui_SOURCE_DIR}/backends
     )
-    target_link_libraries(imgui PUBLIC d3d9)
+    # dwmapi: imgui_impl_win32 links it with #pragma comment(lib), which MinGW ignores
+    target_link_libraries(imgui PUBLIC d3d9 dwmapi)
 endif()
 
 # spdlog
@@ -76,7 +77,9 @@ if(imjson_ADDED)
                 "check where imjson.cpp lives in the repo and adjust the glob in cmake/Libraries.cmake")
     endif()
     add_library(imjson STATIC ${imjson_SOURCES})
-    target_include_directories(imjson PUBLIC ${imjson_SOURCE_DIR}/include)
+    # imjson includes <imgui/imgui.h>, but the imgui target exposes its root (<imgui.h>): forward it
+    file(WRITE ${CMAKE_BINARY_DIR}/imjson_compat/imgui/imgui.h "#pragma once\n#include \"${imgui_SOURCE_DIR}/imgui.h\"\n")
+    target_include_directories(imjson PUBLIC ${imjson_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/imjson_compat)
     target_link_libraries(imjson PUBLIC imgui nlohmann_json::nlohmann_json)
 endif()
 
@@ -97,36 +100,31 @@ target_link_directories(${PROJECT_NAME} PRIVATE
 
 # mmultiplayer
 
-# mmultiplayer's Mirror's Edge 1.0 SDK (softsoundd/mmultiplayer, Client/sdk): generated Unreal Engine 3
-# classes/structs for the game. It is MSVC-only (it uses __thiscall in templates).
-# The repo has no license file: keep it in third_party/ (git-ignored) or let CPM download it, never commit it.
-if(NOT MSVC)
-    message(FATAL_ERROR "The mmultiplayer SDK only builds with MSVC. Use the x86-debug / x86-release presets.")
-endif()
+# Mirror's Edge 1.0 SDK from the connorfrancey/mmultiplayer fork (Client/sdk): generated Unreal Engine 3
+# classes/structs for the game, as the CMake target me_sdk (alias mirrorsedge::sdk, header <ME_SDK.hpp>).
+# It builds with MSVC and MinGW (cmake/mingw-i686.cmake) and exposes only the sdk/ folder, as SYSTEM
+# includes (no warnings from it). Only Client/sdk is added, not the fork's own client DLL and launcher.
+# To build against a local checkout instead: -DCPM_mmultiplayer_SOURCE=/path/to/mmultiplayer
+# GIT_TAG is pinned to a main commit (merge of sdk-cmake) for reproducible builds.
+CPMAddPackage(
+        NAME mmultiplayer
+        GITHUB_REPOSITORY connorfrancey/mmultiplayer
+        GIT_TAG 7b1eb25ddc0fc1ce498d024e7b2f9d1980b9eca3
+        SOURCE_SUBDIR Client/sdk
+        OPTIONS 
+            "ME_SDK_BUILD_DOCS ON"
+)
 
-set(MMP_DIR "${CMAKE_SOURCE_DIR}/third_party/mmultiplayer" CACHE PATH
-        "Extracted softsoundd/mmultiplayer repo (the folder that contains Client/). Downloaded with CPM if missing.")
-if(NOT EXISTS "${MMP_DIR}/Client/sdk/ME_Basic.cpp")
-    message(STATUS "mmultiplayer SDK not found in ${MMP_DIR}, downloading it with CPM")
-    CPMAddPackage(NAME mmultiplayer GITHUB_REPOSITORY softsoundd/mmultiplayer GIT_TAG 2.5.2 DOWNLOAD_ONLY YES)
-    set(MMP_DIR "${mmultiplayer_SOURCE_DIR}")
-endif()
-
-file(GLOB MMP_SDK_SOURCES CONFIGURE_DEPENDS ${MMP_DIR}/Client/sdk/*.cpp)
-add_library(me_sdk STATIC ${MMP_SDK_SOURCES})
-target_compile_options(me_sdk PRIVATE /w /bigobj /MP)
-
-# Expose only one forwarding header instead of the whole Client/ folder (it also contains an old bundled
-# ImGui, hook.h, menu.h, ... that must not shadow ours). Warnings from the SDK headers are silenced.
-file(WRITE ${CMAKE_BINARY_DIR}/me_sdk_include/mirrorsedge_sdk.h
-        "#pragma once\n#pragma warning(push, 0)\n#include \"${MMP_DIR}/Client/sdk.h\"\n#pragma warning(pop)\n")
-target_include_directories(me_sdk INTERFACE ${CMAKE_BINARY_DIR}/me_sdk_include)
-
-
+# Catch2
+CPMAddPackage(
+    NAME catch2
+    GITHUB_REPOSITORY catchorg/Catch2
+    GIT_TAG v3.16.1
+)
 
 # -------------------------------------------------------------------------------------------------
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-        imgui imjson minhook d3d9 shell32 spdlog::spdlog nlohmann_json::nlohmann_json d3dx9 me_sdk)
+        imgui imjson minhook d3d9 shell32 spdlog::spdlog nlohmann_json::nlohmann_json d3dx9 me_sdk catch2)
 
 # -------------------------------------------------------------------------------------------------

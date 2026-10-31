@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.2)
 project(medge_menu LANGUAGES C CXX)
-set(MEMENU_VERSION "0.1.0")   # Shown by the installer, stamped into the loader
+set(MEMENU_VERSION "2.0.0")   # Shown by the installer, stamped into the loader
 
 # -------------------------------------------------------------------------------------------------
 # Platform Guards (Mirror's Edge is a 32-bit Windows process)

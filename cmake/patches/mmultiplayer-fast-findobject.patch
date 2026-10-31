@@ -1,0 +1,47 @@
+--- a/Client/sdk/ME_Core_classes.hpp	2026-10-31 14:41:38.849905000 -0600
++++ b/Client/sdk/ME_Core_classes.hpp	2026-10-31 14:41:38.931270700 -0600
+@@ -55,9 +55,44 @@
+ 
+ 	std::string GetFullName() const;
+ 
++	// Index of `shortName` in the global name table, -1 if it isn't there. Compares the wide strings in place: FNameEntry::GetName()
++	// builds a std::string through a std::locale on every call, far too slow to do for every name.
++	static int FindNameIndex(const std::string& shortName)
++	{
++		auto& names = FName::GetGlobalNames();
++		for (auto i = 0u; i < names.Num(); ++i)
++		{
++			const auto entry = names[i];
++			if (entry == nullptr) continue;
++			const wchar_t* w = entry->GetWideName();
++			std::size_t k = 0;
++			while (k < shortName.size() && w[k] == static_cast<wchar_t>(static_cast<unsigned char>(shortName[k]))) ++k;
++			if (k == shortName.size() && w[k] == L'\0') return static_cast<int>(i);
++		}
++		return -1;
++	}
++
+ 	template<typename T>
+ 	static T* FindObject(const std::string& name)
+ 	{
++		// Fast path: only objects whose own name is the last part of `name` ("Class Package.Outer.Name") get their full name
++		// built. Building it for every object took up to a second for each new lookup (every SDK function looks itself up
++		// on its first call).
++		const auto cut = name.find_last_of(". ");
++		const int nameIndex = FindNameIndex(cut == std::string::npos ? name : name.substr(cut + 1));
++		if (nameIndex >= 0)
++		{
++			for (auto i = 0u; i < GetGlobalObjects().Num(); ++i)
++			{
++				auto object = GetGlobalObjects().GetByIndex(i);
++				if (object != nullptr && object->Name.Index == nameIndex && object->GetFullName() == name)
++				{
++					return static_cast<T*>(object);
++				}
++			}
++		}
++
++		// Names with a number suffix ("Foo_2") are stored as "Foo" + number: compare full names
+ 		for (auto i = 0u; i < GetGlobalObjects().Num(); ++i)
+ 		{
+ 			auto object = GetGlobalObjects().GetByIndex(i);

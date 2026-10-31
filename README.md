@@ -287,7 +287,7 @@ uv run memenu game-test       # run the menu's self-test inside Mirror's Edge
 ```
 
 `build.bat [debug|release] [clean] [options]` is a shortcut for `memenu build` that also works without uv (with
-Python, click and rich installed). The DLL ends up in `build/medge_menu.dll`. The build folders are
+Python 3.11+ and the packages from `python -m pip install -r requirements.txt`). The DLL ends up in `build/medge_menu.dll`. The build folders are
 `cmake-build-x86-<config>`.
 
 A typical loop: edit, `uv run memenu build`, start the game, `uv run memenu launch` (or `install-game` once and just

@@ -57,6 +57,37 @@ namespace cache
 	class Value 
 	{
 	public:
+		// `ttlSeconds` is only used by Scope::Timed.
+		Value(std::string name, Scope scope, double ttlSeconds = 0.0)
+			: stats_(&Register(std::move(name), scope)), scope_(scope), ttl_(clk::FromSeconds(ttlSeconds)) {}
+
+		// The cached value, recomputed with `compute()` (returns a T) when it went stale.
+		template <class F>
+		const T& Get(F&& compute)
+		{
+			if (Fresh())
+			{
+				stats_->hits.fetch_add(1, std::memory_order_relaxed);
+				return value_;
+			}
+			const clk::Ticks t0 = clk::Now();
+			value_ = std::forward<F>(compute)();
+			const clk::Ticks t1 = clk::Now();
+			stamp_ = Stamp(t1);
+			valid_ = true;
+			stats_->misses.fetch_add(1, std::memory_order_relaxed);
+			stats_->computeTicks.fetch_add(t1 - t0, std::memory_order_relaxed);
+			return value_;
+		}
+
+		void Invalidate()
+		{
+			if (valid_) stats_->invalidations.fetch_add(1, std::memory_order_relaxed);
+			valid_ = false;
+		}
+
+		bool Valid() const { return valid_; }
+
 	private:
 		std::uint64_t Stamp(clk::Ticks now) const 
 		{
@@ -85,7 +116,7 @@ namespace cache
 		Scope scope_;
 		clk::Ticks ttl_;
 		bool valid_ = false;
-		std::uint64_t stamp = 0;
+		std::uint64_t stamp_ = 0;
 		T value_{};
 	};
 }

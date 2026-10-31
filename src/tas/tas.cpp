@@ -10,7 +10,7 @@
 #include <Windows.h>
 #include <timeapi.h>
 
-#include <mirrorsedge_sdk.h>
+#include <ME_SDK.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -401,7 +401,7 @@ void Begin(Mode mode)
         for (std::size_t i = 0; i < g_replay.names.size(); ++i) Resolve(static_cast<std::uint16_t>(i));
     }
     timeBeginPeriod(1);
-    game::SetInputBlockSuspended(true);
+    game::SetInputBlockedSuspended(true);
 
     {
         std::lock_guard lock(g_mutex);
@@ -447,7 +447,7 @@ void StopNow(const char* why)
     RestoreStreaming();
     engine::UseVirtualClock(false);
     timeEndPeriod(1);
-    game::SetInputBlockSuspended(false);
+    game::SetInputBlockedSuspended(false);
     SetMessage(why, true);
 }
 

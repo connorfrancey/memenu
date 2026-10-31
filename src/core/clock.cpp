@@ -31,7 +31,7 @@ namespace clk
 	
 	void Init() 
 	{
-		if (!InvariableTsc()) return;
+		if (!InvariantTsc()) return;
 		// Calibrate against the system clock over ~20 ms (good to ~0.01%).
 		const Ticks s0 = SystemTime(), t0 = __rdtsc();
 		Sleep(20);

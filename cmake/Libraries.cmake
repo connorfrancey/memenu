@@ -125,6 +125,6 @@ CPMAddPackage(
 # -------------------------------------------------------------------------------------------------
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-        imgui imjson minhook d3d9 shell32 spdlog::spdlog nlohmann_json::nlohmann_json d3dx9 me_sdk catch2)
+        imgui imjson minhook d3d9 shell32 spdlog::spdlog nlohmann_json::nlohmann_json d3dx9 winmm me_sdk)
 
 # -------------------------------------------------------------------------------------------------

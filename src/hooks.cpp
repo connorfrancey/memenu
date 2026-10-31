@@ -1,6 +1,7 @@
 #include "hooks.h"
 #include "gui.h"
-#include "modules.h"
+#include "core/module.h"
+#include "render/debug_renderer.h"
 #include "paths.h"
 
 #include <Windows.h>
@@ -19,9 +20,12 @@ namespace
 {
     using EndScene_t = HRESULT(WINAPI*)(IDirect3DDevice9*);
     using Reset_t = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+    using StretchRect_t = HRESULT(WINAPI*)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*,
+                                           const RECT*, D3DTEXTUREFILTERTYPE);
 
     EndScene_t oEndScene = nullptr;
     Reset_t oReset = nullptr;
+    StretchRect_t oStretchRect = nullptr;
     WNDPROC oWndProc = nullptr;
     HWND g_hwnd = nullptr;
     bool g_imguiReady = false;
@@ -143,6 +147,9 @@ namespace
 
         // modules::Tick() runs on the game thread now (see game::OnTick in dllmain.cpp)
 
+        debugrender::BeginFrame(dev);   // Matrices for this frame (labels use them too)
+        debugrender::Render(dev);       // Overlay path, when the in-scene pass did not draw
+
         ImGui_ImplDX9_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -152,16 +159,27 @@ namespace
         ImGui::EndFrame();
         ImGui::Render();
         ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+        debugrender::EndFrame();
 
         return oEndScene(dev);
     }
 
     HRESULT WINAPI HookedReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
     {
+        debugrender::OnLostDevice();
         if (g_imguiReady) ImGui_ImplDX9_InvalidateDeviceObjects();
         HRESULT hr = oReset(dev, pp);
         if (SUCCEEDED(hr) && g_imguiReady) ImGui_ImplDX9_CreateDeviceObjects();
         return hr;
+    }
+
+    // The engine resolves its scene color here, with the world's depth buffer still bound: the debug renderer draws
+    // into the frame at that point so the world hides what is behind it.
+    HRESULT WINAPI HookedStretchRect(IDirect3DDevice9* dev, IDirect3DSurface9* src, const RECT* srcRect,
+                                     IDirect3DSurface9* dst, const RECT* dstRect, D3DTEXTUREFILTERTYPE filter)
+    {
+        debugrender::OnStretchRect(dev, src, dst);
+        return oStretchRect(dev, src, srcRect, dst, dstRect, filter);
     }
 
     // Create a throwaway device just to read the IDirect3DDevice9 vtable.
@@ -214,9 +232,13 @@ bool hooks::Install()
         return false;
     }
 
-    constexpr int kReset = 16, kEndScene = 42;
+    constexpr int kReset = 16, kStretchRect = 34, kEndScene = 42;
     if (MH_CreateHook(vt[kEndScene], reinterpret_cast<void*>(&HookedEndScene), reinterpret_cast<void**>(&oEndScene)) != MH_OK) { spdlog::error("Hooking EndScene failed"); return false; }
     if (MH_CreateHook(vt[kReset], reinterpret_cast<void*>(&HookedReset), reinterpret_cast<void**>(&oReset)) != MH_OK) { spdlog::error("Hooking Reset failed"); return false; }
+
+    // Optional: only the collision view's in-scene drawing needs it (it falls back to an overlay).
+    if (MH_CreateHook(vt[kStretchRect], reinterpret_cast<void*>(&HookedStretchRect), reinterpret_cast<void**>(&oStretchRect)) != MH_OK)
+        spdlog::warn("Hooking StretchRect failed: the collision view will draw as an overlay");
 
     // Optional: without these the menu still works, but the game keeps reading the mouse while it is open.
     if (MH_CreateHookApi(L"user32", "PeekMessageW", reinterpret_cast<void*>(&HookedPeekMessageW), reinterpret_cast<void**>(&oPeekMessageW)) != MH_OK)
@@ -234,6 +256,7 @@ void hooks::Uninstall()
 {
     MH_DisableHook(MH_ALL_HOOKS);
     Sleep(250);     // Let in-flight hooked calls drain
+    debugrender::Shutdown();
     if (g_imguiReady)
     {
         SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(oWndProc));

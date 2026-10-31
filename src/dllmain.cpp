@@ -2,12 +2,15 @@
 #include <spdlog/spdlog.h>
 
 #include "config.h"
+#include "core/clock.h"
+#include "core/module.h"
+#include "core/scheduler.h"
 #include "game/game.h"
 #include "game/levels.h"
 #include "hooks.h"
 #include "log.h"
-#include "modules.h"
 #include "paths.h"
+#include "tas/tas.h"
 #include "theme.h"
 
 static DWORD WINAPI MainThread(LPVOID module)
@@ -16,10 +19,12 @@ static DWORD WINAPI MainThread(LPVOID module)
     logging::Init();
     spdlog::info("MirrorsEdgeMenu attached");
 
-    theme::Init();          // themes/ folder + built-in theme files
-    modules::Init();
-    modules::ApplyDefaults();   // modules flagged enabledByDefault
-    config::Load();             // saved state overrides the defaults
+    clk::Init();                // Before anything measures time (scheduler, caches)
+    theme::Init();              // themes/ folder + built-in theme files
+    modules::Init();            // Every module registered with MEM_MODULE
+    modules::ApplyDefaults();   // Modules flagged enabledByDefault
+    config::Load();             // Saved state overrides the defaults
+    sched::Init();              // Run order of the modules' OnTick
 
     if (hooks::Install())
     {
@@ -28,6 +33,7 @@ static DWORD WINAPI MainThread(LPVOID module)
         {
             game::OnTick([](float) { modules::Tick(); });
             levels::Init();
+            if (!tas::Init()) spdlog::warn("TAS unavailable: its patterns were not found");
         }
         else
         {
@@ -37,8 +43,8 @@ static DWORD WINAPI MainThread(LPVOID module)
         while (!(GetAsyncKeyState(VK_END) & 1))
             Sleep(50);
 
-        config::Save();         // save before DisableAll so the enabled state is kept
-        modules::DisableAll();  // modules queue their cleanup on the game thread...
+        config::Save();         // Save before DisableAll so the enabled state is kept
+        modules::DisableAll();  // Modules queue their cleanup on the game thread...
         game::Shutdown();       // ...which we wait for before the hooks go away
         hooks::Uninstall();
     }

@@ -1,7 +1,7 @@
 #include "core/module.h"
 #include "game/game.h"
 
-#include <mirrorsedge_sdk.h>
+#include <ME_SDK.hpp>
 
 namespace {
 

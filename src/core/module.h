@@ -107,12 +107,38 @@ namespace modules
 	using Factory = std::unique_ptr<Module> (*)();
 	void Register(Factory factory);
 	
-	template <class T>
-	struct Registrar 
+	// Declares a menu column: its position and width (features/tabs.cpp). Tabs only modules mention go last.
+	struct TabRegistrar
 	{
-		Registrar(std::string name, int order, float width);	
+		TabRegistrar(std::string name, int order, float width);
 	};
-	
+
 	// ---- Lifetime ------------------------------------------------------------------------------------------------------------------
-	
+	void Init();				// Creates every registered module and the tabs
+	void ApplyDefaults();		// Turns on modules flagged enabledByDefault (after Init, before the config is loaded)
+	void DisableAll();			// On unload, so modules can undo their changes
+
+	// ---- Per frame -----------------------------------------------------------------------------------------------------------------
+	void Tick();				// Game thread: runs the scheduler (OnTick of the enabled modules that are due)
+	void Render();				// Render thread: OnRender of enabled modules
+	void OnKey(int vk);			// Module hotkeys and control key bindings
+
+	// ---- Lookup --------------------------------------------------------------------------------------------------------------------
+	std::vector<std::unique_ptr<Tab>>& Tabs();
+	Module* Find(std::string_view name);	// By name, any tab
+
+	template <class F>
+	void ForEach(F&& f)
+	{
+		for (auto& tab : Tabs())
+			for (Module* m : tab->modules) f(*tab, *m);
+	}
 }
+
+// Registers a module class (default-constructible, derived from Module) with the menu. Use once per class, at namespace
+// scope in its own .cpp file.
+#define MEM_MODULE_CONCAT_(a, b) a##b
+#define MEM_MODULE_CONCAT(a, b) MEM_MODULE_CONCAT_(a, b)
+#define MEM_MODULE(T)                                                                                          \
+	[[maybe_unused]] const bool MEM_MODULE_CONCAT(kRegistered_, T) =                                       \
+		(::modules::Register([]() -> std::unique_ptr<Module> { return std::make_unique<T>(); }), true);

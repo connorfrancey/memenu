@@ -167,3 +167,272 @@ namespace sched
 		}
 	}
 }
+
+// ---- Public API (the state above lives in sched's anonymous namespace) -------------------------------------------------
+namespace sched
+{
+	namespace
+	{
+		std::atomic<std::uint64_t> g_tickCount{0};
+
+		float EffectiveInterval(const Entry& e)
+		{
+			return static_cast<float>(e.schedule.interval * Scale(e.schedule.priority));
+		}
+
+		void RecordRun(Entry& e, float us)
+		{
+			e.runs.fetch_add(1, std::memory_order_relaxed);
+			e.lastUs.store(us, std::memory_order_relaxed);
+			Ema(e.avgUs, us);
+			Max(e.maxUs, us);
+		}
+
+		// Tasks added with AddTask since the last tick join the run order. Game thread.
+		void AdoptPending()
+		{
+			std::lock_guard lock(g_mutex);
+			if (g_pending.empty()) return;
+			for (auto& e : g_pending) g_entries.push_back(std::move(e));
+			g_pending.clear();
+			BuildOrder();
+		}
+
+		void PushHistory(float workMs, float intervalMs)
+		{
+			const std::size_t pos = g_historyPos.load(std::memory_order_relaxed);
+			g_workHistory[pos % kHistory].store(workMs, std::memory_order_relaxed);
+			g_intervalHistory[pos % kHistory].store(intervalMs, std::memory_order_relaxed);
+			g_historyPos.store(pos + 1, std::memory_order_release);
+		}
+	}
+
+	void AddTask(std::string name, Schedule schedule, std::function<void()> run, std::function<bool()> needsUpdate)
+	{
+		auto e = std::make_unique<Entry>();
+		e->name = std::move(name);
+		e->schedule = std::move(schedule);
+		e->run = std::move(run);
+		e->needsUpdate = std::move(needsUpdate);
+		e->effectiveInterval.store(e->schedule.interval, std::memory_order_relaxed);
+		std::lock_guard lock(g_mutex);
+		g_pending.push_back(std::move(e));
+	}
+
+	void Init()
+	{
+		if (g_initialized.load(std::memory_order_acquire)) return;
+		{
+			std::lock_guard lock(g_mutex);
+			modules::ForEach([](modules::Tab&, Module& m) {
+				auto e = std::make_unique<Entry>();
+				e->name = m.Name();
+				e->module = &m;
+				e->schedule = m.schedule;
+				e->effectiveInterval.store(m.schedule.interval, std::memory_order_relaxed);
+				g_byModule.emplace(&m, e.get());
+				g_entries.push_back(std::move(e));
+			});
+			for (auto& e : g_pending) g_entries.push_back(std::move(e));
+			g_pending.clear();
+			BuildOrder();
+		}
+		g_initialized.store(true, std::memory_order_release);
+		spdlog::info("Scheduler: {} entries", g_order.size());
+	}
+
+	void Tick()
+	{
+		if (!g_initialized.load(std::memory_order_acquire)) return;
+		cache::NextTick();
+		AdoptPending();
+
+		const clk::Ticks start = clk::Now();
+		const float intervalMs = g_lastTickStart ? static_cast<float>(clk::Seconds(start - g_lastTickStart) * 1000.0) : 0.f;
+		g_lastTickStart = start;
+		const clk::Ticks budget = clk::FromSeconds(g_budgetMs.load(std::memory_order_relaxed) / 1000.0);
+
+		for (int index : g_order)
+		{
+			Entry& e = *g_entries[static_cast<std::size_t>(index)];
+
+			if (e.module && !e.module->Enabled())
+			{
+				e.state.store(State::Disabled, std::memory_order_relaxed);
+				continue;
+			}
+			const bool blocked = std::any_of(e.requiredOn.begin(), e.requiredOn.end(), [](int dep) {
+				const Module* m = g_entries[static_cast<std::size_t>(dep)]->module;
+				return m && !m->Enabled();
+			});
+			if (blocked)
+			{
+				e.state.store(State::Blocked, std::memory_order_relaxed);
+				continue;
+			}
+
+			const bool dirty = e.module && e.module->TakeDirty();
+			const float interval = EffectiveInterval(e);
+			e.effectiveInterval.store(interval, std::memory_order_relaxed);
+
+			const clk::Ticks now = clk::Now();
+			const double since = e.lastRun ? clk::Seconds(now - e.lastRun) : 1e9;
+			const bool due = interval <= 0.f || since >= interval;
+			if (!due && !dirty)
+			{
+				e.state.store(State::NotDue, std::memory_order_relaxed);
+				e.skips.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+
+			if (!dirty)
+			{
+				const bool needed = e.module ? e.module->NeedsUpdate() : (!e.needsUpdate || e.needsUpdate());
+				if (!needed)
+				{
+					e.lastRun = now;
+					e.state.store(State::Clean, std::memory_order_relaxed);
+					e.skips.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+			}
+
+			if (Deferrable(e.schedule.priority) && now - start > budget)
+			{
+				const bool starving = since >= std::max(4.0 * interval, kMinStarve);
+				if (!starving)
+				{
+					e.state.store(State::Deferred, std::memory_order_relaxed);
+					e.deferrals.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+			}
+
+			try
+			{
+				if (e.module) e.module->OnTick();
+				else if (e.run) e.run();
+				e.state.store(State::Ran, std::memory_order_relaxed);
+			}
+			catch (const std::exception& ex)
+			{
+				spdlog::error("Scheduler: '{}' threw: {}", e.name, ex.what());
+				e.state.store(State::Failed, std::memory_order_relaxed);
+			}
+			catch (...)
+			{
+				spdlog::error("Scheduler: '{}' threw an unknown exception", e.name);
+				e.state.store(State::Failed, std::memory_order_relaxed);
+			}
+			e.lastRun = now;
+			RecordRun(e, static_cast<float>(clk::Micros(clk::Now() - now)));
+		}
+
+		// Adapt: stretch Low/Background intervals while over budget, relax them again once there is headroom.
+		const clk::Ticks work = clk::Now() - start;
+		const float workMs = static_cast<float>(clk::Seconds(work) * 1000.0);
+		g_lastMs.store(workMs, std::memory_order_relaxed);
+		Ema(g_avgMs, workMs);
+		double pressure = g_pressure.load(std::memory_order_relaxed);
+		if (work > budget) pressure = std::min(kMaxPressure, pressure * 1.05);
+		else if (work * 2 < budget) pressure = std::max(1.0, pressure / 1.02);
+		g_pressure.store(pressure, std::memory_order_relaxed);
+
+		PushHistory(workMs, intervalMs);
+		g_tickCount.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void SetBudget(double milliseconds) { g_budgetMs.store(std::max(0.01, milliseconds), std::memory_order_relaxed); }
+	double Budget() { return g_budgetMs.load(std::memory_order_relaxed); }
+
+	std::vector<EntryView> Snapshot()
+	{
+		std::lock_guard lock(g_mutex);
+		std::vector<EntryView> out;
+		out.reserve(g_entries.size());
+		for (const auto& p : g_entries)
+		{
+			const Entry& e = *p;
+			EntryView v;
+			v.name = e.name;
+			v.isModule = e.module != nullptr;
+			v.priority = e.schedule.priority;
+			v.state = e.state.load(std::memory_order_relaxed);
+			v.interval = e.schedule.interval;
+			v.effectiveInterval = e.effectiveInterval.load(std::memory_order_relaxed);
+			v.runs = e.runs.load(std::memory_order_relaxed);
+			v.deferrals = e.deferrals.load(std::memory_order_relaxed);
+			v.avgUs = e.avgUs.load(std::memory_order_relaxed);
+			v.maxUs = e.maxUs.load(std::memory_order_relaxed);
+			v.lastUs = e.lastUs.load(std::memory_order_relaxed);
+			v.renderAvgUs = e.renderAvgUs.load(std::memory_order_relaxed);
+			v.renderMaxUs = e.renderMaxUs.load(std::memory_order_relaxed);
+			v.order = e.order;
+			out.push_back(std::move(v));
+		}
+		return out;
+	}
+
+	TickView Ticks()
+	{
+		TickView t;
+		t.pressure = g_pressure.load(std::memory_order_relaxed);
+		t.lastMs = g_lastMs.load(std::memory_order_relaxed);
+		t.avgMs = g_avgMs.load(std::memory_order_relaxed);
+		t.budgetMs = static_cast<float>(g_budgetMs.load(std::memory_order_relaxed));
+		t.ticks = g_tickCount.load(std::memory_order_relaxed);
+		return t;
+	}
+
+	void History(std::vector<float>& workMs, std::vector<float>& intervalMs)
+	{
+		const std::size_t end = g_historyPos.load(std::memory_order_acquire);
+		const std::size_t count = std::min(end, kHistory);
+		workMs.resize(count);
+		intervalMs.resize(count);
+		for (std::size_t i = 0; i < count; ++i)
+		{
+			const std::size_t slot = (end - count + i) % kHistory;
+			workMs[i] = g_workHistory[slot].load(std::memory_order_relaxed);
+			intervalMs[i] = g_intervalHistory[slot].load(std::memory_order_relaxed);
+		}
+	}
+
+	void RecordRender(const Module& module, double microseconds)
+	{
+		if (!g_initialized.load(std::memory_order_acquire)) return;
+		const auto it = g_byModule.find(&module);
+		if (it == g_byModule.end()) return;
+		Ema(it->second->renderAvgUs, static_cast<float>(microseconds));
+		Max(it->second->renderMaxUs, static_cast<float>(microseconds));
+	}
+
+	const char* PriorityName(Priority p)
+	{
+		switch (p)
+		{
+			case Priority::Critical: return "critical";
+			case Priority::High: return "high";
+			case Priority::Normal: return "normal";
+			case Priority::Low: return "low";
+			case Priority::Background: return "background";
+		}
+		return "?";
+	}
+
+	const char* StateName(State s)
+	{
+		switch (s)
+		{
+			case State::Idle: return "idle";
+			case State::Ran: return "ran";
+			case State::NotDue: return "not due";
+			case State::Clean: return "clean";
+			case State::Deferred: return "deferred";
+			case State::Blocked: return "blocked";
+			case State::Disabled: return "off";
+			case State::Failed: return "failed";
+		}
+		return "?";
+	}
+}

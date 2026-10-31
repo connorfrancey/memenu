@@ -78,6 +78,8 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          # v2.0.1-dev, v2.1.0-rc1, ...: a pre-release, so releases/latest (what install.ps1 / install.sh get) skips it
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## Install
 
@@ -85,6 +87,12 @@ jobs:
 
             ```powershell
             irm https://raw.githubusercontent.com/${{ github.repository }}/master/install.ps1 | iex
+            ```
+
+            Linux, Steam Deck or macOS (Proton / Wine): paste this into a terminal and follow its last step:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/master/install.sh | bash
             ```
 
             Or download `memenu_installer.exe` below and click **Install**. Then start Mirror's Edge as usual:

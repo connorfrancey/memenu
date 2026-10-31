@@ -33,6 +33,15 @@ irm https://raw.githubusercontent.com/connorfrancey/memenu/master/install.ps1 | 
 
 Then start Mirror's Edge the way you always do. The menu loads with the game. Run the same command again to update.
 
+**Linux, Steam Deck, macOS** (the game running in Proton, Wine, Lutris, CrossOver or Whisky): paste this into a
+terminal instead, and do the one extra step it shows you (a Steam launch option, or a Wine setting):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/connorfrancey/memenu/master/install.sh | bash
+```
+
+Uninstall with `... | bash -s -- --uninstall`. This is less tested than Windows.
+
 <details>
 <summary>Other ways, and uninstalling</summary>
 
@@ -268,6 +277,9 @@ Everything is in the `memenu` folder next to `MirrorsEdge.exe`:
 ### Setup and the `memenu` tool
 
 You need Visual Studio with "Desktop development with C++", CMake 4.2+, Ninja and [uv](https://docs.astral.sh/uv/).
+**`setup.bat dev`** (or double-click `setup.bat` and pick 2) installs whichever of them are missing with winget, then
+runs `uv sync` and checks the toolchain. Run it again any time; it skips what is already there. (`setup.bat` also
+installs the menu into the game for players, and `bash setup.sh` does that on Linux and macOS.)
 The game is a 32-bit program, so everything is built for x86. The tool sets up the 32-bit MSVC environment itself,
 so any terminal works.
 

@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from .game import INSTALLER, LAUNCHER, detected_installs, is_elevated, project_v
 from .toolchain import ROOT, Toolchain, ToolchainError, cmake_version, find_toolchain
 
 console = Console(highlight=False)
+FILES_ZIP = "memenu-files.zip"   # The DLLs unpacked, for install.sh (see `package`)
 
 config_option = click.option(
     "-c", "--config", type=click.Choice(sorted(b.CONFIGS)), default="debug", show_default=True,
@@ -996,9 +998,26 @@ def package(ctx: click.Context, no_build: bool) -> None:
     shutil.copy2(src, versioned)
     shutil.copy2(src, fixed)
     digest = hashlib.sha256(versioned.read_bytes()).hexdigest()
-    (dist / "SHA256SUMS.txt").write_text(f"{digest}  {versioned.name}\n{digest}  {fixed.name}\n", encoding="ascii")
+
+    # The same two files unpacked, laid out like the game's Binaries folder, for install.sh (Linux / Steam Deck /
+    # macOS: the game runs in Proton or Wine there, where the installer exe can't be used).
+    files = dist / FILES_ZIP
+    loader = b.build_dir("release") / "loader" / "dinput8.dll"
+    menu = _artifact("release", "medge_menu.dll")
+    for path in (loader, menu):
+        if not path.exists():
+            console.print(f"[red]{path.relative_to(ROOT)} is missing.[/] Run without --no-build.")
+            ctx.exit(1)
+    with zipfile.ZipFile(files, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(loader, "dinput8.dll")
+        z.write(menu, "memenu/medge_menu.dll")
+    files_digest = hashlib.sha256(files.read_bytes()).hexdigest()
+
+    (dist / "SHA256SUMS.txt").write_text(f"{digest}  {versioned.name}\n{digest}  {fixed.name}\n"
+                                         f"{files_digest}  {files.name}\n", encoding="ascii")
     console.print(Panel.fit(f"[bold]{versioned.relative_to(ROOT)}[/] (and {fixed.relative_to(ROOT)})\n"
-                            f"{versioned.stat().st_size / 1e6:.1f} MB\nsha256 {digest}",
+                            f"{versioned.stat().st_size / 1e6:.1f} MB\nsha256 {digest}\n"
+                            f"[bold]{files.relative_to(ROOT)}[/] (for install.sh) {files.stat().st_size / 1e6:.1f} MB",
                             title="Packaged", border_style="green"))
 
 

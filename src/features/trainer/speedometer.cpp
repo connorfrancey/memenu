@@ -94,7 +94,7 @@ public:
         ImGui::SetNextWindowBgAlpha(opacity);
         if (ImGui::Begin("Speedometer##trainer", nullptr, flags)) {
             const float scale = SpeedScale();
-            const char* unit = SpeedUnit();
+            const char* unitName = SpeedUnit();
             if (showPosition) {
                 Row("X", "%.2f", v.x);
                 Row("Y", "%.2f", v.y);
@@ -102,8 +102,8 @@ public:
                 Row("Top Z", "%.2f", v.topHeight);
             }
             if (showSpeed) {
-                Row("Speed", "%.2f %s", v.speed * scale, unit);
-                Row("Top speed", "%.2f %s", v.topSpeed * scale, unit);
+                Row("Speed", "%.2f %s", v.speed * scale, unitName);
+                Row("Top speed", "%.2f %s", v.topSpeed * scale, unitName);
             }
             if (showAngles) {
                 Row("Pitch", "%.2f", v.pitch);

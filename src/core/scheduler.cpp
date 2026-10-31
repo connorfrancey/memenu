@@ -2,6 +2,7 @@
 #include "core/cache.h"
 #include "core/clock.h"
 #include "core/module.h"
+#include "core/optimizations.h"
 
 #include <spdlog/spdlog.h>
 
@@ -177,6 +178,7 @@ namespace sched
 
 		float EffectiveInterval(const Entry& e)
 		{
+			if (!opt::kEnabled) return 0.f;		// No optimizations: every entry is due on every tick
 			return static_cast<float>(e.schedule.interval * Scale(e.schedule.priority));
 		}
 
@@ -285,7 +287,7 @@ namespace sched
 				continue;
 			}
 
-			if (!dirty)
+			if (opt::kEnabled && !dirty)		// No optimizations: never skipped as "clean"
 			{
 				const bool needed = e.module ? e.module->NeedsUpdate() : (!e.needsUpdate || e.needsUpdate());
 				if (!needed)
@@ -297,7 +299,7 @@ namespace sched
 				}
 			}
 
-			if (Deferrable(e.schedule.priority) && now - start > budget)
+			if (opt::kEnabled && Deferrable(e.schedule.priority) && now - start > budget)	// Else never deferred
 			{
 				const bool starving = since >= std::max(4.0 * interval, kMinStarve);
 				if (!starving)
@@ -333,10 +335,13 @@ namespace sched
 		const float workMs = static_cast<float>(clk::Seconds(work) * 1000.0);
 		g_lastMs.store(workMs, std::memory_order_relaxed);
 		Ema(g_avgMs, workMs);
-		double pressure = g_pressure.load(std::memory_order_relaxed);
-		if (work > budget) pressure = std::min(kMaxPressure, pressure * 1.05);
-		else if (work * 2 < budget) pressure = std::max(1.0, pressure / 1.02);
-		g_pressure.store(pressure, std::memory_order_relaxed);
+		if (opt::kEnabled)		// No optimizations: no adaptive stretching, pressure stays 1
+		{
+			double pressure = g_pressure.load(std::memory_order_relaxed);
+			if (work > budget) pressure = std::min(kMaxPressure, pressure * 1.05);
+			else if (work * 2 < budget) pressure = std::max(1.0, pressure / 1.02);
+			g_pressure.store(pressure, std::memory_order_relaxed);
+		}
 
 		PushHistory(workMs, intervalMs);
 		g_tickCount.fetch_add(1, std::memory_order_relaxed);

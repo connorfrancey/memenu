@@ -27,7 +27,8 @@ private:
         const auto maps = levels::Maps();
         if (maps.empty()) { ImGui::TextDisabled("No maps yet"); return; }
 
-        for (int i = 0; i < static_cast<int>(maps.size()); ++i) {
+        // Newest level first (last to first). Indices stay the game's, only the display order is reversed.
+        for (int i = static_cast<int>(maps.size()) - 1; i >= 0; --i) {
             const auto& map = maps[static_cast<std::size_t>(i)];
             ImGui::PushID(i);
             if (ImGui::CollapsingHeader(map.label.c_str())) {

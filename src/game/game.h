@@ -37,6 +37,7 @@ namespace game {
 		bool hasPawn = false;               // Local TdPlayerPawn found
 		int health = 0, maxHealth = 0;
 		unsigned long long ticks = 0;       // Engine ticks seen: 0 means the Tick hook never fires
+		unsigned long long objectScans = 0; // Times the player lookup walked the whole object list
 	};
 	Status GetStatus();
 
@@ -50,7 +51,7 @@ namespace game {
 	void SetCameraTracking(bool enabled);
 	rmath::Camera GetCamera();			// Any thread; valid == false when there is no camera yet
 	
-	float EngineNear();					// Near clip plane of the engine's projection (0 until known)
+	float EngineNear();					// Near clip plane of the engine's projection (0 = unknown; always, for now)
 
 	bool Ready();                       // SDK globals resolved and hooks installed
 	bool IsLoading();                   // A level is being loaded
@@ -70,7 +71,6 @@ namespace game {
 	
 	// Byte pattern scan over MirrorsEdge.exe ('x' = must match, '?' = any byte). nullptr if not found.
 	void* FindPattern(const char* pattern, const char* mask);
-	void RunOnGameThread(std::function<void()> fn);   // Runs on the next tick
 	
 	// Null while loading or outside a level. Game thread only.
 	Classes::ATdPlayerController* Controller();

@@ -60,6 +60,8 @@ struct Session {
     bool endReached = false;
     long long desyncFrame = -1;
     std::size_t syncChecked = 0;
+    bool recordAfterSeek = false;     // a rewind: switch to recording when the seek arrives
+    bool deathSeen = false;           // the player's death was handled already (it lasts many frames)
 
     std::vector<engine::RawInput> pending;              // real input of this frame, recorded at the next one
     std::unordered_map<long long, std::uint16_t> names; // engine FName -> replay name (recording)
@@ -98,7 +100,7 @@ void RunCommands()
 
 float NominalDt(float hz) { return static_cast<float>(1.0 / (hz > 0.f ? hz : kArmHz)); }
 
-std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+std::wstring Widen(const std::string& text) { return std::wstring(text.begin(), text.end()); }
 
 std::string EngineName(int index, int number)
 {
@@ -136,7 +138,7 @@ bool SameName(const std::string& a, const std::string& b)
 // Keys that control the menu or the session never reach the game while a session runs (they'd be recorded otherwise).
 bool IsHotkey(const engine::RawInput& in)
 {
-    const int hash = opt.keyPause * 31 + opt.keyAdvance * 37 + opt.keyTakeOver * 41 + opt.keyStop * 43;
+    const int hash = opt.keyPause * 31 + opt.keyAdvance * 37 + opt.keyTakeOver * 41 + opt.keyStop * 43 + opt.keyRewind * 47;
     if (hash != s.hotkeyHash) {
         s.hotkeyNames.clear();
         s.hotkeyHash = hash;
@@ -146,7 +148,7 @@ bool IsHotkey(const engine::RawInput& in)
 
     const std::string name = EngineName(in.nameIndex, in.nameNumber);
     bool hit = false;
-    for (int vk : {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, VK_INSERT, VK_END})
+    for (int vk : {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, VK_INSERT, VK_END})
         if (vk && SameName(name, UnrealKeyName(vk))) hit = true;
     s.hotkeyNames[key] = hit;
     return hit;
@@ -163,13 +165,14 @@ bool GameFocused()
 void Begin(Mode mode);
 void StopNow(const char* why);
 void TakeOverNow();
+void RewindNow(const char* why);
 
 void PollHotkeys()
 {
-    static bool was[4]{};
-    const int keys[4] = {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop};
-    bool edge[4]{};
-    for (int i = 0; i < 4; ++i) {
+    static bool was[5]{};
+    const int keys[5] = {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind};
+    bool edge[5]{};
+    for (int i = 0; i < 5; ++i) {
         const bool down = keys[i] && (GetAsyncKeyState(keys[i]) & 0x8000);
         edge[i] = down && !was[i];
         was[i] = down;
@@ -183,6 +186,7 @@ void PollHotkeys()
     }
     if (edge[2] && s.mode == Mode::Playing) TakeOverNow();
     if (edge[3]) StopNow("stopped");
+    if (edge[4] && s.mode == Mode::Recording && !s.armed) RewindNow("rewound");
 }
 
 // ---- input --------------------------------------------------------------------------------------------------------------
@@ -385,6 +389,7 @@ void Begin(Mode mode)
     s.endReached = false;
     s.desyncFrame = -1;
     s.syncChecked = 0;
+    s.deathSeen = false;
     s.pending.clear();
     s.names.clear();
     s.resolved.clear();
@@ -439,6 +444,7 @@ void StopNow(const char* why)
     s.mode = Mode::Idle;
     s.armed = false;
     s.seekTo = kNoSeek;
+    s.recordAfterSeek = false;
     g_active = false;
     g_paused = false;
     g_advance = 0;
@@ -469,6 +475,72 @@ void TakeOverNow()
     s.lastReal = engine::RealSeconds();
     SetRendering(true);
     SetMessage("recording from frame " + std::to_string(s.frame), true);
+}
+
+// The frame `seconds` of game time before the current one (0 at most).
+std::size_t FramesBack(double seconds)
+{
+    std::lock_guard lock(g_mutex);
+    std::size_t f = std::min(s.frame, g_replay.frames.size());
+    double t = 0.0;
+    while (f > 0 && t < seconds) t += g_replay.frames[--f].dt;
+    return f;
+}
+
+// Practice mode: drop the last seconds of the recording, replay the rest (as fast as possible, checked against the
+// recording) and continue recording from there, paused so the player can get ready.
+void RewindNow(const char* why)
+{
+    if (s.mode != Mode::Recording || s.armed) return;
+    if (g_replay.start == StartKind::Now) {
+        SetMessage("a macro that starts now can't rewind (record from a level start)", true);
+        return;
+    }
+    const std::size_t target = FramesBack(opt.rewindSeconds);
+    {
+        std::lock_guard lock(g_mutex);
+        g_replay.Truncate(target);
+        ++g_replay.rerecords;
+    }
+    StopNow(why);
+    if (target == 0) {
+        Begin(Mode::Recording);                  // nothing left: a fresh attempt from the start level
+        return;
+    }
+    Begin(Mode::Playing);
+    if (s.mode == Mode::Idle) return;
+    s.seekTo = target;
+    s.recordAfterSeek = true;
+    g_paused = false;
+    g_advance = 0;
+    if (opt.seekWithoutRendering) SetRendering(false);
+}
+
+// Recording only: reacts once to the player dying (Options::onDeath).
+void CheckDeath()
+{
+    if (s.mode != Mode::Recording || s.armed || opt.onDeath == OnDeath::Nothing) return;
+    auto* pawn = game::Pawn();
+    const bool dead = pawn && pawn->Health <= 0;
+    if (!dead) {
+        s.deathSeen = false;
+        return;
+    }
+    if (s.deathSeen) return;
+    s.deathSeen = true;
+    if (g_replay.start == StartKind::Now) return;          // can't go back: the death stays in the macro
+
+    if (opt.onDeath == OnDeath::Restart) {
+        {
+            std::lock_guard lock(g_mutex);
+            g_replay.Truncate(0);
+            ++g_replay.rerecords;
+        }
+        StopNow("died: restarting the attempt");
+        Begin(Mode::Recording);
+    } else {
+        RewindNow("died: rewinding");
+    }
 }
 
 // The player's state against the recording. Frames past the checked range (edited) get their sync data refreshed instead,
@@ -537,6 +609,7 @@ bool OnFrame()
     }
     RunCommands();
     PollHotkeys();
+    CheckDeath();
     if (s.mode == Mode::Idle) return false;
 
     // Arm: wait for the start level, running frames at the nominal step (they are the same in every run too).
@@ -562,6 +635,10 @@ bool OnFrame()
         s.seekTo = kNoSeek;
         g_paused = true;
         SetRendering(true);
+        if (s.recordAfterSeek) {
+            s.recordAfterSeek = false;
+            TakeOverNow();                       // paused: resume (or step) to keep recording
+        }
     }
     if (WaitWhilePaused()) s.lastReal = engine::RealSeconds();
     if (s.mode == Mode::Idle) return false;
@@ -773,6 +850,18 @@ void Goto(std::size_t frame)
     });
 }
 
+void Rewind() { Post([] { RewindNow("rewound"); }); }
+
+void Clear()
+{
+    Post([] {
+        StopNow("cleared");
+        std::lock_guard lock(g_mutex);
+        g_replay.Clear();
+        s.resolved.clear();
+    });
+}
+
 void WithReplay(const std::function<void(Replay&)>& fn)
 {
     std::lock_guard lock(g_mutex);
@@ -782,7 +871,8 @@ void WithReplay(const std::function<void(Replay&)>& fn)
 bool LoadFile(const std::filesystem::path& path, std::string* error)
 {
     Replay r;
-    if (!r.Load(path, error)) return false;
+    const bool json = path.extension() == ".json";
+    if (!(json ? r.ImportJson(path, error) : r.Load(path, error))) return false;
     if (r.gameStamp && r.gameStamp != engine::GameStamp())
         SetMessage("warning: made with a different game version, it will likely desync", true);
     // Not while a session uses the replay: stop it first, then swap.
@@ -803,6 +893,7 @@ bool SaveFile(const std::filesystem::path& path, std::string* error)
     g_replay.botName = "MirrorsEdgeMenu";
     g_replay.botVersion = "1.0";
     if (!g_replay.gameStamp) g_replay.gameStamp = engine::GameStamp();
+    if (path.extension() == ".json") return g_replay.ExportJson(path, error);
     return g_replay.Save(path, error);
 }
 

@@ -18,8 +18,9 @@ namespace game
 		return object->GetName().rfind("Default__", 0) == 0;
 	}
 
-	int NameIndex(const char* name) 
+	int NameIndex(const char* name)
 	{
+		if (opt::kEnabled)	// No optimizations: walk the name table on every call
 		{
 			std::lock_guard lock(g_nameMutex);
 			if (auto it = g_names.find(name); it != g_names.end())
@@ -46,7 +47,7 @@ namespace game
 		g_nameStats.computeTicks.fetch_add(clk::Now() - t0, std::memory_order_relaxed);
 
 		// Only remember hits: a name may be added to the table later (when its package loads).
-		if (found >= 0)
+		if (opt::kEnabled && found >= 0)
 		{
 			std::lock_guard lock(g_nameMutex);
 			g_names.emplace(name, found);

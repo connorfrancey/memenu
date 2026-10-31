@@ -22,6 +22,10 @@ namespace flight
             Vec velocity;                 // units per second
             bool hasLast = false;         // timing of the previous tick
             std::chrono::steady_clock::time_point last;
+            // Button blocking ("Block jump/actions"). Owned separately from `active`: the mode can drop out without a
+            // Restore (no player for a moment, death) while the controller still has our block set, and a restart must
+            // not take that 1 for the player's own value, or turning the mode off leaves jump blocked for good.
+            bool blockingButtons = false;
             unsigned char prevIgnoreButtons = 0;
         };
 
@@ -31,7 +35,7 @@ namespace flight
 
         // Same cleanup mmultiplayer's trainer does before it starts flying: stop slides/animations and leave any
         // special movement so the pawn is in a plain state.
-        void Start(Classes::ATdPlayerPawn* pawn, Classes::ATdPlayerController* controller, Mode mode)
+        void Start(Classes::ATdPlayerPawn* pawn, Mode mode)
         {
             pawn->StopSlideEffect();
             pawn->StopAllCustomAnimations(0.0f);
@@ -41,15 +45,29 @@ namespace flight
             g_state.mode = mode;
             g_state.velocity = {};
             g_state.hasLast = false;
-            g_state.prevIgnoreButtons = controller->bIgnoreButtonInput;
             spdlog::info("{}: started at ({:.0f}, {:.0f}, {:.0f})", Name(mode), pawn->Location.X, pawn->Location.Y,
                          pawn->Location.Z);
+        }
+
+        void BlockButtons(Classes::ATdPlayerController* controller, bool block)
+        {
+            if (block && !g_state.blockingButtons)
+            {
+                g_state.prevIgnoreButtons = controller->bIgnoreButtonInput;
+                g_state.blockingButtons = true;
+            }
+            else if (!block && g_state.blockingButtons)
+            {
+                controller->bIgnoreButtonInput = g_state.prevIgnoreButtons;
+                g_state.blockingButtons = false;
+            }
+            if (block) controller->bIgnoreButtonInput = 1;
         }
 
         // Back to normal physics, keeping the speed we had so leaving flight feels continuous.
         void Restore(Classes::ATdPlayerPawn* pawn, Classes::ATdPlayerController* controller)
         {
-            if (controller) controller->bIgnoreButtonInput = g_state.prevIgnoreButtons;
+            if (controller) BlockButtons(controller, false);
 
             Classes::FVector v{};
             v.X = g_state.velocity.x;
@@ -74,6 +92,7 @@ namespace flight
     {
         auto* pawn = game::Pawn();
         auto* controller = game::Controller();
+        if (controller && (!pawn || pawn->Health <= 0)) BlockButtons(controller, false); // don't strand the block
         if (!pawn || !controller)
         {
             if (g_state.active)
@@ -94,7 +113,7 @@ namespace flight
         }
 
         if (g_state.active && g_state.mode != mode) Restore(pawn, controller); // switched between the two modules
-        if (!g_state.active) Start(pawn, controller, mode);
+        if (!g_state.active) Start(pawn, mode);
 
         // Time step: measured here so callers do not have to pass one. Clamped so a hitch cannot launch the player.
         const auto now = std::chrono::steady_clock::now();
@@ -127,7 +146,7 @@ namespace flight
         // The game's own physics must not fight us: no gravity, no leftover velocity.
         pawn->Physics = Classes::EPhysics::PHYS_None;
         pawn->Velocity = Classes::FVector{};
-        if (s.blockActions) controller->bIgnoreButtonInput = 1;
+        BlockButtons(controller, s.blockActions);
 
         if (s.invulnerable)
         {
@@ -163,11 +182,17 @@ namespace flight
 
     void Stop(Mode mode)
     {
-        if (!g_state.active || g_state.mode != mode) return;
+        if (g_state.mode != mode) return;
+        if (!g_state.active)
+        {
+            if (auto* controller = game::Controller()) BlockButtons(controller, false);
+            return;
+        }
         if (auto* pawn = game::Pawn())
             Restore(pawn, game::Controller());
         else
         {
+            if (auto* controller = game::Controller()) BlockButtons(controller, false);
             spdlog::debug("{}: stop requested without a player", Name(mode));
             g_state.active = false;
         }

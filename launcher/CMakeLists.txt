@@ -9,6 +9,9 @@ target_compile_definitions(medge_launcher PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX U
 
 if (MSVC)
     target_compile_options(medge_launcher PRIVATE /W4 /permissive- /utf-8)
+    # Always run as administrator (UAC prompt), like the installer: injecting into the game needs the rights to open
+    # its process, which a normal launcher does not have when the game itself runs elevated.
+    target_link_options(medge_launcher PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
 else()
     target_compile_options(medge_launcher PRIVATE -Wall -Wextra)
     target_link_options(medge_launcher PRIVATE -municode -static -static-libgcc -static-libstdc++)

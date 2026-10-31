@@ -20,6 +20,17 @@ def project_version() -> str:
     return m[1] if m else "0.0.0"
 
 
+def is_elevated() -> bool:
+    """This process runs as administrator (so it can start the installer and the launcher without a UAC prompt)."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+ERROR_ELEVATION_REQUIRED = 740
+
+
 class _ShellExecuteInfo(ctypes.Structure):
     _fields_ = [
         ("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wintypes.HWND),
@@ -65,6 +76,13 @@ def detected_installs(launcher: Path) -> str:
     """What the launcher's install detection finds (its --list output)."""
     if not launcher.exists():
         return ""
-    result = subprocess.run([str(launcher), "--list"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                            check=False)
+    try:
+        result = subprocess.run([str(launcher), "--list"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                check=False)
+    except OSError as e:
+        # The launcher always runs as administrator: a normal terminal can't start it (and a UAC prompt just to list
+        # the installs would be too much).
+        if getattr(e, "winerror", None) == ERROR_ELEVATION_REQUIRED:
+            return "(the launcher runs as administrator: run this from an admin terminal to detect the game)"
+        raise
     return result.stdout.strip()

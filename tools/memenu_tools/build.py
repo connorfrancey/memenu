@@ -15,6 +15,9 @@ from rich.table import Table
 from .toolchain import ROOT, Toolchain
 
 CONFIGS = {"debug": "x86-debug", "release": "x86-release"}
+# The minimal build (`memenu minimal`): its own presets and build folders, so it never touches the full build's cache
+MINIMAL = {"debug": "minimal-debug", "release": "minimal-release"}
+PRESETS = CONFIGS | {"minimal-debug": "x86-minimal-debug", "minimal-release": "x86-minimal-release"}
 
 # C:\path\file.cpp(12): error C2065: 'x': undeclared identifier      (also "(12,5)" and "fatal error")
 _COMPILER = re.compile(
@@ -65,7 +68,32 @@ def parse_diagnostic(line: str) -> Diagnostic | None:
 
 
 def build_dir(config: str) -> Path:
-    return ROOT / f"cmake-build-{CONFIGS[config]}"
+    return ROOT / f"cmake-build-{PRESETS[config]}"
+
+
+# Optional parts of the project (CMake options, all OFF by default) and the targets they add.
+OPTIONS = {
+    "tests": "MEMENU_BUILD_TESTS",
+    "installer": "MEMENU_BUILD_INSTALLER",
+    "launcher": "MEMENU_BUILD_LAUNCHER",
+    "testhost": "MEMENU_BUILD_TESTHOST",
+}
+
+
+def cache_value(config: str, name: str) -> str | None:
+    """A variable's value from the build folder's CMakeCache.txt (None when unset or not configured)."""
+    cache = build_dir(config) / "CMakeCache.txt"
+    if not cache.exists():
+        return None
+    prefix = name + ":"
+    for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith(prefix) and "=" in line:
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def option_enabled(config: str, name: str) -> bool:
+    return (cache_value(config, name) or "").upper() in {"ON", "TRUE", "YES", "1", "Y"}
 
 
 @dataclass
@@ -118,7 +146,7 @@ def run_tool(console: Console, tc: Toolchain, args: list[str], title: str, log: 
 
 def configure(console: Console, tc: Toolchain, config: str, fresh: bool = False, verbose: bool = False,
               defines: tuple[str, ...] = ()) -> RunResult:
-    args = [tc.cmake, "--preset", CONFIGS[config]]
+    args = [tc.cmake, "--preset", PRESETS[config]]
     if fresh:
         args.append("--fresh")
     args += [f"-D{d}" for d in defines]

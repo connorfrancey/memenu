@@ -117,6 +117,9 @@ struct Replay {
     bool Save(const std::filesystem::path& path, std::string* error) const;
     bool Load(const std::filesystem::path& path, std::string* error);
     bool ExportJson(const std::filesystem::path& path, std::string* error) const;
+    // Reads what ExportJson writes (hand-written or edited macros too). Only "inputs" is required; "frames" defaults
+    // to one past the last input, "framerate" to 60, "start" to now. Recorded sync data isn't in JSON: not verifiable.
+    bool ImportJson(const std::filesystem::path& path, std::string* error);
 };
 
 const char* KindName(EventKind kind);

@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace logging {
-    void Init();        // Default spdlog logger -> memenu.log + OutputDebugString + in-memory buffer
+    void Init();        // logs/memenu.log (previous one archived to logs/.old, format in log.cpp) + debugger + memory
     void Shutdown();
 
     // The last lines that were logged, kept in memory for the log viewer (features/debug/log_viewer.cpp).

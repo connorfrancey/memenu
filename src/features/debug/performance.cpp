@@ -1,6 +1,7 @@
 #include "core/cache.h"
 #include "core/clock.h"
 #include "core/module.h"
+#include "core/optimizations.h"
 #include "core/scheduler.h"
 #include "gui.h"
 
@@ -166,7 +167,10 @@ private:
         if (!d.workMs.empty())
             ImGui::PlotHistogram("##work", d.workMs.data(), static_cast<int>(d.workMs.size()), 0, nullptr, 0.f,
                                  std::max(d.ticks.budgetMs * 2.f, workWorst), {-1.f, 50.f});
-        if (d.ticks.pressure > 1.01)
+        if (!opt::kEnabled)
+            ImGui::TextColored({1.f, 0.75f, 0.3f, 1.f}, "Built with no-optimizations: caches always recompute, "
+                               "every module runs every tick");
+        else if (d.ticks.pressure > 1.01)
             ImGui::TextColored({1.f, 0.75f, 0.3f, 1.f}, "Over budget: low priority intervals x%.2f, background x%.2f",
                                d.ticks.pressure, d.ticks.pressure * d.ticks.pressure);
         else
@@ -213,7 +217,7 @@ private:
         if (const ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs(); specs && specs->SpecsCount > 0) {
             const auto col = specs->Specs[0].ColumnUserID;
             const bool asc = specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending;
-            auto key = [col](const sched::EntryView* e) -> double {
+            auto sortKey = [col](const sched::EntryView* e) -> double {
                 switch (col) {
                     case Prio:      return static_cast<double>(e->priority);
                     case State:     return static_cast<double>(e->state);
@@ -229,7 +233,7 @@ private:
             };
             std::stable_sort(rows_.begin(), rows_.end(), [&](auto* a, auto* b) {
                 if (col == Name) return asc ? a->name < b->name : a->name > b->name;
-                return asc ? key(a) < key(b) : key(a) > key(b);
+                return asc ? sortKey(a) < sortKey(b) : sortKey(a) > sortKey(b);
             });
         }
 

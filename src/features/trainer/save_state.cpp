@@ -3,6 +3,8 @@
 #include "game/game.h"
 #include "game/player_state.h"
 
+#include "game/uobject.h"
+
 #include <ME_SDK.hpp>
 
 namespace {
@@ -68,7 +70,7 @@ public:
             if (!pawn || !controller || !world) return;
 
             // Same conditions as the trainer's button: not in time trials, not already full or active, not falling to death.
-            if (world->Game && world->Game->IsA(Classes::ATdSPTimeTrialGame::StaticClass())) {
+            if (world->Game && game::IsA(world->Game, Classes::ATdSPTimeTrialGame::StaticClass())) {
                 notify::Push("Reaction time: not in time trials");
                 return;
             }

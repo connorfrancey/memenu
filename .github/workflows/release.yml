@@ -52,8 +52,8 @@ jobs:
         run: uv run memenu info
 
       - name: Configure
-        # No Doxygen on the runner: leave out the SDK docs target.
-        run: uv run memenu configure -c release -D MEMENU_SDK_DOCS=OFF
+        # No Doxygen on the runner: leave out the SDK docs target. Tests and installer are off by default.
+        run: uv run memenu configure -c release -D MEMENU_SDK_DOCS=OFF -D MEMENU_BUILD_TESTS=ON -D MEMENU_BUILD_INSTALLER=ON
 
       - name: Build
         run: uv run memenu build -c release

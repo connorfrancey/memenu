@@ -3,9 +3,5 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build/_deps/imgui-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build/_deps/imjson-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build/_deps/minhook-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build/_deps/spdlog-src" vcs="Git" />
   </component>
 </project>

@@ -5,6 +5,8 @@
 #include <Windows.h>
 
 #include <MinHook.h>
+#include "game/uobject.h"
+
 #include <ME_SDK.hpp>
 #include <spdlog/spdlog.h>
 
@@ -214,7 +216,7 @@ Classes::UGameViewportClient* GameViewport()
 {
     static game::ObjectRef<Classes::UGameEngine> engine{"Game engine"};
     auto* e = engine.Find([](Classes::UObject* o) {
-        return o->IsA(Classes::UGameEngine::StaticClass()) && !game::IsDefaultObject(o);
+        return game::IsA(o, Classes::UGameEngine::StaticClass()) && !game::IsDefaultObject(o);
     });
     return e ? e->GameViewport : nullptr;
 }

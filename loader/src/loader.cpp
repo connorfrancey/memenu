@@ -105,6 +105,18 @@ namespace
         }
         Sleep(kSettleMs);
 
+        // memenu\load-delay-ms (developers, `memenu game-test --late`): load that much later, e.g. once the game is in
+        // exclusive fullscreen, the way the launcher injects into a running game
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, (g_dir + L"\\memenu\\load-delay-ms").c_str(), L"r") == 0 && f) {
+            unsigned long ms = 0;
+            if (fscanf_s(f, "%lu", &ms) == 1 && ms > 0 && ms <= 10 * 60 * 1000) {
+                Log("memenu\\load-delay-ms: waiting %lu ms more", ms);
+                Sleep(ms);
+            }
+            fclose(f);
+        }
+
         if (LoadLibraryW(menu.c_str())) Log("loaded %ls", menu.c_str());
         else Log("LoadLibrary(%ls) failed (error %lu)", menu.c_str(), GetLastError());
         return 0;

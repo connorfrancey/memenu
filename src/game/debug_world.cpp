@@ -115,7 +115,8 @@ namespace debugworld
         }
 
         // Class information is computed once per UClass (from the first object seen), then looked up by class pointer.
-        // Everything is decided from the class *name*, not from IsA(): in this build IsA() only matches the exact class.
+        // Everything is decided from the class *name* (the SDK's IsA() only matches the exact class; game::IsA() in
+        // game/uobject.h is the correct one).
         const ClassInfo& ClassOf(Classes::UObject* o)
         {
             const auto it = g_classes.find(o->Class);

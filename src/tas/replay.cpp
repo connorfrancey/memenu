@@ -542,6 +542,95 @@ bool Replay::ExportJson(const std::filesystem::path& path, std::string* error) c
     return static_cast<bool>(out);
 }
 
+bool Replay::ImportJson(const std::filesystem::path& path, std::string* error)
+{
+    using json = nlohmann::json;
+    std::ifstream in(path);
+    if (!in) { Fail(error, "can't open " + path.string()); return false; }
+    const json j = json::parse(in, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) { Fail(error, "not valid JSON"); return false; }
+    if (!j.contains("inputs") || !j["inputs"].is_array()) { Fail(error, "no \"inputs\" array"); return false; }
+
+    try {
+        Replay rep;
+        rep.author = j.value("author", "");
+        rep.description = j.value("description", "");
+        rep.gameStamp = j.value("gameVersion", 0u);
+        rep.fixedHz = j.value("framerate", 60.f);
+        rep.seed = j.value("seed", rep.seed);
+        rep.rerecords = j.value("rerecords", 0u);
+        rep.created = j.value("created", std::uint64_t{0});
+        if (j.contains("bot") && j["bot"].is_object()) {
+            rep.botName = j["bot"].value("name", "");
+            rep.botVersion = j["bot"].value("version", "");
+        }
+        if (j.contains("start") && j["start"].is_object()) {
+            const json& st = j["start"];
+            const std::string kind = st.value("kind", "now");
+            if (kind == "command") rep.start = StartKind::Command;
+            else if (kind == "checkpoint") rep.start = StartKind::Checkpoint;
+            else if (kind == "now") rep.start = StartKind::Now;
+            else { Fail(error, "unknown start kind \"" + kind + "\""); return false; }
+            rep.command = st.value("command", "");
+            rep.map = st.value("map", "");
+            rep.checkpoint = st.value("checkpoint", "");
+        }
+        if (j.contains("extensions") && j["extensions"].is_object())
+            for (const auto& [k, v] : j["extensions"].items())
+                if (v.is_string()) rep.extensions[k] = v.get<std::string>();
+
+        // Inputs, sorted by frame (stable: the order inside a frame is the order in the file).
+        struct In { std::size_t frame; Event e; };
+        std::vector<In> inputs;
+        std::size_t lastFrame = 0;
+        for (const json& i : j["inputs"]) {
+            if (!i.is_object() || !i.contains("frame") || !i.contains("key")) {
+                Fail(error, "every input needs \"frame\" and \"key\"");
+                return false;
+            }
+            const std::string ev = i.value("event", "down");
+            Event e;
+            if (ev == "down") e.kind = EventKind::Pressed;
+            else if (ev == "up") e.kind = EventKind::Released;
+            else if (ev == "repeat") e.kind = EventKind::Repeat;
+            else if (ev == "double") e.kind = EventKind::DoubleClick;
+            else if (ev == "axis") e.kind = EventKind::Axis;
+            else { Fail(error, "unknown event \"" + ev + "\""); return false; }
+            e.name = rep.NameIndex(i["key"].get<std::string>());
+            e.value = i.value("value", e.kind == EventKind::Pressed ? 1.f : 0.f);
+            e.value2 = i.value("deltaTime", e.kind == EventKind::Axis && rep.fixedHz > 0.f ? 1.f / rep.fixedHz : 0.f);
+            e.gamepad = i.value("gamepad", false) ? 1 : 0;
+            const auto frame = i["frame"].get<std::size_t>();
+            lastFrame = std::max(lastFrame, frame);
+            inputs.push_back({frame, e});
+        }
+        std::stable_sort(inputs.begin(), inputs.end(), [](const In& a, const In& b) { return a.frame < b.frame; });
+
+        std::size_t frameCount = j.value("frames", inputs.empty() ? std::size_t{0} : lastFrame + 1);
+        if (!inputs.empty() && frameCount <= lastFrame) { Fail(error, "an input is past \"frames\""); return false; }
+        std::vector<float> dts(frameCount, NominalDt(rep.fixedHz));
+        if (j.contains("frameTimes") && j["frameTimes"].is_array()) {
+            if (j["frameTimes"].size() != frameCount) { Fail(error, "\"frameTimes\" doesn't match \"frames\""); return false; }
+            for (std::size_t f = 0; f < frameCount; ++f) dts[f] = j["frameTimes"][f].get<float>();
+        } else if (rep.fixedHz <= 0.f) {
+            Fail(error, "real-time replays need \"frameTimes\"");
+            return false;
+        }
+
+        std::size_t next = 0;
+        for (std::size_t f = 0; f < frameCount; ++f) {
+            rep.BeginFrame(dts[f]);
+            for (; next < inputs.size() && inputs[next].frame == f; ++next) rep.AddEvent(inputs[next].e);
+        }
+        rep.syncValidUntil = 0;
+        *this = std::move(rep);
+        return true;
+    } catch (const json::exception& e) {
+        Fail(error, std::string("bad value: ") + e.what());
+        return false;
+    }
+}
+
 const char* KindName(EventKind kind)
 {
     switch (kind) {

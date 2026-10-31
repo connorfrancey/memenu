@@ -22,10 +22,24 @@
       "displayName": "x86 Release (MSVC)",
       "inherits": "x86-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "x86-minimal-debug",
+      "displayName": "x86 Minimal Debug (MSVC, D3D9 hook + ImGui demo only)",
+      "inherits": "x86-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "MEMENU_MINIMAL": "ON" }
+    },
+    {
+      "name": "x86-minimal-release",
+      "displayName": "x86 Minimal Release (MSVC, D3D9 hook + ImGui demo only)",
+      "inherits": "x86-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "MEMENU_MINIMAL": "ON" }
     }
   ],
   "buildPresets": [
     { "name": "x86-debug",   "configurePreset": "x86-debug" },
-    { "name": "x86-release", "configurePreset": "x86-release" }
+    { "name": "x86-release", "configurePreset": "x86-release" },
+    { "name": "x86-minimal-debug",   "configurePreset": "x86-minimal-debug" },
+    { "name": "x86-minimal-release", "configurePreset": "x86-minimal-release" }
   ]
 }

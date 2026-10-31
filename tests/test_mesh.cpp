@@ -1,17 +1,17 @@
 #include "render/mesh.h"
 
-#include <catch2/catch_test_macros.hpp>
+#include <gtest/gtest.h>
 
 using namespace rmesh;
 
-TEST_CASE("PackColor packs ARGB and clamps", "[mesh]")
+TEST(Mesh, PackColorPacksArgbAndClamps)
 {
-    CHECK(PackColor(1.f, 0.f, 0.f) == 0xFFFF0000u);
-    CHECK(PackColor(0.f, 1.f, 0.f, 0.f) == 0x0000FF00u);
-    CHECK(PackColor(2.f, -1.f, 0.f, 1.f) == 0xFFFF0000u);
+    EXPECT_EQ(PackColor(1.f, 0.f, 0.f), 0xFFFF0000u);
+    EXPECT_EQ(PackColor(0.f, 1.f, 0.f, 0.f), 0x0000FF00u);
+    EXPECT_EQ(PackColor(2.f, -1.f, 0.f, 1.f), 0xFFFF0000u);
 }
 
-TEST_CASE("a box is 12 triangles and 12 outline edges", "[mesh]")
+TEST(Mesh, BoxIs12TrianglesAnd12OutlineEdges)
 {
     MeshData data;
     Builder b(data);
@@ -21,17 +21,17 @@ TEST_CASE("a box is 12 triangles and 12 outline edges", "[mesh]")
     b.SetStyle(style);
     b.Box(rmath::Identity(), {10, 20, 30});
 
-    CHECK(b.Shapes() == 1);
-    CHECK(data.tris.size() == 12 * 3);
-    CHECK(data.lines.size() == 12 * 2);    // Only the cube's edges: the diagonals of its faces are not creases
+    EXPECT_EQ(b.Shapes(), 1u);
+    EXPECT_EQ(data.tris.size(), 12u * 3);
+    EXPECT_EQ(data.lines.size(), 12u * 2);    // Only the cube's edges: the diagonals of its faces are not creases
     for (const Vertex& v : data.tris) {
-        CHECK((v.x == 10.f || v.x == -10.f));
-        CHECK((v.y == 20.f || v.y == -20.f));
-        CHECK((v.z == 30.f || v.z == -30.f));
+        EXPECT_TRUE(v.x == 10.f || v.x == -10.f) << "x = " << v.x;
+        EXPECT_TRUE(v.y == 20.f || v.y == -20.f) << "y = " << v.y;
+        EXPECT_TRUE(v.z == 30.f || v.z == -30.f) << "z = " << v.z;
     }
 }
 
-TEST_CASE("wireframe style has no faces, fill-only style has no lines", "[mesh]")
+TEST(Mesh, WireframeHasNoFacesFillOnlyHasNoLines)
 {
     MeshData wire, solid;
     Builder bw(wire), bs(solid);
@@ -44,27 +44,27 @@ TEST_CASE("wireframe style has no faces, fill-only style has no lines", "[mesh]"
     bs.SetStyle(s);
     bs.Sphere(rmath::Identity(), 50.f);
 
-    CHECK(wire.tris.empty());
-    CHECK_FALSE(wire.lines.empty());
-    CHECK_FALSE(solid.tris.empty());
-    CHECK(solid.lines.empty());
+    EXPECT_TRUE(wire.tris.empty());
+    EXPECT_FALSE(wire.lines.empty());
+    EXPECT_FALSE(solid.tris.empty());
+    EXPECT_TRUE(solid.lines.empty());
 }
 
-TEST_CASE("out-of-range indices are skipped and counted", "[mesh]")
+TEST(Mesh, OutOfRangeIndicesAreSkippedAndCounted)
 {
     MeshData data;
     Builder b(data);
     b.Mesh({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}, {0, 1, 2, 0, 1, 7});
-    CHECK(data.tris.size() == 3);
-    CHECK(b.GetCounters().invalidTriangles == 1);
+    EXPECT_EQ(data.tris.size(), 3u);
+    EXPECT_EQ(b.GetCounters().invalidTriangles, 1u);
 }
 
-TEST_CASE("lines keep their color", "[mesh]")
+TEST(Mesh, LinesKeepTheirColor)
 {
     MeshData data;
     Builder b(data);
     b.Line({0, 0, 0}, {1, 2, 3}, 0xFF123456u);
-    REQUIRE(data.lines.size() == 2);
-    CHECK(data.lines[1].x == 1.f);
-    CHECK(data.lines[0].color == 0xFF123456u);
+    ASSERT_EQ(data.lines.size(), 2u);
+    EXPECT_FLOAT_EQ(data.lines[1].x, 1.f);
+    EXPECT_EQ(data.lines[0].color, 0xFF123456u);
 }

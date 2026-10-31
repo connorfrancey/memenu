@@ -1,4 +1,5 @@
 #include "game.h"
+#include "game/uobject.h"
 #include "core/cache.h"
 
 #include <Windows.h>
@@ -27,7 +28,6 @@ namespace {
     std::atomic<bool> g_inputApplied{false};    // We currently own the controller's bIgnoreLookInput
     bool g_prevIgnoreLook = false;
     std::atomic<unsigned long long> g_ticks{0};
-    std::atomic<float> g_engineNear{0.f};       // From the engine's projection matrix, 0 = unknown
     std::atomic<bool> g_hasPawn{false};
     std::atomic<int> g_health{0}, g_maxHealth{0};
 
@@ -37,13 +37,40 @@ namespace {
     std::vector<game::LevelLoadCallback> g_levelLoadCallbacks;
     std::vector<game::StateChangeCallback> g_stateChangeCallbacks;   // Not called yet: no hook for it
 
-    // Cached lookups, game thread only. Cleared whenever a level starts loading.
+    // The local player's world and controller, game thread only. Kept between ticks while their slots in the object
+    // list still hold them (checked once per tick, without touching the objects: see ValidateCache), dropped when a
+    // level starts loading. When there is none (main menu screens, loading), the object list is scanned again at most
+    // every kRescanTicks ticks: a scan walks ~100k objects.
+    constexpr unsigned long long kRescanTicks = 15;
     Classes::AWorldInfo* g_world = nullptr;
     Classes::ATdPlayerController* g_controller = nullptr;
+    std::size_t g_worldIndex = 0, g_controllerIndex = 0;
+    unsigned long long g_validatedTick = ~0ull;     // Tick the cache was last checked in
+    unsigned long long g_nextScanTick = 0;          // Nothing found: don't scan again before this tick
+    std::atomic<unsigned long long> g_scans{0};
+
+    void DropCache()
+    {
+        g_world = nullptr;
+        g_controller = nullptr;
+        g_nextScanTick = 0;
+    }
+
+    // Still the same player? Both objects alive, the controller still in the world's list and still set up. A respawn
+    // or a restart that replaces them without the level-load hook makes this fail, and the next lookup scans again.
+    void ValidateCache()
+    {
+        g_validatedTick = g_ticks;
+        if (!g_controller) return;
+        if (!game::AliveAt(g_world, g_worldIndex) || !game::AliveAt(g_controller, g_controllerIndex)) { DropCache(); return; }
+        bool listed = false;
+        int n = 0;
+        for (auto c = g_world->ControllerList; c && n < 64 && !listed; c = c->NextController, ++n) listed = c == g_controller;
+        if (!listed || !g_controller->PlayerCamera) DropCache();
+    }
 
     void (__thiscall *oTick)(float*, int, float) = nullptr;
     int (__thiscall *oLevelLoad)(void*, void*, unsigned long long) = nullptr;
-    int* (__thiscall *oProjection)(float*, void*) = nullptr;
 
     // ---- Pattern scan over the main executable's image --------------------------------------------------------------
     // Pattern/mask as used by mmultiplayer: 'x' = byte must match, '?' = wildcard.
@@ -142,10 +169,9 @@ namespace {
         ++g_ticks;
         if (!g_loading)
         {
-            // Look the world/controller up every tick (lazily, on first use): a respawn or level restart can
-            // replace them without going through the level-load hook, and a stale pointer would be a crash.
-            g_world = nullptr;
-            g_controller = nullptr;
+            // A respawn or level restart can replace the world/controller without going through the level-load
+            // hook, and a stale pointer would be a crash: check the cached ones before anything uses them.
+            ValidateCache();
 
             DrainQueue();
             ApplyInputBlock();
@@ -164,37 +190,22 @@ namespace {
         // The camera is read *after* the engine has ticked: the player controller updates its camera during the tick, so a
         // read before it is one frame old and a volume drawn from it trails the world as you move (jitter).
         if (!g_loading && g_trackCamera) {
-            g_world = nullptr;
-            g_controller = nullptr;     // The tick may have replaced them
+            ValidateCache();            // The tick may have replaced them
             UpdateCamera();
         }
     }
 
-    // The engine builds its projection matrix here (found by mmultiplayer). Only the near plane is taken from it, to make
-    // the depth values of the debug renderer line up with the depth buffer of the game.
-    int* __fastcall ProjectionHook(float* m, void* /*edx*/, void* arg) {
-        int* ret = oProjection(m, arg);
-        static bool logged = false;
-        if (m && !IsBadReadPtr(m, 16 * sizeof(float))) {
-            if (!logged) {
-                logged = true;
-                spdlog::info("Engine projection (raw): [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}] "
-                             "[{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}]",
-                             m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
-            }
-            // Infinite-far perspective: [2][2] = 1 and [3][2] = -near
-            const float z = m[10], w = m[14];
-            if (std::isfinite(z) && std::isfinite(w) && std::fabs(z - 1.f) < 0.01f && w < -1.f && w > -200.f)
-                g_engineNear = -w;
-        }
-        return ret;
-    }
+    // There is deliberately no "projection" hook. mmultiplayer hooks the function at "\x83\xEC\x3C\xD9\x44\x24\x44" as
+    // `int*(__thiscall*)(FMatrix*, void*)`, but in this game version that function is a visibility test: it reads ecx
+    // AND edx as inputs, takes two stack arguments the caller pops (it ends in a plain `ret`) and returns 0/1. Hooked
+    // with that signature it unbalanced the stack on every call (the debug build's /RTC check fired on it, release
+    // builds crashed later) and passed it a garbage edx. Nothing there is a projection matrix either, so the debug
+    // renderer uses its own near plane setting (game::EngineNear() returns 0).
 
     int __fastcall LevelLoadHook(void* self, void* /*edx*/, void** levelInfo, unsigned long long arg)
     {
         g_loading = true;
-        g_world = nullptr;
-        g_controller = nullptr;
+        DropCache();
         cache::NextLevel();
 
         std::vector<game::LevelLoadCallback> callbacks;
@@ -217,6 +228,33 @@ namespace {
         }
         return true;
     }
+}
+
+bool game::CheckObjectLayout()
+{
+    // A class must reach Actor and Object through SuperOf(), and Actor's own fields must include Location.
+    const auto* pawnClass = Classes::ATdPlayerPawn::StaticClass();
+    const auto* actorClass = Classes::AActor::StaticClass();
+    if (!pawnClass || !actorClass) {
+        spdlog::error("Object layout: TdPlayerPawn/Actor classes not found");
+        return false;
+    }
+    bool reachesActor = false;
+    int depth = 0;
+    for (const Classes::UStruct* c = pawnClass; c && depth < 64; c = SuperOf(c), ++depth)
+        if (c == actorClass) { reachesActor = true; break; }
+    int fields = 0;
+    bool hasLocation = false;
+    for (Classes::UField* f = ChildrenOf(actorClass); f && fields < 10000; f = NextOf(f), ++fields)
+        if (f->GetName() == "Location") hasLocation = true;
+    if (!reachesActor || !hasLocation) {
+        spdlog::error("Object layout: does not match this game (TdPlayerPawn reaches Actor: {}, Actor has {} fields, "
+                      "Location among them: {}): class reflection (save state, IsA) will not work",
+                      reachesActor, fields, hasLocation);
+        return false;
+    }
+    spdlog::info("Object layout: ok (TdPlayerPawn -> Actor in {} steps, Actor declares {} fields)", depth, fields);
+    return true;
 }
 
 bool game::Init()
@@ -242,6 +280,7 @@ bool game::Init()
 
     spdlog::info("SDK globals: GNames={} entries, GObjects={} objects",
                  Classes::FName::GetGlobalNames().Num(), Classes::UObject::GetGlobalObjects().Num());
+    CheckObjectLayout();   // Only logs: the menu and most features work without class reflection
 
     ptr = FindPattern(
         "\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x81\xEC"
@@ -258,11 +297,6 @@ bool game::Init()
         "xxxxxxxxxx????xx????xx????xx");
     if (!ptr) { spdlog::error("Tick pattern not found"); return false; }
     if (!HookAt(ptr, reinterpret_cast<void*>(&TickHook), reinterpret_cast<void**>(&oTick), "Tick")) return false;
-
-    // Optional: the debug renderer falls back to its own near plane setting without it.
-    ptr = FindPattern("\x83\xEC\x3C\xD9\x44\x24\x44", "xxxxxxx");
-    if (!ptr || !HookAt(ptr, reinterpret_cast<void*>(&ProjectionHook), reinterpret_cast<void**>(&oProjection), "Projection"))
-        spdlog::warn("Projection pattern not found or not hookable: the debug renderer will use its near plane setting");
 
     g_ready = true;
     spdlog::info("Game integration ready");
@@ -323,7 +357,7 @@ void game::SetCameraTracking(bool enabled) {
 }
 
 float game::EngineNear() {
-    return g_engineNear;
+    return 0.f;     // Unknown: no source for the engine's projection yet (see the note above LevelLoadHook)
 }
 
 rmath::Camera game::GetCamera() {
@@ -340,6 +374,7 @@ game::Status game::GetStatus()
     s.health = g_health;
     s.maxHealth = g_maxHealth;
     s.ticks = g_ticks;
+    s.objectScans = g_scans;
     return s;
 }
 
@@ -363,25 +398,31 @@ void game::RunOnGameThread(std::function<void()> fn)
 Classes::ATdPlayerController* game::Controller()
 {
     if (!g_ready || g_loading) return nullptr;
+    if (g_validatedTick != g_ticks) ValidateCache();   // Called outside the tick hook (another hook, a callback)
+    if (g_controller) return g_controller;
+    if (g_ticks < g_nextScanTick) return nullptr;      // Looked a moment ago and there was none
 
-    if (!g_controller) {
-        const auto& objects = Classes::UObject::GetGlobalObjects();
-        for (std::size_t i = 0; i < objects.Num() && !g_controller; ++i) {
-            const auto object = objects.GetByIndex(i);
-            if (!object || !object->IsA(Classes::AWorldInfo::StaticClass())) continue;
+    ++g_scans;
+    const auto& objects = Classes::UObject::GetGlobalObjects();
+    const auto* worldClass = Classes::AWorldInfo::StaticClass();
+    const auto* controllerClass = Classes::ATdPlayerController::StaticClass();
+    for (std::size_t i = 0; i < objects.Num() && !g_controller; ++i) {
+        const auto object = objects.GetByIndex(i);
+        if (!object || !IsA(object, worldClass)) continue;
 
-            const auto world = static_cast<Classes::AWorldInfo*>(object);
-            for (auto c = world->ControllerList; c; c = c->NextController) {
-                if (!c->IsA(Classes::ATdPlayerController::StaticClass())) continue;
-                const auto pc = static_cast<Classes::ATdPlayerController*>(c);
-                if (!pc->PlayerCamera) break;                 // Level not fully set up yet
-                g_world = world;
-                g_controller = pc;
-                break;
-            }
+        const auto world = static_cast<Classes::AWorldInfo*>(object);
+        for (auto c = world->ControllerList; c; c = c->NextController) {
+            if (!IsA(c, controllerClass)) continue;
+            const auto pc = static_cast<Classes::ATdPlayerController*>(c);
+            if (!pc->PlayerCamera) break;                 // Level not fully set up yet
+            g_world = world;
+            g_worldIndex = i;
+            g_controller = pc;
+            g_controllerIndex = IndexOf(pc);
+            break;
         }
     }
-
+    if (!g_controller) g_nextScanTick = g_ticks + kRescanTicks;
     return g_controller;
 }
 
@@ -395,6 +436,6 @@ Classes::ATdPlayerPawn* game::Pawn()
 {
     const auto controller = Controller();
     if (!controller || !controller->AcknowledgedPawn) return nullptr;
-    if (!controller->AcknowledgedPawn->IsA(Classes::ATdPlayerPawn::StaticClass())) return nullptr;
+    if (!IsA(controller->AcknowledgedPawn, Classes::ATdPlayerPawn::StaticClass())) return nullptr;
     return static_cast<Classes::ATdPlayerPawn*>(controller->AcknowledgedPawn);
 }

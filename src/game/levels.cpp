@@ -3,6 +3,8 @@
 
 #include <Windows.h>
 
+#include "game/uobject.h"
+
 #include <ME_SDK.hpp>
 #include <spdlog/spdlog.h>
 
@@ -78,7 +80,7 @@ namespace levels
         {
             if (auto* world = game::World())
             {
-                if (world->Game && world->Game->IsA(Classes::ATdGameInfo::StaticClass()))
+                if (world->Game && game::IsA(world->Game, Classes::ATdGameInfo::StaticClass()))
                 {
                     if (auto* data = static_cast<Classes::ATdGameInfo*>(world->Game)->TdGameData) return data;
                 }
@@ -88,7 +90,7 @@ namespace levels
             Classes::UUIDataStore_TdGameData* found = nullptr;
             ForEachObject([&](Classes::UObject* o)
             {
-                if (!found && o->IsA(Classes::UUIDataStore_TdGameData::StaticClass()))
+                if (!found && game::IsA(o, Classes::UUIDataStore_TdGameData::StaticClass()))
                     found = static_cast<Classes::UUIDataStore_TdGameData*>(o);
             });
             return found;
@@ -100,9 +102,9 @@ namespace levels
             Classes::APlayerController* found = nullptr;
             ForEachObject([&](Classes::UObject* o)
             {
-                if (found || !o->IsA(Classes::AWorldInfo::StaticClass())) return;
+                if (found || !game::IsA(o, Classes::AWorldInfo::StaticClass())) return;
                 for (auto c = static_cast<Classes::AWorldInfo*>(o)->ControllerList; c && !found; c = c->NextController)
-                    if (c->IsA(Classes::APlayerController::StaticClass())) found = static_cast<
+                    if (game::IsA(c, Classes::APlayerController::StaticClass())) found = static_cast<
                         Classes::APlayerController*>(c);
             });
             return found;
@@ -116,7 +118,7 @@ namespace levels
 
             ForEachObject([&](Classes::UObject* o)
             {
-                if (!o->IsA(Classes::UUIDataProvider_TdMaps::StaticClass())) return;
+                if (!game::IsA(o, Classes::UUIDataProvider_TdMaps::StaticClass())) return;
                 auto* p = static_cast<Classes::UUIDataProvider_TdMaps*>(o);
 
                 MapEntry e;

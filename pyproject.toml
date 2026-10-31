@@ -16,7 +16,9 @@ license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.1",
+    "questionary>=2.1.1",
     "rich>=13.7",
+    "zstandard>=0.23; python_version < '3.14'",   # Archived logs (logs/.old/*.log.zst); 3.14+ has compression.zstd
 ]
 
 [project.scripts]

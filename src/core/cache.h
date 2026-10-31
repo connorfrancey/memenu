@@ -1,5 +1,6 @@
 #pragma once
 #include "clock.h"
+#include "optimizations.h"
 
 #include <atomic>
 #include <cstdint>
@@ -100,9 +101,9 @@ namespace cache
 			}
 		}
 		
-		bool Fresh() const 
+		bool Fresh() const
 		{
-			if (!valid_) return false;
+			if (!opt::kEnabled || !valid_) return false;	// No optimizations: recompute on every Get()
 			switch (scope_) 
 			{
 				case Scope::Tick: return stamp_ == TickEpoch();

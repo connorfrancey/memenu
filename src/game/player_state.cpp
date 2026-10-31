@@ -1,6 +1,8 @@
 #include "game/player_state.h"
+#include "game/flight.h"
 #include "game/game.h"
 #include "game/object_ref.h"
+#include "game/uobject.h"
 
 #include <Windows.h>
 
@@ -47,9 +49,9 @@ T* Read(const void* p, int at)
 
 UProperty* FindProperty(UClass* cls, const char* name)
 {
-    for (auto* s = static_cast<UStruct*>(cls); s; s = static_cast<UStruct*>(s->SuperField))
-        for (UField* f = s->Children; f; f = f->Next)
-            if (f->IsA(UProperty::StaticClass()) && f->GetName() == name) return static_cast<UProperty*>(f);
+    for (UStruct* s = cls; s; s = game::SuperOf(s))
+        for (UField* f = game::ChildrenOf(s); f; f = game::NextOf(f))
+            if (game::IsA(f, UProperty::StaticClass()) && f->GetName() == name) return static_cast<UProperty*>(f);
     return nullptr;
 }
 
@@ -125,9 +127,18 @@ std::unordered_map<UClass*, std::vector<Field>> g_plans;
 bool IsCopiedStruct(UProperty* prop)
 {
     auto* st = Read<UObject>(prop, kSubclassField);
-    if (!st || !st->IsA(UScriptStruct::StaticClass())) return false;
+    if (!st || !game::IsA(st, UScriptStruct::StaticClass())) return false;
     const auto name = st->GetName();
     return name == "Vector" || name == "Rotator";           // the only structs the trainer saves
+}
+
+// Values the menu itself sets while it runs (input blocking while it is open, God Mode, No Clip). A state saved while
+// they were set would bring them back on load, e.g. a camera that no longer turns after the menu was closed, or a
+// player without collision. (Physics is saved, it is part of the move; Load fixes the one No Clip/Flight leave.)
+bool IsOwnedByMenu(const std::string& name)
+{
+    return name == "bIgnoreLookInput" || name == "bIgnoreMoveInput" || name == "bIgnoreButtonInput" ||
+           name == "bGodMode" || name == "bCollideWorld";
 }
 
 const std::vector<Field>& PlanFor(UClass* cls)
@@ -135,10 +146,10 @@ const std::vector<Field>& PlanFor(UClass* cls)
     if (auto it = g_plans.find(cls); it != g_plans.end()) return it->second;
 
     std::vector<Field> plan;
-    const std::uint32_t classSize = static_cast<UStruct*>(cls)->PropertySize;
-    for (auto* s = static_cast<UStruct*>(cls); s; s = static_cast<UStruct*>(s->SuperField)) {
-        for (UField* f = s->Children; f; f = f->Next) {
-            if (!f->IsA(UProperty::StaticClass())) continue;
+    const std::uint32_t classSize = game::PropertySizeOf(cls);
+    for (UStruct* s = cls; s; s = game::SuperOf(s)) {
+        for (UField* f = game::ChildrenOf(s); f; f = game::NextOf(f)) {
+            if (!game::IsA(f, UProperty::StaticClass())) continue;
             auto* prop = static_cast<UProperty*>(f);
 
             const std::uint32_t offset = Dword(prop, g_layout.offset);
@@ -147,13 +158,14 @@ const std::vector<Field>& PlanFor(UClass* cls)
             if (dim < 1 || dim > 256 || elementSize < 1 || elementSize > 64) continue;
             const std::uint32_t size = elementSize * dim;
             if (offset < sizeof(UObject) || (classSize && offset + size > classSize)) continue;
+            if (IsOwnedByMenu(prop->GetName())) continue;
 
-            if (prop->IsA(UBoolProperty::StaticClass())) {
+            if (game::IsA(prop, UBoolProperty::StaticClass())) {
                 const std::uint32_t mask = Dword(prop, kSubclassField);
                 if (mask && !(mask & (mask - 1))) plan.push_back({offset, 4, mask});
-            } else if (prop->IsA(UByteProperty::StaticClass()) || prop->IsA(UIntProperty::StaticClass()) ||
-                       prop->IsA(UFloatProperty::StaticClass()) ||
-                       (prop->IsA(UStructProperty::StaticClass()) && IsCopiedStruct(prop))) {
+            } else if (game::IsA(prop, UByteProperty::StaticClass()) || game::IsA(prop, UIntProperty::StaticClass()) ||
+                       game::IsA(prop, UFloatProperty::StaticClass()) ||
+                       (game::IsA(prop, UStructProperty::StaticClass()) && IsCopiedStruct(prop))) {
                 plan.push_back({offset, size, 0});
             }
         }
@@ -261,6 +273,7 @@ bool player_state::Save()
     }
 
     g_hasSave = true;
+    spdlog::info("Save state: saved at ({:.0f}, {:.0f}, {:.0f})", pawn->Location.X, pawn->Location.Y, pawn->Location.Z);
     return true;
 }
 
@@ -269,8 +282,14 @@ bool player_state::Load()
     auto* pawn = game::Pawn();
     auto* controller = game::Controller();
     auto* world = game::World();
-    if (!g_hasSave || !pawn || !controller || !world) return false;
-    if (pawn->bCutsceneIsSkippable) return false;            // in a cutscene
+    if (!g_hasSave || !pawn || !controller || !world) {
+        spdlog::info("Save state: not loaded ({})", !g_hasSave ? "nothing saved" : "no player");
+        return false;
+    }
+    if (pawn->bCutsceneIsSkippable) {                        // in a cutscene
+        spdlog::info("Save state: not loaded (a cutscene is playing)");
+        return false;
+    }
 
     const Snapshot& s = g_save;
 
@@ -307,7 +326,12 @@ bool player_state::Load()
         neck->QuadraticDownwardTranslation = s.quadraticDownward;
     }
 
+    // Saved during Flight/No Clip (no physics): outside them that would leave the player hanging in the air
+    if (!flight::Active() && pawn->Physics == EPhysics::PHYS_None) pawn->Physics = EPhysics::PHYS_Falling;
+
     ++g_loadCount;
+    spdlog::info("Save state: loaded, player at ({:.0f}, {:.0f}, {:.0f})", pawn->Location.X, pawn->Location.Y,
+                 pawn->Location.Z);
     return true;
 }
 

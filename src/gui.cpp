@@ -118,9 +118,11 @@ void gui::Render()
         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 
     float x = 24.f;
+    bool anyTab = false;
     for (auto& tab : modules::Tabs())
     {
         if (tab->modules.empty()) continue;
+        anyTab = true;
 
         ImGui::SetNextWindowPos({x, 24.f}, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSizeConstraints({tab->width, 0.f}, {tab->width, FLT_MAX});
@@ -130,6 +132,15 @@ void gui::Render()
         }
         ImGui::End();
         x += tab->width + 12.f;
+    }
+
+    // Built with every feature off (MEMENU_FEATURES=OFF): still show that the menu is loaded
+    if (!anyTab)
+    {
+        ImGui::SetNextWindowPos({x, 24.f}, ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Mirror's Edge Menu", nullptr, kFlags))
+            ImGui::TextDisabled("Built without features");
+        ImGui::End();
     }
     theme::End(); // must be popped before ImGui::EndFrame()
 

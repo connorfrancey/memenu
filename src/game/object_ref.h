@@ -29,7 +29,7 @@ namespace game
 		T* Find(Match&& match)
 		{
 			auto& objects = Classes::UObject::GetGlobalObjects();
-			if (ptr_ && index_ < objects.Num() && objects.GetByIndex(index_) == ptr_)
+			if (opt::kEnabled && ptr_ && index_ < objects.Num() && objects.GetByIndex(index_) == ptr_)
 			{
 				stats_->hits.fetch_add(1, std::memory_order_relaxed);
 				return ptr_;
@@ -37,7 +37,9 @@ namespace game
 			ptr_ = nullptr;
 
 			// Nothing last time: wait before walking the object list again, unless a level was loaded since.
-			if (missed_ && cache::LevelEpoch() == missLevel_ && cache::TickEpoch() - missTick_ < retry_) return nullptr;
+			// (No optimizations: scan every time.)
+			if (opt::kEnabled && missed_ && cache::LevelEpoch() == missLevel_ && cache::TickEpoch() - missTick_ < retry_)
+				return nullptr;
 
 			stats_->misses.fetch_add(1, std::memory_order_relaxed);
 			const clk::Ticks t0 = clk::Now();

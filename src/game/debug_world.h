@@ -37,6 +37,7 @@ namespace debugworld {
         double lastScanMs = 0.0;
         std::size_t scans = 0;
         bool baking = false;                        // "Bake all levels" is running
+        std::string bakeStatus;                     // Progress / result of the last bake
     };
 
     void Update(const Config& config);              // Call every tick: rebuilds the scene when it is due

@@ -7,7 +7,7 @@
 
 #include <Windows.h>
 
-#include <mirrorsedge_sdk.h>
+#include <ME_SDK.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>

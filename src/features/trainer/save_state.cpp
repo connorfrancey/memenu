@@ -3,7 +3,7 @@
 #include "game/game.h"
 #include "game/player_state.h"
 
-#include <mirrorsedge_sdk.h>
+#include <ME_SDK.hpp>
 
 namespace {
 

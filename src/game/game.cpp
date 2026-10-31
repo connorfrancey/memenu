@@ -1,10 +1,11 @@
 #include "game.h"
+#include "core/cache.h"
 
 #include <Windows.h>
 
 #include <MinHook.h>
 #include <spdlog/spdlog.h>
-#include <mirrorsedge_sdk.h>
+#include <ME_SDK.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +23,7 @@ namespace {
     std::mutex g_cameraMutex;
     rmath::Camera g_camera;
     std::atomic<bool> g_blockInput{false};      // Menu open: ignore look input
+    std::atomic<bool> g_inputSuspended{false};  // A TAS session owns the input
     std::atomic<bool> g_inputApplied{false};    // We currently own the controller's bIgnoreLookInput
     bool g_prevIgnoreLook = false;
     std::atomic<unsigned long long> g_ticks{0};
@@ -32,6 +34,8 @@ namespace {
     std::mutex g_mutex;                         // Guards the two vectors below
     std::vector<game::TickCallback> g_tickCallbacks;
     std::vector<std::function<void()>> g_queue;
+    std::vector<game::LevelLoadCallback> g_levelLoadCallbacks;
+    std::vector<game::StateChangeCallback> g_stateChangeCallbacks;   // Not called yet: no hook for it
 
     // Cached lookups, game thread only. Cleared whenever a level starts loading.
     Classes::AWorldInfo* g_world = nullptr;
@@ -86,7 +90,7 @@ namespace {
     // Game thread. Sets the controller's bIgnoreLookInput while the menu is open and puts the old value back after.
     void ApplyInputBlock()
     {
-        const bool want = g_blockInput;
+        const bool want = g_blockInput && !g_inputSuspended;
         if (!want && !g_inputApplied) return;   // Nothing to do, don't even look the controller up
 
         auto* pc = game::Controller();
@@ -191,8 +195,17 @@ namespace {
         g_loading = true;
         g_world = nullptr;
         g_controller = nullptr;
+        cache::NextLevel();
+
+        std::vector<game::LevelLoadCallback> callbacks;
+        {
+            std::lock_guard lock(g_mutex);
+            callbacks = g_levelLoadCallbacks;
+        }
+        for (auto cb : callbacks) cb(false);
         const int ret = oLevelLoad(self, levelInfo, arg);
         g_loading = false;
+        for (auto cb : callbacks) cb(true);
         return ret;
     }
 
@@ -275,6 +288,34 @@ void game::Shutdown()
 void game::SetInputBlocked(bool blocked)
 {
     g_blockInput = blocked;
+}
+
+void game::SetInputBlockedSuspended(bool suspended)
+{
+    g_inputSuspended = suspended;
+}
+
+void game::OnLevelLoad(LevelLoadCallback callback)
+{
+    std::lock_guard lock(g_mutex);
+    g_levelLoadCallbacks.push_back(callback);
+}
+
+void game::OnPlayerStateChange(StateChangeCallback callback)
+{
+    // TODO: hook the player's move state handler (mmultiplayer's trainer has the pattern). Until then nothing calls these.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        spdlog::warn("Player state change hook is not implemented: tools that rely on it (Strang) do nothing");
+    }
+    std::lock_guard lock(g_mutex);
+    g_stateChangeCallbacks.push_back(callback);
+}
+
+void* game::FindPattern(const char* pattern, const char* mask)
+{
+    return ::FindPattern(pattern, mask);
 }
 
 void game::SetCameraTracking(bool enabled) {

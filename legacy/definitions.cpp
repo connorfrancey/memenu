@@ -8,7 +8,7 @@
 #include "theme.h"
 
 #include <Windows.h>
-#include <mirrorsedge_sdk.h>   // the mmultiplayer SDK: Classes::ATdPlayerPawn, Classes::AWorldInfo, ...
+#include <ME_SDK.hpp>   // the mmultiplayer SDK: Classes::ATdPlayerPawn, Classes::AWorldInfo, ...
 
 #include <cstdio>
 #include <string>

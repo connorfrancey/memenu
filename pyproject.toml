@@ -1,0 +1,29 @@
+# Developer tooling for the project (not part of the mod itself).
+#
+#   uv sync                 create .venv and install the `memenu` command into it
+#   uv run memenu --help    build, test, install into the game, package, ...
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memenu-tools"
+version = "0.1.0"
+description = "Build, test, install and package Mirror's Edge Menu"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.7",
+]
+
+[project.scripts]
+memenu = "memenu_tools.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "tools" }
+
+[tool.setuptools.packages.find]
+where = ["tools"]

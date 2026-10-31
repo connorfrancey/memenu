@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 4.2)
 project(medge_menu LANGUAGES C CXX)
+set(MEMENU_VERSION "0.1.0")   # Shown by the installer, stamped into the loader
 
 # -------------------------------------------------------------------------------------------------
 # Platform Guards (Mirror's Edge is a 32-bit Windows process)
@@ -55,5 +56,14 @@ endif()
 include(cmake/Libraries.cmake)
 
 # -------------------------------------------------------------------------------------------------
-# Launcher (injects the DLL into the game)
-#add_subdirectory(launcher)
+# Loader (dinput8.dll proxy next to the game exe) and its installer: the normal way to use the menu
+add_subdirectory(loader)
+add_subdirectory(installer)
+
+# Launcher (injects the DLL into a running game without installing anything)
+add_subdirectory(launcher)
+
+# -------------------------------------------------------------------------------------------------
+# Tests (Catch2)
+enable_testing()
+add_subdirectory(tests)

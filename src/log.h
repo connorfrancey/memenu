@@ -1,4 +1,10 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <vector>
+
 namespace logging {
     void Init();        // Default spdlog logger -> memenu.log + OutputDebugString + in-memory buffer
     void Shutdown();

@@ -1,0 +1,15 @@
+# Build output
+cmake-build-*/
+build/
+dist/
+
+# Python tooling (uv)
+.venv/
+__pycache__/
+*.egg-info/
+
+# Cached MSVC environment (tools/memenu_tools/toolchain.py)
+.cache/
+
+# CPM dependency cache on CI (.github/workflows/release.yml)
+.cpm-cache/

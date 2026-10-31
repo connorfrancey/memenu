@@ -3,7 +3,7 @@
 
 #include <spdlog/spdlog.h>
 #include <spdlog/details/null_mutex.h>
-#include <spdlog/sinks/basic_sink.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/msvc_sink.h>
 
@@ -22,7 +22,7 @@ namespace {
     std::uint64_t g_nextId = 1;
 
     // Keeps the last kMaxEntries lines in memory. Locking is done here, so the sink itself needs no mutex.
-    class MemorySink final : public spdlog::sinks::base_sink<spdlog::details::nul_mutex> {
+    class MemorySink final : public spdlog::sinks::base_sink<spdlog::details::null_mutex> {
     protected:
         void sink_it_(const spdlog::details::log_msg& msg) override
         {
@@ -73,3 +73,21 @@ void logging::Init() {
         // Logging is best-effort; never take the game down over it.
     }
 }
+
+void logging::Shutdown()
+{
+    if (auto logger = spdlog::default_logger()) logger->flush();
+    spdlog::shutdown();
+}
+
+std::uint64_t logging::CopySince(std::uint64_t afterId, std::vector<Entry>& out)
+{
+    std::lock_guard lock(g_mutex);
+    // Ids increase along the deque: skip to the first one that is newer.
+    auto it = std::upper_bound(g_entries.begin(), g_entries.end(), afterId,
+                               [](std::uint64_t id, const Entry& e) { return id < e.id; });
+    out.insert(out.end(), it, g_entries.end());
+    return g_entries.empty() ? afterId : std::max(afterId, g_entries.back().id);
+}
+
+const std::filesystem::path& logging::FilePath() { return g_file; }

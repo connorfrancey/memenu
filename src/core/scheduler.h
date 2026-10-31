@@ -54,7 +54,8 @@ namespace sched
 		Priority priority = Priority::Normal;
 		State state = State::Idle;
 		float interval = 0.f, effectiveInterval = 0.f;
-		std::uint64_t runs = 0, maxUs = 0.f, lastUs = 0.f;		// OnTick / task cost
+		std::uint64_t runs = 0, deferrals = 0;
+		float avgUs = 0.f, maxUs = 0.f, lastUs = 0.f;			// OnTick / task cost
 		float renderAvgUs = 0.f, renderMaxUs = 0.f;				// Modules: OnRender cost
 		int order = 0;	
 	};

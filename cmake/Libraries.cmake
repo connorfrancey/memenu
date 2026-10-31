@@ -89,14 +89,8 @@ endif()
 # Portable File Dialogs
 #include(${CMAKE_SOURCE_DIR}/cmake/portable-file-dialogs.cmake)
 
-set(DIRECTX_SDK_ROOT "C:/Program Files (x86)/Microsoft DirectX SDK (June 2010)")
-target_include_directories(${PROJECT_NAME} PRIVATE
-        "${DIRECTX_SDK_ROOT}/Include"
-)
-
-target_link_directories(${PROJECT_NAME} PRIVATE
-        "${DIRECTX_SDK_ROOT}/Lib/x86"
-)
+# Direct3D 9 comes from the Windows SDK (d3d9.h / d3d9.lib). Nothing uses D3DX, so the legacy DirectX SDK
+# (June 2010) is not needed, and players don't need the d3dx9_43.dll runtime either.
 
 # mmultiplayer
 
@@ -106,13 +100,15 @@ target_link_directories(${PROJECT_NAME} PRIVATE
 # includes (no warnings from it). Only Client/sdk is added, not the fork's own client DLL and launcher.
 # To build against a local checkout instead: -DCPM_mmultiplayer_SOURCE=/path/to/mmultiplayer
 # GIT_TAG is pinned to a main commit (merge of sdk-cmake) for reproducible builds.
+# The me_sdk_docs target needs Doxygen at configure time: CI (and anyone without Doxygen) turns it off.
+option(MEMENU_SDK_DOCS "Add the SDK documentation target (needs Doxygen)" ON)
 CPMAddPackage(
         NAME mmultiplayer
         GITHUB_REPOSITORY connorfrancey/mmultiplayer
         GIT_TAG 7b1eb25ddc0fc1ce498d024e7b2f9d1980b9eca3
         SOURCE_SUBDIR Client/sdk
-        OPTIONS 
-            "ME_SDK_BUILD_DOCS ON"
+        OPTIONS
+            "ME_SDK_BUILD_DOCS ${MEMENU_SDK_DOCS}"
 )
 
 # Catch2
@@ -125,6 +121,6 @@ CPMAddPackage(
 # -------------------------------------------------------------------------------------------------
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-        imgui imjson minhook d3d9 shell32 spdlog::spdlog nlohmann_json::nlohmann_json d3dx9 me_sdk catch2)
+        imgui imjson minhook d3d9 shell32 spdlog::spdlog nlohmann_json::nlohmann_json winmm me_sdk)
 
 # -------------------------------------------------------------------------------------------------

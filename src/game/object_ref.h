@@ -1,7 +1,7 @@
 #pragma once
 #include "core/cache.h"
 
-#include <mirrorsedge_sdk.h>
+#include <ME_SDK.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -21,10 +21,54 @@ namespace game
 	class ObjectRef 
 	{
 	public:
+		explicit ObjectRef(std::string name, std::uint32_t retryTicks = 120)
+			: stats_(&cache::Register(std::move(name), cache::Scope::Level)), retry_(retryTicks) {}
+
+		// The remembered object if it is still alive, else the first object `match(UObject*)` accepts (or nullptr).
+		template <class Match>
+		T* Find(Match&& match)
+		{
+			auto& objects = Classes::UObject::GetGlobalObjects();
+			if (ptr_ && index_ < objects.Num() && objects.GetByIndex(index_) == ptr_)
+			{
+				stats_->hits.fetch_add(1, std::memory_order_relaxed);
+				return ptr_;
+			}
+			ptr_ = nullptr;
+
+			// Nothing last time: wait before walking the object list again, unless a level was loaded since.
+			if (missed_ && cache::LevelEpoch() == missLevel_ && cache::TickEpoch() - missTick_ < retry_) return nullptr;
+
+			stats_->misses.fetch_add(1, std::memory_order_relaxed);
+			const clk::Ticks t0 = clk::Now();
+			for (std::size_t i = 0; i < objects.Num(); ++i)
+			{
+				Classes::UObject* o = objects.GetByIndex(i);
+				if (o && match(o))
+				{
+					ptr_ = static_cast<T*>(o);
+					index_ = i;
+					break;
+				}
+			}
+			stats_->computeTicks.fetch_add(clk::Now() - t0, std::memory_order_relaxed);
+			missed_ = ptr_ == nullptr;
+			missTick_ = cache::TickEpoch();
+			missLevel_ = cache::LevelEpoch();
+			return ptr_;
+		}
+
+		void Reset()
+		{
+			if (ptr_) stats_->invalidations.fetch_add(1, std::memory_order_relaxed);
+			ptr_ = nullptr;
+			missed_ = false;
+		}
+
 	private:
 		cache::Stats* stats_;
 		std::uint32_t retry_;
-		T* ptr = nullptr;
+		T* ptr_ = nullptr;
 		std::size_t index_ = 0;
 		bool missed_ = false;
 		std::uint32_t missTick_ = 0, missLevel_ = 0;

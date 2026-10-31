@@ -62,3 +62,8 @@ add_subdirectory(installer)
 
 # Launcher (injects the DLL into a running game without installing anything)
 add_subdirectory(launcher)
+
+# -------------------------------------------------------------------------------------------------
+# Tests (Catch2)
+enable_testing()
+add_subdirectory(tests)

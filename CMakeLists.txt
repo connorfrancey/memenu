@@ -4,10 +4,10 @@ project(medge_menu LANGUAGES C CXX)
 # -------------------------------------------------------------------------------------------------
 # Platform Guards (Mirror's Edge is a 32-bit Windows process)
 if(NOT WIN32)
-message(FATAL_ERROR "${PROJECT_NAME} is Windows-only.")
+  message(FATAL_ERROR "${PROJECT_NAME} is Windows-only.")
 endif()
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
-message(FATAL_ERROR "Mirror's Edge is 32-bit. Use an x86 toolchain/preset (cmake -A Win32 / x86-debug).")
+  message(FATAL_ERROR "Mirror's Edge is 32-bit. Use an x86 toolchain/preset (cmake -A Win32 / x86-debug).")
 endif()
 
 # -------------------------------------------------------------------------------------------------
@@ -27,11 +27,11 @@ include(cmake/CPM.cmake)
 # -------------------------------------------------------------------------------------------------
 # Find sources and headers
 file(GLOB_RECURSE SOURCE_FILES CONFIGURE_DEPENDS
-${CMAKE_SOURCE_DIR}/src/*.c
-${CMAKE_SOURCE_DIR}/src/*.cpp)
+  ${CMAKE_SOURCE_DIR}/src/*.c
+  ${CMAKE_SOURCE_DIR}/src/*.cpp)
 file(GLOB_RECURSE HEADER_FILES CONFIGURE_DEPENDS
-${CMAKE_SOURCE_DIR}/src/*.h
-${CMAKE_SOURCE_DIR}/src/*.hpp)
+  ${CMAKE_SOURCE_DIR}/src/*.h
+  ${CMAKE_SOURCE_DIR}/src/*.hpp)
 
 # Injected mod => DLL, not an executable
 add_library(${PROJECT_NAME} SHARED ${HEADER_FILES} ${SOURCE_FILES})

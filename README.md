@@ -25,39 +25,48 @@ An internal mod menu, trainer and TAS / macro tool for Mirror's Edge (2008, PC),
 
 ## Installing
 
-Paste this into PowerShell and accept the administrator prompt (the game lives in Program Files):
+1. Download **`memenu_installer.exe`** from the [latest release](https://github.com/connorfrancey/memenu/releases/latest).
+2. Run it and accept the administrator prompt (the game lives in Program Files). If Windows says "Windows protected
+   your PC", click **More info → Run anyway**: the installer isn't code-signed.
+3. It finds Mirror's Edge by itself (Steam, EA app, other installs). Click **Install**, then **Yes** to start the game.
+   Press **INSERT** in the game to open the menu.
 
-```powershell
-irm https://raw.githubusercontent.com/connorfrancey/memenu/master/install.ps1 | iex
-```
+From then on the menu loads whenever you start the game, however you start it. To update, run a newer installer the
+same way: your settings stay.
 
-Then start Mirror's Edge the way you always do. The menu loads with the game. Run the same command again to update.
-
-**Linux, Steam Deck, macOS** (the game running in Proton, Wine, Lutris, CrossOver or Whisky): paste this into a
-terminal instead, and do the one extra step it shows you (a Steam launch option, or a Wine setting):
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/connorfrancey/memenu/master/install.sh | bash
-```
-
-Uninstall with `... | bash -s -- --uninstall`. This is less tested than Windows.
+**Uninstalling:** Windows **Settings → Apps → Installed apps → Mirror's Edge Menu → Uninstall** (or *Programs and
+Features* in the Control Panel). It asks whether to keep your settings and saved macros, then puts the game folder
+back the way it was. Running the installer again and clicking **Uninstall** does the same.
 
 <details>
-<summary>Other ways, and uninstalling</summary>
+<summary>Other ways: one command, Linux / Steam Deck / macOS, a game folder that isn't found</summary>
 
-- **Without PowerShell:** download `memenu_installer.exe` from the [latest release](https://github.com/connorfrancey/memenu/releases/latest),
-  run it and click **Install**. If it doesn't find your game, click **Browse** and pick `MirrorsEdge.exe`.
-- **Game not found automatically:**
+- **One command (Windows):** paste into PowerShell and accept the administrator prompt. Run it again to update.
+
+  ```powershell
+  irm https://raw.githubusercontent.com/connorfrancey/memenu/master/install.ps1 | iex
+  ```
+
+- **Linux, Steam Deck, macOS** (the game in Proton, Wine, Lutris, CrossOver or Whisky): paste into a terminal, and do
+  the one extra step it shows you (a Steam launch option, or a Wine setting). Uninstall with `... | bash -s --
+  --uninstall`. This is less tested than Windows.
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/connorfrancey/memenu/master/install.sh | bash
+  ```
+
+- **Game not found:** click **Browse** in the installer and pick `MirrorsEdge.exe`. With the script:
   `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/connorfrancey/memenu/master/install.ps1))) -GameDir "D:\Games\Mirror's Edge"`
-- **Uninstall:** the same with `-Uninstall` (add `-RemoveSettings` to delete your settings too), or **Uninstall** in the installer window.
+- **Uninstall from the script:** the same with `-Uninstall` (add `-RemoveSettings` to delete your settings too).
+- **From a command line:** `memenu_installer.exe --install|--uninstall ["game folder"] [--quiet] [--remove-settings]`.
 - **Without installing:** `medge_launcher.exe` injects the menu into a game that is already running.
 
 </details>
 
-What it does: it puts a small loader (`dinput8.dll`) next to `MirrorsEdge.exe` and the menu in a `memenu` folder beside
-it. The game itself is not modified, so Steam updates and "Verify integrity of game files" leave it alone. To start the
-game without the menu once, create an empty file called `disabled` in the `memenu` folder. **Uninstall** in the
-installer puts everything back (and offers to keep your settings).
+What it does: it puts a small loader (`dinput8.dll`) next to `MirrorsEdge.exe`, and the menu in a `memenu` folder beside
+it, with `uninstall.exe` (a copy of the installer) for the Apps list. The game's own files are not modified, so Steam
+updates and "Verify integrity of game files" leave it alone. A `dinput8.dll` from another mod is kept and put back on
+uninstall. To start the game without the menu once, create an empty file called `disabled` in the `memenu` folder.
 
 ---
 
@@ -72,9 +81,10 @@ installer puts everything back (and offers to keep your settings).
 
 The menu is a row of columns (tabs). Every row in a column is a **module**:
 
-- **Left click** a module to switch it on or off. Some modules are *actions* (Save State, Restart Checkpoint, ...):
-  clicking runs them once.
-- **Right click** a module to open its settings. They are saved with the rest of your config.
+- **Click** a module's name to open its settings, **right click** it to close them. Settings are saved with the rest
+  of your config.
+- The **switch** on the right of a module turns it on or off. Some modules are *actions* (Save State, Restart
+  Checkpoint, ...): they have a **Run** button there instead, which runs them once.
 - Every module has a **Toggle key** / **Hotkey** button at the bottom of its settings. Click it, then press the key
   you want (Escape cancels). The key works while the menu is closed.
 - Hover over a module or a setting for a description.
@@ -148,7 +158,7 @@ runs on a fixed time step, so a playback does exactly what the recording did, fr
 
 #### Recording a macro, step by step
 
-1. Open **TAS / Macro** (right click it) and look at **New recording → Start**:
+1. Open **TAS / Macro** (click its name) and look at **New recording → Start**:
    - **Level / checkpoint** (recommended): pick a chapter and checkpoint. Recording loads it and starts on the first
      frame after the load. Every playback starts the same way, so the run is **reproducible and verified**.
    - **Console command**: same idea with any command, e.g. `open edge_p`.
@@ -233,11 +243,48 @@ them, `""` = level start). Keys use Unreal's names: `W`, `A`, `SpaceBar`, `LeftS
 `LeftMouseButton`, `MouseX`, `MouseY`, ... Inputs are keys, not actions. A macro made with other key bindings can be
 fixed with **Tools → key translator** (e.g. `LeftMouseButton` → `RightMouseButton`).
 
+#### Example macro
+
+[`examples/replays/showcase.json`](examples/replays/showcase.merp) is a 6-second macro written by hand in this
+format. It runs, looks right and back, jumps, slides, weaves left and right, glances down, jumps again and stops. It
+starts **now**, so stand somewhere open first, for example the Prologue rooftop (checkpoint *After_Intro*). Then use
+**Load from file...**, pick the JSON and click **Play**. Open **Tools → Replay editor** to step through it frame by
+frame. It uses the default keys (`W`/`A`/`D`, `SpaceBar`, `LeftShift`). If your bindings differ, fix it with the key
+translator. To get it in the **Macros** list, type a name and click **Save**.
+
+#### Timeline and camera keyframes
+
+**Edit** (next to Save / Load) opens the **Timeline**: the macro as rows, one per key, with every time the key is held
+drawn as a bar, the mouse / stick movement as ticks, and a **Camera** row for keyframes on top.
+
+- **Double click** a key's row to hold the key there (for the frames set in the toolbar), or the Camera row to add a
+  camera key. **Add track** gives you a row for a key the macro doesn't use yet.
+- **Drag** a bar to move it, drag its ends to change when the key goes down or up; drag a camera key to another frame.
+  **Right click** deletes. Below the timeline you can type exact frames, yaw and pitch, the easing to the next key
+  (Linear, Smooth or Hold), or take the key from where the player is looking right now (**From camera**).
+- **Click the ruler** to go to that frame. **Ctrl + wheel** zooms, **Shift + wheel** scrolls.
+
+Camera keys are keyframes for the look direction: from the first key to the last, playback turns the camera itself,
+in between the keys smoothly, and leaves out the recorded mouse movement there. Before the first key and after the
+last one, the recorded input plays as usual. Yaw isn't wrapped (370 is a full turn further than 10), so you decide
+which way it turns. The timeline is read only while recording.
+
 #### Replay editor
 
-**Tools → Replay editor** opens a window with every frame and its inputs. Select a frame to change its inputs or
-length, add or delete frames, or jump there with **Go to**. Frames after an edit are no longer "verified" until the
-next playback records their state again.
+**Advanced → Replay editor** works frame by frame, in the macro and in the game:
+
+- The buttons on top move the game itself: **|<** back to the start, **<** one frame back, **Pause / Resume**,
+  **>** one frame on, **>|** to the end, and **Go to** any frame. Going back plays the macro again from its start (as
+  fast as it can) and pauses on that frame, so the game is exactly where the macro had it. Double click a frame in the
+  list to go there too. A macro that starts "now" can only go forward while it runs.
+- The list shows every frame: how long it is, the keys held on it, and the mouse movement.
+- On the right, the selected frame's keys light up when held: **click a key** to hold or let go of it on that frame.
+  With **Follow** on, the selected frame is the one that plays next, so you can pause, set the keys, and step. Below
+  are the mouse movement of the frame, its length, adding / deleting frames, and every raw input under **Raw inputs**.
+- Paused at the end of a playback, **+ Frame & step** adds a frame and plays it: a macro built one frame at a time.
+
+Frames after an edit are no longer "verified" until the next playback records their state again. **Advanced → Input
+display** (on by default) shows the macro's keys at the bottom left of the screen while it runs, lit while held.
 
 #### What breaks a macro
 
@@ -245,6 +292,29 @@ next playback records their state again.
   recording **and** playback.
 - A different game version (the file stores it, and you'll get a warning).
 - A "Now" macro started from a different place or state.
+- Different mouse sensitivity, invert mouse, key bindings or streaming setting than when it was recorded. These are
+  handled for you, see below.
+
+#### Desyncs: preventing and fixing them
+
+Every recording saves what it depends on: mouse sensitivity and invert, what each key it uses is bound to, the
+streaming setting, and which game-changing modules were on. The **Desync** section of the panel compares that with the
+game right now and lists every difference before you play.
+
+- **Match the recording** (on by default) makes playback use the recording's streaming setting and mouse settings (yours
+  come back afterwards), and plays a key whose binding changed as the key that does that action now. Those lines show
+  as *fixed on play*. **Turn them off** switches off game-changing modules that weren't on when it was recorded.
+- **On desync** decides what happens when a playback stops matching the recording anyway. The panel says what
+  differed ("velocity off by 0.002, position matched"):
+  - **Pause**: stop on that frame. Take over to record a fix from there.
+  - **Correct small drift**: while the player is in the same move and less than **Correct up to** away, put them back
+    on the recorded position and velocity and go on. The panel counts the corrections; a corrected playback is never
+    "verified". Bigger differences are a real desync and still stop it.
+  - **Keep going**: note it and go on.
+- **Re-record sync** forgets the player states saved with the macro, and the next playback saves new ones. Use it after
+  a game update, once the macro plays the way it should.
+
+Macros recorded before this have no saved settings: the check says so and compares nothing.
 
 ### Files the menu keeps
 
@@ -277,9 +347,10 @@ Everything is in the `memenu` folder next to `MirrorsEdge.exe`:
 ### Setup and the `memenu` tool
 
 You need Visual Studio with "Desktop development with C++", CMake 4.2+, Ninja and [uv](https://docs.astral.sh/uv/).
-**`setup.bat dev`** (or double-click `setup.bat` and pick 2) installs whichever of them are missing with winget, then
-runs `uv sync` and checks the toolchain. Run it again any time; it skips what is already there. (`setup.bat` also
-installs the menu into the game for players, and `bash setup.sh` does that on Linux and macOS.)
+**`setup.cmd dev`** (or double-click `setup.cmd` and pick 2) installs whichever of them are missing with winget, then
+runs `uv sync` and checks the toolchain. Run it again any time; it skips what is already there. (`setup.cmd install`
+/ `uninstall` also puts the menu into the game for players, or takes it out: double-click it on Windows, or run
+`bash setup.cmd` on Linux and macOS. It is one file for both: a cmd batch file and a bash script in one.)
 The game is a 32-bit program, so everything is built for x86. The tool sets up the 32-bit MSVC environment itself,
 so any terminal works.
 
@@ -445,7 +516,10 @@ last. That is what `verbose-build` walks through to find the first stage that br
 | `tas/tas.*`        | sessions: record / play / pause / advance / take over / seek / rewind, death handling, sync checks, files |
 | `tas/replay.*`     | the `.merp` format: chunked binary with a checksum, editing helpers, JSON export / import |
 | `tas/macro.h`      | `tas::Macro`: write a macro in code (`Wait`, `Press`, `Release`, `Hold`, `Axis`) |
-| `features/tas/tas_module.cpp` | the panel, the file dialog, the replay editor                                    |
+| `tas/timeline.*`   | the replay as key holds and camera keys: holds from events and back, camera interpolation (unit tested) |
+| `features/tas/tas_module.cpp` | the panel and the file browser                                                   |
+| `features/tas/timeline_view.*` | the Timeline window (ImGui draw list: rows, bars, camera keys, ruler)          |
+| `features/tas/replay_editor.*` | the Replay Editor (transport, frame list, per-frame keys) and the input display |
 
 How a session works: while one runs, the game thread sees a virtual 10 MHz clock that advances by exactly one frame's
 time step per engine tick, `rand()` is seeded at the start, and streamed sublevels load on the frame they are
@@ -459,7 +533,7 @@ are posted and run on the game thread at the start of the next frame. Everything
 `tas::WithReplay` (locked) or the session functions in `tas.h`.
 
 The `.merp` layout is documented at the top of `src/tas/replay.cpp`: magic `MERP`, version, tagged chunks
-(`HEAD`, `META`, `NAME`, `TIME`, `EVNT`, `SYNC`, `EXTN`), then `END ` with an FNV-1a checksum. Unknown chunks are
+(`HEAD`, `META`, `NAME`, `TIME`, `EVNT`, `SYNC`, `CAMK`, `EXTN`), then `END ` with an FNV-1a checksum. Unknown chunks are
 skipped, so new data can be added without breaking old readers. Bump `kVersion` only for changes old readers can't
 skip.
 
@@ -499,3 +573,8 @@ Set `MEMENU_DEV=1` for developer mode: full tracebacks with local variables, tim
 The [release workflow](.github/workflows/release.yml) builds, tests and publishes `memenu_installer.exe` with its
 `SHA256SUMS.txt`. That is what the install command downloads, so players get it the next time they run it. It refuses
 to publish when the tag and `MEMENU_VERSION` differ.
+
+To hand a build to someone without a release, run `uv run memenu package`: `dist/MirrorsEdgeMenu-<version>.zip` holds
+the installer, a `README.txt` quick start (from `tools/memenu_tools/dist/`), `LICENSE.txt`, `THIRD-PARTY-NOTICES.txt`
+(the licenses of every library compiled in, read from the sources it was built from) and `try-without-installing/`
+with the launcher and the DLL.

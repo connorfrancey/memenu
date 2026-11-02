@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -451,80 +452,208 @@ namespace debugworld
         }
 
         // ---- Baking all levels -----------------------------------------------------------------------------------------
+        // One job per level start and checkpoint, in story order. Each one loads, waits for the engine's level-load hook
+        // to report the load finished and the player to exist, then rescans every second until nothing new turns up
+        // (streamed parts come in a little after the load). A level whose jobs all worked gets cache/<map>.baked, so
+        // "bake missing" can skip it. At the end the player goes back to the level they started in.
+        constexpr double kLoadTimeout = 45.0;     // Seconds for a load to finish before the job is skipped
+        constexpr double kSettleMin = 2.0;        // Seconds after the load before a job may finish
+        constexpr double kSettleQuiet = 1.5;      // ...and this long without new volumes
+        constexpr double kSettleMax = 12.0;
+        constexpr double kScanEvery = 1.0;
+
+        struct BakeJob
+        {
+            int map = 0;                // Index into levels::Maps()
+            int checkpoint = 0;         // 0 = start of the level
+            std::string label;          // For the status line
+        };
+
         struct Bake
         {
             enum class Phase { Idle, Start, WaitLoad, Settle } phase = Phase::Idle;
             bool running = false;
-            std::vector<levels::MapView> maps;
-            std::size_t map = 0, checkpoint = 0;   // checkpoint 0 = start of the level
-            bool sawLoading = false;
-            bool forcedScan = false;
-            Clock::time_point since{};
+            std::vector<BakeJob> jobs;
+            std::size_t job = 0;
+            std::size_t failed = 0;
+            bool mapOk = true;          // Every job of the current map worked so far
+            std::size_t loadsSeen = 0;  // g_loadsFinished when this job's load was asked for
+            std::size_t shapesAtStart = 0, shapesSeen = 0;
+            std::string startMap;       // Lower-case file name of the level the bake started in
+            Clock::time_point since{}, lastScan{}, lastNew{};
         };
         Bake g_bake;
+        std::atomic<std::size_t> g_loadsFinished{0};   // Level loads the engine finished (game::OnLevelLoad)
+
+        void OnLevelLoaded(bool finished)
+        {
+            if (finished) g_loadsFinished.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        std::string Lower(std::string s)
+        {
+            for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        }
+
+        // "CHAPTER 9 - THE SHARD (Scraper_p)" -> "scraper_p"
+        std::string MapFile(const std::string& label)
+        {
+            const std::size_t open = label.rfind('('), close = label.rfind(')');
+            if (open == std::string::npos || close == std::string::npos || close < open) return Lower(label);
+            return Lower(label.substr(open + 1, close - open - 1));
+        }
+
+        // Story order; maps not in it come after, in the game's order.
+        int StoryRank(const std::string& file)
+        {
+            static const char* const order[] = {"edge_p", "escape_p", "stormdrain_p", "cranes_p", "subway_p",
+                                                "mall_p", "factory_p", "boat_p", "convoy_p", "scraper_p"};
+            for (int i = 0; i < static_cast<int>(std::size(order)); ++i)
+                if (file == order[i]) return i;
+            return 1000;
+        }
+
+        fs::path BakedMarker(const std::string& map) { return paths::Dir() / "cache" / (map + ".baked"); }
+
+        // Lower-case names of the maps that have been baked completely.
+        std::unordered_set<std::string> BakedMaps()
+        {
+            std::unordered_set<std::string> out;
+            std::error_code ec;
+            for (fs::directory_iterator it(paths::Dir() / "cache", ec), end; !ec && it != end; it.increment(ec))
+                if (it->path().extension() == ".baked") out.insert(Lower(it->path().stem().string()));
+            return out;
+        }
 
         void SetBakeStatus(const std::string& status)
         {
             std::lock_guard lock(g_infoMutex);
             g_info.baking = g_bake.running;
             g_info.bakeStatus = status;
+            g_info.bakeDone = g_bake.job;
+            g_info.bakeTotal = g_bake.jobs.size();
+            g_info.bakeFailed = g_bake.failed;
         }
 
-        void FinishBake(const char* why)
+        // Back to the start of the level the bake began in (if it was one it can load).
+        bool ReturnToStart()
+        {
+            if (g_bake.startMap.empty()) return false;
+            const auto maps = levels::Maps();
+            for (std::size_t m = 0; m < maps.size(); ++m)
+            {
+                if (MapFile(maps[m].label) != g_bake.startMap) continue;
+                spdlog::info("Debug world: baking: back to '{}'", maps[m].label);
+                levels::Load(static_cast<int>(m), 0, levels::Method::Game, false);
+                return true;
+            }
+            return false;
+        }
+
+        void FinishBake(const std::string& why, bool goBack)
         {
             spdlog::info("Debug world: baking {}", why);
             g_bake.running = false;
             g_bake.phase = Bake::Phase::Idle;
-            SetBakeStatus(why);
+            if (goBack && ReturnToStart()) SetBakeStatus(why + ", back to the level you were in");
+            else SetBakeStatus(why);
+        }
+
+        // The current job is done (or gave up): save what it found, mark its level when that was the last of it.
+        void EndJob(bool ok)
+        {
+            if (!ok)
+            {
+                ++g_bake.failed;
+                g_bake.mapOk = false;
+            }
+            if (g_cacheDirty) { SaveCache(g_map); g_cacheDirty = false; g_fromDisk = true; }
+
+            const BakeJob& job = g_bake.jobs[g_bake.job];
+            const bool lastOfMap = g_bake.job + 1 >= g_bake.jobs.size() || g_bake.jobs[g_bake.job + 1].map != job.map;
+            if (lastOfMap)
+            {
+                if (g_bake.mapOk && !g_map.empty())
+                {
+                    std::ofstream(BakedMarker(g_map)) << "baked\n";
+                    spdlog::info("Debug world: '{}' baked ({} volumes)", g_map, g_shapes.size());
+                }
+                g_bake.mapOk = true;
+            }
+            ++g_bake.job;
+            g_bake.phase = Bake::Phase::Start;
         }
 
         void TickBake()
         {
             if (!g_bake.running) return;
             const auto now = Clock::now();
-            const double elapsed = std::chrono::duration<double>(now - g_bake.since).count();
+            const auto secs = [&](Clock::time_point t) { return std::chrono::duration<double>(now - t).count(); };
 
             switch (g_bake.phase)
             {
                 case Bake::Phase::Idle:
                     break;
+
                 case Bake::Phase::Start:
                 {
-                    if (g_bake.map >= g_bake.maps.size()) { FinishBake("finished: all levels are in the cache"); return; }
-                    const auto& m = g_bake.maps[g_bake.map];
-                    const std::string where = g_bake.checkpoint == 0 ? std::string("start of level") : m.checkpoints[g_bake.checkpoint - 1];
-                    spdlog::info("Debug world: baking {} / {}: '{}' {}", g_bake.map + 1, g_bake.maps.size(), m.label, where);
-                    SetBakeStatus("Baking " + std::to_string(g_bake.map + 1) + "/" + std::to_string(g_bake.maps.size()) + ": " +
-                                  m.label + " - " + where);
-                    levels::Load(static_cast<int>(g_bake.map), static_cast<int>(g_bake.checkpoint), levels::Method::Game, false);
+                    if (g_bake.job >= g_bake.jobs.size())
+                    {
+                        FinishBake(g_bake.failed ? "finished, " + std::to_string(g_bake.failed) + " checkpoint(s) failed"
+                                                 : std::string("finished: every level is in the cache"), true);
+                        return;
+                    }
+                    const BakeJob& job = g_bake.jobs[g_bake.job];
+                    spdlog::info("Debug world: baking {} / {}: {}", g_bake.job + 1, g_bake.jobs.size(), job.label);
+                    SetBakeStatus(job.label);
+                    g_bake.loadsSeen = g_loadsFinished.load(std::memory_order_relaxed);
+                    levels::Load(job.map, job.checkpoint, levels::Method::Game, false);
                     g_bake.phase = Bake::Phase::WaitLoad;
                     g_bake.since = now;
-                    g_bake.sawLoading = false;
-                    g_bake.forcedScan = false;
                     break;
                 }
+
                 case Bake::Phase::WaitLoad:
-                    if (game::IsLoading()) g_bake.sawLoading = true;
-                    if ((g_bake.sawLoading && !game::IsLoading()) || elapsed > 30.0)
+                    // The engine doesn't tick while it loads, so the load is seen through its hook, not IsLoading().
+                    if (g_loadsFinished.load(std::memory_order_relaxed) > g_bake.loadsSeen && !game::IsLoading() &&
+                        game::Pawn())
                     {
-                        if (!g_bake.sawLoading) spdlog::warn("Debug world: baking did not see the level load start; continuing anyway");
                         g_bake.phase = Bake::Phase::Settle;
-                        g_bake.since = now;
+                        g_bake.since = g_bake.lastNew = now;
+                        g_bake.lastScan = Clock::time_point{};
+                        g_bake.shapesAtStart = g_bake.shapesSeen = g_shapes.size();
                     }
-                    break;
-                case Bake::Phase::Settle:
-                    // Streaming sublevels need a moment to come in: scan again a few seconds after the load.
-                    if (!g_bake.forcedScan && elapsed > 4.0) { g_forceScan = true; g_bake.forcedScan = true; }
-                    if (elapsed > 7.0)
+                    else if (secs(g_bake.since) > kLoadTimeout)
                     {
-                        g_forceScan = true;
-                        if (g_cacheDirty) { SaveCache(g_map); g_cacheDirty = false; g_fromDisk = true; }
-                        const auto& m = g_bake.maps[g_bake.map];
-                        if (++g_bake.checkpoint > m.checkpoints.size()) { g_bake.checkpoint = 0; ++g_bake.map; }
-                        g_bake.phase = Bake::Phase::Start;
-                        g_bake.since = now;
+                        spdlog::warn("Debug world: baking: {} did not load in {:.0f} s, skipped",
+                                     g_bake.jobs[g_bake.job].label, kLoadTimeout);
+                        EndJob(false);
                     }
                     break;
+
+                case Bake::Phase::Settle:
+                {
+                    if (g_shapes.size() != g_bake.shapesSeen)
+                    {
+                        g_bake.shapesSeen = g_shapes.size();
+                        g_bake.lastNew = now;
+                    }
+                    if (secs(g_bake.lastScan) >= kScanEvery)
+                    {
+                        g_forceScan = true;         // Update() scans right after this
+                        g_bake.lastScan = now;
+                    }
+                    const double t = secs(g_bake.since);
+                    if ((t >= kSettleMin && secs(g_bake.lastNew) >= kSettleQuiet) || t >= kSettleMax)
+                    {
+                        spdlog::info("Debug world: baking: {} done, {} new volumes ({} in '{}')",
+                                     g_bake.jobs[g_bake.job].label, g_shapes.size() - g_bake.shapesAtStart,
+                                     g_shapes.size(), g_map);
+                        EndJob(true);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -714,7 +843,11 @@ namespace debugworld
         {
             spdlog::info("Debug world: clearing the remembered volumes of '{}'", g_map);
             std::error_code ec;
-            if (!g_map.empty()) fs::remove(CachePath(g_map), ec);
+            if (!g_map.empty())
+            {
+                fs::remove(CachePath(g_map), ec);
+                fs::remove(BakedMarker(g_map), ec);
+            }
             g_shapes.clear();
             g_keys.clear();
             g_cacheDirty = false;
@@ -725,22 +858,49 @@ namespace debugworld
         });
     }
 
-    void BakeAllLevels()
+    void BakeAllLevels(bool onlyMissing)
     {
-        game::RunOnGameThread([]
+        game::RunOnGameThread([onlyMissing]
         {
             if (g_bake.running) return;
-            g_bake = Bake{};
-            g_bake.maps = levels::Maps();
-            if (g_bake.maps.empty())
+            static bool hooked = false;
+            if (!hooked)
             {
-                SetBakeStatus("no levels known yet");
+                game::OnLevelLoad(&OnLevelLoaded);
+                hooked = true;
+            }
+
+            g_bake = Bake{};
+            const auto maps = levels::Maps();
+            const auto baked = onlyMissing ? BakedMaps() : std::unordered_set<std::string>{};
+            std::vector<int> order;
+            for (int m = 0; m < static_cast<int>(maps.size()); ++m)
+            {
+                const std::string file = MapFile(maps[m].label);
+                if (file == "tdmainmenu" || baked.count(file)) continue;
+                order.push_back(m);
+            }
+            std::stable_sort(order.begin(), order.end(), [&](int x, int y)
+            {
+                return StoryRank(MapFile(maps[x].label)) < StoryRank(MapFile(maps[y].label));
+            });
+            for (int m : order)
+            {
+                const auto& cps = maps[m].checkpoints;
+                for (int c = 0; c <= static_cast<int>(cps.size()); ++c)
+                    g_bake.jobs.push_back({m, c, maps[m].label + " - " + (c == 0 ? std::string("start") : cps[c - 1])});
+            }
+            if (g_bake.jobs.empty())
+            {
+                SetBakeStatus(maps.empty() ? "no levels known yet" : "nothing to do: every level is baked already");
                 return;
             }
+
+            g_bake.startMap = Lower(g_map);
             g_bake.running = true;
             g_bake.phase = Bake::Phase::Start;
-            g_bake.since = Clock::now();
-            spdlog::info("Debug world: baking {} levels", g_bake.maps.size());
+            spdlog::info("Debug world: baking {} levels ({} checkpoints){}", order.size(), g_bake.jobs.size(),
+                         onlyMissing ? ", the ones not baked yet" : "");
             SetBakeStatus("starting");
         });
     }
@@ -749,7 +909,10 @@ namespace debugworld
     {
         game::RunOnGameThread([]
         {
-            if (g_bake.running) FinishBake("cancelled");
+            if (!g_bake.running) return;
+            if (g_cacheDirty) { SaveCache(g_map); g_cacheDirty = false; g_fromDisk = true; }   // What this one found
+            FinishBake("cancelled after " + std::to_string(g_bake.job) + " of " + std::to_string(g_bake.jobs.size()) +
+                       " checkpoints", true);
         });
     }
 

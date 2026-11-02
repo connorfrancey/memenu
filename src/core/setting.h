@@ -221,6 +221,16 @@ namespace ctl {
 		void Draw(float width) override;
 	};
 
+	// A header that folds the controls after it away. Its open state is saved; the controls it holds are the ones that
+	// call `VisibleIf(section)` (Section converts to bool, so `[this] { return section && other; }` works too).
+	class Section final : public Value<bool> {
+	public:
+		Section(Module* owner, std::string title, bool open = true);
+
+	protected:
+		void Draw(float width) override;
+	};
+
 	// Whatever `draw` renders inside the module's panel, every frame. `width` is the usable width.
 	class Custom final : public Setting {
 	public:

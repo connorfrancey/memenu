@@ -119,11 +119,45 @@ static void Run(HMODULE module)
     diag::RemoveCrashLogger();
 }
 
+// One menu per game process. Two copies (the installed one from the game's loader plus an injected build) both hook
+// the frame timing, input and D3D9: neither TAS works and both menus fight over the mouse. The launcher's "already
+// loaded" check can't catch two copies arriving at the same moment, so the first one to get here owns the process.
+// False when another copy holds the process. `claim` is closed at unload (nullptr if the mutex couldn't be created at
+// all: then nothing is guarded, and this copy runs anyway).
+static bool ClaimProcess(HANDLE& claim)
+{
+    wchar_t name[64];
+    swprintf_s(name, L"Local\\MirrorsEdgeMenu-%lu", GetCurrentProcessId());
+    claim = CreateMutexW(nullptr, FALSE, name);
+    if (claim && GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(claim);
+        claim = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Unloads this copy if another one owns the process (not inline in MainThread: __try can't share it with objects).
+static HANDLE ClaimOrLeave(HMODULE module)
+{
+    HANDLE claim = nullptr;
+    if (ClaimProcess(claim)) return claim;
+    spdlog::error("Another copy of the menu is already running in this game: this one ({}) does nothing and unloads. "
+                  "Use one copy: the installed one, or an injected build with the installed one disabled",
+                  diag::ModulePath(module));
+    OutputDebugStringW(L"MirrorsEdgeMenu: another copy is already running in this process; not starting\n");
+    logging::Shutdown();
+    FreeLibraryAndExitThread(module, 0);
+}
+
 static DWORD WINAPI MainThread(LPVOID param)
 {
     const auto module = static_cast<HMODULE>(param);
     paths::Init(module);
     logging::Init();
+    HANDLE claim = ClaimOrLeave(module);
+
     failsafe::Start([](const char* message) {   // First: it must work even if anything after this hangs
         spdlog::critical("{}", message);
         spdlog::default_logger()->flush();
@@ -137,6 +171,7 @@ static DWORD WINAPI MainThread(LPVOID param)
 #endif
     failsafe::Stop();
     logging::Shutdown();
+    if (claim) CloseHandle(claim);   // Last: a copy injected after this unload may run
     FreeLibraryAndExitThread(module, 0);
 }
 

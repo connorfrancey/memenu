@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -265,4 +266,39 @@ TEST(Replay, ImportRejectsBadJson)
     EXPECT_FALSE(r.ImportJson(path, &error));
     std::filesystem::remove(path);
     EXPECT_NE(error.find("sideways"), std::string::npos);
+}
+
+// The example macros in examples/replays/ load, survive a .merp round trip and leave no key pressed at the end.
+TEST(Replay, ExamplesLoad)
+{
+    const std::filesystem::path folder = MEMENU_EXAMPLES_DIR "/replays";
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+        if (entry.path().extension() != ".json") continue;
+        SCOPED_TRACE(entry.path().filename().string());
+        ++count;
+
+        Replay r;
+        std::string error;
+        ASSERT_TRUE(r.ImportJson(entry.path(), &error)) << error;
+        EXPECT_FALSE(r.description.empty());
+        EXPECT_GT(r.FrameCount(), 0u);
+        ExpectConsistent(r);
+
+        std::vector<std::string> held;
+        for (const Event& e : r.events) {
+            const std::string& key = r.Name(e.name);
+            if (e.kind == EventKind::Pressed) held.push_back(key);
+            if (e.kind == EventKind::Released) held.erase(std::remove(held.begin(), held.end(), key), held.end());
+        }
+        EXPECT_TRUE(held.empty()) << "still pressed at the end: " << held.front();
+
+        const auto path = TempFile("example.merp");
+        Replay back;
+        ASSERT_TRUE(r.Save(path, &error)) << error;
+        ASSERT_TRUE(back.Load(path, &error)) << error;
+        std::filesystem::remove(path);
+        EXPECT_EQ(back.InputHash(), r.InputHash());
+    }
+    EXPECT_GT(count, 0u) << "no examples in " << folder.string();
 }

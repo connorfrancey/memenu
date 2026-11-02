@@ -5,10 +5,13 @@ add_executable(memenu_tests
         test_math.cpp
         test_mesh.cpp
         test_replay.cpp
+        test_timeline.cpp
         ${CMAKE_SOURCE_DIR}/src/render/mesh.cpp
-        ${CMAKE_SOURCE_DIR}/src/tas/replay.cpp)
+        ${CMAKE_SOURCE_DIR}/src/tas/replay.cpp
+        ${CMAKE_SOURCE_DIR}/src/tas/timeline.cpp)
 target_include_directories(memenu_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_definitions(memenu_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_definitions(memenu_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        MEMENU_EXAMPLES_DIR="${CMAKE_SOURCE_DIR}/examples")
 target_link_libraries(memenu_tests PRIVATE GTest::gtest_main nlohmann_json::nlohmann_json)
 if(MSVC)
   target_compile_options(memenu_tests PRIVATE /W4 /permissive- /utf-8)

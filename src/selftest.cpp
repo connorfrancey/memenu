@@ -15,6 +15,7 @@
 #include "game/player_state.h"
 #if MEMENU_FEATURE_TAS
 #include "tas/macro.h"
+#include "tas/timeline.h"
 #include "tas/tas.h"
 #endif
 
@@ -68,8 +69,7 @@ ULONGLONG g_started = 0;
 bool g_aborted = false;         // Unload requested in the middle: stop testing
 
 // Buttons that would open windows on the desktop, delete files or run for minutes: never pressed
-const std::set<std::string> kNoPress = {"Open log file", "Open themes folder", "Bake all levels",
-                                        "Clear this level's cache",
+const std::set<std::string> kNoPress = {"Open log file", "Open themes folder",
                                         "Clear saved state"};   // Load State is tested next and needs it
 
 std::string Lower(std::string s)
@@ -578,13 +578,29 @@ void TestTasMacro()
 
     // Follow it: the highest point the player reaches. Playback paces itself at the replay's 60 fps.
     float topZ = start.at.Z;
-    bool airborne = false, started = false;
+    bool airborne = false, started = false, pausedOnce = false;
     tas::Status st{};
     const ULONGLONG deadline = GetTickCount64() + 30000;
     while (GetTickCount64() < deadline && !g_aborted) {
         st = tas::GetStatus();
         if (st.mode == tas::Mode::Playing) started = true;
         if (started && (st.mode != tas::Mode::Playing || st.frame >= st.frames)) break;   // Done (or paused at the end)
+        if (started && !pausedOnce && !st.armed && st.frame >= 20) {
+            // Paused, the game thread stands still and draws the menu itself, through every overlay's Present hook
+            // (a crash on 2026-11-02). Not OnGameThread meanwhile: the game doesn't tick while paused.
+            pausedOnce = true;
+            gui::visible = true;
+            const unsigned before = hooks::StalledFrames();
+            tas::TogglePause();
+            Sleep(1500);
+            if (!tas::GetStatus().paused) p.Problem("pausing the playback didn't pause it");
+            const unsigned drawn = hooks::StalledFrames() - before;
+            if (drawn == 0) p.Problem("the menu was not drawn while paused");
+            s.notes.push_back("paused 1.5 s: " + std::to_string(drawn) + " menu frames drawn meanwhile");
+            tas::TogglePause();
+            gui::visible = false;
+            continue;
+        }
         OnGameThread([&] {
             if (auto* pawn = game::Pawn()) {
                 topZ = std::max(topZ, pawn->Location.Z);
@@ -626,6 +642,292 @@ void TestTasMacro()
     OnGameThread([] { player_state::Load(); });
     WaitTicks(5);
     OnRenderThread([] { gui::visible = true; });
+    p.Check(1, true);
+    End(s);
+}
+
+// Camera keyframes: a macro with no input but two camera keys 90 degrees apart must turn the player by 90 degrees,
+// the TAS setting the look direction itself. The timeline window is open meanwhile (drawn in the game).
+void TestTasCamera()
+{
+    Step& s = Begin("TAS camera keys");
+    Probe p(s);
+    if (!tas::Available()) {
+        p.Problem("the TAS engine hooks were not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+
+    std::int32_t startYaw = 0;
+    bool ok = false;
+    OnGameThread([&] {
+        if (auto* pc = game::Controller(); pc && game::Pawn()) {
+            startYaw = static_cast<std::int32_t>(pc->Rotation.Yaw);
+            ok = true;
+            player_state::Save();
+        }
+    });
+    if (!ok) {
+        p.Problem("no player to turn");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+
+    constexpr double kUnits = 65536.0 / 360.0;
+    const float yaw0 = static_cast<float>(startYaw / kUnits);
+    tas::Macro m(60.f);
+    m.Describe("memenu self-test: turn 90 degrees with camera keys").Wait(40);
+    tas::Replay macro = m.Build();
+    tas::timeline::SetCameraKey(macro, {5, yaw0, 0.f, tas::Ease::Linear});
+    tas::timeline::SetCameraKey(macro, {30, yaw0 + 90.f, 0.f, tas::Ease::Smooth});
+
+    // The TAS module's timeline window, open while it plays
+    ctl::Checkbox* timeline = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& mod) {
+        for (ctl::Setting* c : mod.Settings())
+            if (c->Name() == "Timeline" && mod.Name() == "TAS / Macro") timeline = dynamic_cast<ctl::Checkbox*>(c);
+    });
+    const bool timelineWas = timeline && timeline->Get();
+
+    tas::Replay saved;
+    tas::WithReplay([&](tas::Replay& r) { saved = r; r = macro; });
+    OnRenderThread([timeline] {
+        gui::visible = true;
+        if (timeline) timeline->Set(true);
+    });
+    tas::Play();
+
+    bool started = false;
+    tas::Status st{};
+    const ULONGLONG deadline = GetTickCount64() + 20000;
+    while (GetTickCount64() < deadline && !g_aborted) {
+        st = tas::GetStatus();
+        if (st.mode == tas::Mode::Playing) started = true;
+        if (started && (st.mode != tas::Mode::Playing || st.frame >= st.frames)) break;
+        Sleep(20);
+    }
+    tas::Stop();
+    if (!WaitFor(5.0, [] { return tas::GetStatus().mode == tas::Mode::Idle; })) p.Problem("the session did not stop");
+
+    std::int32_t endYaw = startYaw;
+    OnGameThread([&] {
+        if (auto* pc = game::Controller()) endYaw = static_cast<std::int32_t>(pc->Rotation.Yaw);
+    });
+    const double turned = (endYaw - startYaw) / kUnits;
+    char info[96];
+    std::snprintf(info, sizeof info, "turned %.2f degrees (keys: %.2f -> %.2f)", turned, yaw0, yaw0 + 90.f);
+    if (!started) p.Problem("playback never started: " + tas::GetStatus().message);
+    else if (std::abs(turned - 90.0) > 0.5) p.Problem(std::string("the camera keys didn't turn the player: ") + info);
+    else s.notes.push_back(info);
+
+    tas::WithReplay([&](tas::Replay& r) { r = saved; });
+    OnRenderThread([timeline, timelineWas] {
+        if (timeline) timeline->Set(timelineWas);
+    });
+    OnGameThread([] { player_state::Load(); });
+    WaitTicks(5);
+    p.Check(1, true);
+    End(s);
+}
+
+// Go to + frame advance, the replay editor's way: from idle, go to frame 20 of a macro (it plays up to there and
+// pauses), step one frame, and stop. The Replay Editor window is open meanwhile (drawn in the game).
+void TestTasGoto()
+{
+    Step& s = Begin("TAS go to and step");
+    Probe p(s);
+    if (!tas::Available()) {
+        p.Problem("the TAS engine hooks were not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+
+    tas::Macro m(60.f);
+    m.Describe("memenu self-test: go to and step").Wait(60);
+    const tas::Replay macro = m.Build();
+
+    ctl::Checkbox* editor = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& mod) {
+        for (ctl::Setting* c : mod.Settings())
+            if (c->Name() == "Replay editor" && mod.Name() == "TAS / Macro") editor = dynamic_cast<ctl::Checkbox*>(c);
+    });
+    const bool editorWas = editor && editor->Get();
+
+    tas::Replay saved;
+    tas::WithReplay([&](tas::Replay& r) { saved = r; r = macro; });
+    OnRenderThread([editor] {
+        gui::visible = true;
+        if (editor) editor->Set(true);
+    });
+
+    // Not OnGameThread while paused: the game doesn't tick then
+    const auto pausedOn = [](std::size_t frame) {
+        const tas::Status st = tas::GetStatus();
+        return st.mode == tas::Mode::Playing && st.paused && st.frame == frame;
+    };
+    tas::Goto(20);
+    if (!WaitFor(10.0, [&] { return pausedOn(20); })) {
+        const tas::Status st = tas::GetStatus();
+        p.Problem("go to 20 didn't pause on frame 20 (frame " + std::to_string(st.frame) +
+                  (st.paused ? ", paused" : ", running") + "): " + st.message);
+    } else {
+        tas::Advance(1);
+        if (!WaitFor(5.0, [&] { return pausedOn(21); }))
+            p.Problem("stepping from 20 didn't stop on 21 (frame " + std::to_string(tas::GetStatus().frame) + ")");
+        else s.notes.push_back("went to frame 20, stepped to 21");
+    }
+    tas::Stop();
+    if (!WaitFor(5.0, [] { return tas::GetStatus().mode == tas::Mode::Idle; })) p.Problem("the session did not stop");
+
+    tas::WithReplay([&](tas::Replay& r) { r = saved; });
+    OnRenderThread([editor, editorWas] {
+        if (editor) editor->Set(editorWas);
+    });
+    WaitTicks(5);
+    p.Check(1, true);
+    End(s);
+}
+
+// Desync prevention and fixing, with a macro that starts at the self-test's checkpoint (only those are checked):
+//   1. the first playback records the reference player states, with the macro's recorded mouse sensitivity set for it
+//      (and the player's own back afterwards)
+//   2. the recorded positions are moved 10 units from frame 30 on: with "On desync: Pause" it stops on frame 30 and
+//      says the position is off by 10
+//   3. with "Correct small drift" it plays to the end, putting the player back on the recording
+void TestTasDesync()
+{
+    Step& s = Begin("TAS desync fixing");
+    Probe p(s);
+    const auto fail = [&](const std::string& why) {
+        p.Problem(why);
+        p.Check(1, false);
+        End(s);
+    };
+    if (!tas::Available()) return fail("the TAS engine hooks were not found");
+
+    const auto maps = levels::Maps();
+    int index = -1;
+    for (int i = 0; i < static_cast<int>(maps.size()); ++i)
+        if (Lower(maps[i].label).find(Lower(g_options.map)) != std::string::npos) { index = i; break; }
+    if (index < 0) return fail("no level matching '" + g_options.map + "'");
+    const int cp = std::min(g_options.checkpoint, static_cast<int>(maps[index].checkpoints.size()));
+
+    Module* tasModule = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& m) { if (m.Name() == "TAS / Macro") tasModule = &m; });
+    auto* onDesync = tasModule ? dynamic_cast<ctl::Combo*>(tasModule->FindSetting("On desync")) : nullptr;
+    auto* match = tasModule ? dynamic_cast<ctl::Checkbox*>(tasModule->FindSetting("Match the recording")) : nullptr;
+    if (!onDesync || !match) return fail("the TAS module's On desync / Match the recording controls were not found");
+    const int onDesyncWas = onDesync->Get();
+    const bool matchWas = match->Get();
+
+    std::string forward;
+    float sens = 0.f;
+    OnGameThread([&] {
+        auto* pc = game::Controller();
+        forward = KeyFor(pc, "GBA_MoveForward", "W");
+        if (pc && pc->PlayerInput) sens = pc->PlayerInput->MouseSensitivity;
+    });
+    const float recordedSens = sens + 1.f;
+
+    tas::Macro m(60.f);
+    m.Describe("memenu self-test: desync fixing").Wait(5).Press(forward).Wait(60).Release(forward).Wait(10);
+    tas::Replay macro = m.Build();
+    macro.start = tas::StartKind::Checkpoint;
+    macro.map = maps[index].label;
+    macro.checkpoint = cp > 0 ? maps[index].checkpoints[static_cast<std::size_t>(cp - 1)] : std::string();
+    macro.syncValidUntil = 0;                       // the first playback records the reference
+    char text[32];
+    std::snprintf(text, sizeof text, "%.4f", recordedSens);
+    macro.extensions["env.sensitivity"] = text;
+    macro.extensions["env.invertMouse"] = "0";
+    macro.extensions["env.blockStreaming"] = "1";
+
+    tas::Replay saved;
+    tas::WithReplay([&](tas::Replay& r) { saved = r; r = macro; });
+    OnRenderThread([&] {
+        gui::visible = false;
+        onDesync->Set(static_cast<int>(tas::OnDesync::Pause));
+        match->Set(true);
+    });
+    WaitTicks(3);
+
+    // Plays it (loading the checkpoint), until it ends or pauses; the status then
+    float sensDuring = 0.f;
+    const auto play = [&]() {
+        tas::Play();
+        bool started = false, sampled = false;
+        tas::Status st{};
+        const ULONGLONG deadline = GetTickCount64() + 90000;
+        while (GetTickCount64() < deadline && !g_aborted) {
+            st = tas::GetStatus();
+            if (st.mode == tas::Mode::Playing && !st.armed) started = true;
+            if (started && !sampled && st.frame > 10 && !st.paused) {
+                OnGameThread([&] {
+                    if (auto* pc = game::Controller(); pc && pc->PlayerInput) sensDuring = pc->PlayerInput->MouseSensitivity;
+                }, 1.0);
+                sampled = true;
+            }
+            if (started && (st.mode != tas::Mode::Playing || st.paused || st.frame >= st.frames)) break;
+            Sleep(20);
+        }
+        tas::Stop();
+        WaitFor(5.0, [] { return tas::GetStatus().mode == tas::Mode::Idle; });
+        return std::make_pair(started, st);
+    };
+
+    // 1. The reference
+    const auto [ran, first] = play();
+    std::size_t recorded = 0;
+    tas::WithReplay([&](tas::Replay& r) { recorded = r.syncValidUntil; });
+    float sensAfter = 0.f;
+    OnGameThread([&] {
+        if (auto* pc = game::Controller(); pc && pc->PlayerInput) sensAfter = pc->PlayerInput->MouseSensitivity;
+    });
+    if (!ran) p.Problem("the first playback never started: " + tas::GetStatus().message);
+    else if (first.desyncFrame >= 0) p.Problem("the first playback desynced, with nothing to compare against yet");
+    else if (recorded < macro.FrameCount()) p.Problem("the first playback recorded " + std::to_string(recorded) + " of " +
+                                                      std::to_string(macro.FrameCount()) + " reference states");
+    if (std::abs(sensDuring - recordedSens) > 1e-3f)
+        p.Problem("playback didn't use the recorded mouse sensitivity (" + std::to_string(sensDuring) + ", recorded " +
+                  std::to_string(recordedSens) + ")");
+    if (std::abs(sensAfter - sens) > 1e-3f)
+        p.Problem("the player's own mouse sensitivity wasn't restored (" + std::to_string(sensAfter) + ", was " +
+                  std::to_string(sens) + ")");
+
+    // 2. Off by 10 from frame 30: Pause stops there and says so
+    tas::WithReplay([&](tas::Replay& r) {
+        for (std::size_t f = 30; f < r.sync.size(); ++f) r.sync[f].x += 10.f;
+    });
+    const auto [ran2, paused] = play();
+    if (!ran2) p.Problem("the second playback never started");
+    else if (paused.desyncFrame != 30)
+        p.Problem("with the recording moved on frame 30, the desync was found on " + std::to_string(paused.desyncFrame));
+    else if (paused.desyncInfo.find("position off by 10") == std::string::npos)
+        p.Problem("the desync was described as '" + paused.desyncInfo + "'");
+    else s.notes.push_back("paused at frame 30: " + paused.desyncInfo);
+
+    // 3. Correct puts the player back and plays to the end
+    OnRenderThread([&] { onDesync->Set(static_cast<int>(tas::OnDesync::Correct)); });
+    WaitTicks(3);
+    const auto [ran3, corrected] = play();
+    if (!ran3) p.Problem("the third playback never started");
+    else if (corrected.desyncFrame >= 0)
+        p.Problem("Correct didn't fix the desync on frame " + std::to_string(corrected.desyncFrame) + ": " +
+                  corrected.desyncInfo);
+    else if (corrected.corrections == 0) p.Problem("Correct made no corrections");
+    else if (corrected.frame < macro.FrameCount()) p.Problem("Correct stopped on frame " + std::to_string(corrected.frame));
+    else s.notes.push_back("corrected " + std::to_string(corrected.corrections) + " frames, played to the end");
+
+    tas::WithReplay([&](tas::Replay& r) { r = saved; });
+    OnRenderThread([&] {
+        onDesync->Set(onDesyncWas);
+        match->Set(matchWas);
+        gui::visible = true;
+    });
+    WaitTicks(5);
     p.Check(1, true);
     End(s);
 }
@@ -879,6 +1181,15 @@ void Run()
             const bool tasWanted = (g_options.only.empty() || g_options.only.count("TAS macro")) &&
                                    !g_options.skip.count("TAS macro");
             if (tasWanted && !g_aborted) TestTasMacro();
+            const bool camWanted = (g_options.only.empty() || g_options.only.count("TAS camera keys")) &&
+                                   !g_options.skip.count("TAS camera keys");
+            if (camWanted && !g_aborted) TestTasCamera();
+            const bool gotoWanted = (g_options.only.empty() || g_options.only.count("TAS go to and step")) &&
+                                    !g_options.skip.count("TAS go to and step");
+            if (gotoWanted && !g_aborted) TestTasGoto();
+            const bool desyncWanted = (g_options.only.empty() || g_options.only.count("TAS desync fixing")) &&
+                                      !g_options.skip.count("TAS desync fixing");
+            if (desyncWanted && !g_aborted) TestTasDesync();
 #endif
         }
 #endif

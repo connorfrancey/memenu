@@ -130,6 +130,23 @@ if(MEMENU_BARE)
     return()
 endif()
 
+# imgui-filebrowser: the TAS module's Open / Save file browser, drawn with ImGui inside the menu (Windows' own dialog
+# opened behind the fullscreen game and took the cursor). Header only; the repo has no tags, so a commit is pinned.
+if("tas" IN_LIST MEMENU_ENABLED_FEATURES)
+CPMAddPackage(
+        NAME imgui_filebrowser
+        GITHUB_REPOSITORY AirGuanZ/imgui-filebrowser
+        GIT_TAG 47a1884524d6a3df5d99f70ecc82e1ed0ccd26cf
+        DOWNLOAD_ONLY YES
+)
+if(imgui_filebrowser_ADDED)
+    add_library(imgui_filebrowser INTERFACE)
+    target_include_directories(imgui_filebrowser SYSTEM INTERFACE ${imgui_filebrowser_SOURCE_DIR})
+    target_link_libraries(imgui_filebrowser INTERFACE imgui)
+endif()
+target_link_libraries(${PROJECT_NAME} PRIVATE imgui_filebrowser)
+endif()
+
 # Discord RPC
 #include(${CMAKE_SOURCE_DIR}/cmake/discord-rpc.cmake)
 
@@ -180,6 +197,20 @@ if(MEMENU_BUILD_TESTS)
           "BUILD_GMOCK OFF"
           "gtest_force_shared_crt OFF"   # Static CRT, like the rest of the project (CMAKE_MSVC_RUNTIME_LIBRARY)
   )
+endif()
+
+# nanobench (only needed for the benchmarks): header only, the implementation is compiled in bench/bench_main.cpp
+if(MEMENU_BUILD_BENCHMARKS)
+  CPMAddPackage(
+      NAME nanobench
+      GITHUB_REPOSITORY martinus/nanobench
+      GIT_TAG v4.3.11
+      DOWNLOAD_ONLY YES
+  )
+  if(nanobench_ADDED)
+    add_library(nanobench INTERFACE)
+    target_include_directories(nanobench SYSTEM INTERFACE ${nanobench_SOURCE_DIR}/src/include)
+  endif()
 endif()
 
 if(MEMENU_DEV_TOOLS)

@@ -1,10 +1,13 @@
 #include "tas/tas.h"
 #include "tas/engine.h"
+#include "tas/examples.h"
+#include "tas/timeline.h"
 
 #include "core/notify.h"
 #include "game/game.h"
 #include "game/levels.h"
 #include "gui.h"
+#include "hooks.h"
 #include "paths.h"
 
 #include <Windows.h>
@@ -16,9 +19,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <ctime>
+#include <fstream>
 #include <limits>
 #include <mutex>
+#include <cstdlib>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -46,6 +55,21 @@ std::atomic<bool> g_active{false};   // a session runs (mirrors s.mode != Idle f
 std::atomic<bool> g_paused{false};
 std::atomic<int> g_advance{0};
 
+// ---- the game's settings a recording depends on ----------------------------------------------------------------------------
+// Saved with every recording (Replay::extensions, "env.*") and matched on playback (Options::matchRecording): the same
+// mouse movement turns the view by the sensitivity, and a recorded key does whatever it is bound to.
+struct Env {
+    bool valid = false;               // there was a player to read them from
+    float sensitivity = 0.f;
+    bool invertMouse = false;
+    std::map<std::string, std::string> binds;   // key -> the command it is bound to (without Ctrl / Shift / Alt)
+};
+
+std::mutex g_envMutex;
+Env g_envShared;                      // the game's, a moment ago (Preflight reads it on any thread)
+
+constexpr const char* kEnv = "env.";
+
 // ---- game thread state -----------------------------------------------------------------------------------------------------
 struct Session {
     Mode mode = Mode::Idle;
@@ -70,6 +94,15 @@ struct Session {
     std::vector<Classes::ULevelStreaming*> streaming;   // levels we set bShouldBlockOnLoad on
     std::unordered_map<long long, bool> hotkeyNames;    // engine FName -> is one of our keys (cache)
     int hotkeyHash = 0;
+
+    // Desync prevention and fixing
+    bool blockStreaming = true;       // this session's streaming setting (the recording's, when matching it)
+    std::size_t corrections = 0;      // OnDesync::Correct
+    std::string desyncInfo;
+    struct SavedInput { bool valid = false; float sensitivity = 0.f; bool invert = false; } savedInput;
+    Env recordEnv;                    // the settings when this recording started
+    bool recordStreaming = true;
+    std::string recordMods;
 };
 Session s;
 Options opt;                          // copy for this frame
@@ -99,6 +132,13 @@ void RunCommands()
 }
 
 float NominalDt(float hz) { return static_cast<float>(1.0 / (hz > 0.f ? hz : kArmHz)); }
+
+std::string Ext(const Replay& r, const std::string& key)
+{
+    const auto it = r.extensions.find(kEnv + key);
+    return it == r.extensions.end() ? std::string() : it->second;
+}
+bool HasExt(const Replay& r, const std::string& key) { return r.extensions.count(kEnv + key) != 0; }
 
 std::wstring Widen(const std::string& text) { return std::wstring(text.begin(), text.end()); }
 
@@ -138,7 +178,8 @@ bool SameName(const std::string& a, const std::string& b)
 // Keys that control the menu or the session never reach the game while a session runs (they'd be recorded otherwise).
 bool IsHotkey(const engine::RawInput& in)
 {
-    const int hash = opt.keyPause * 31 + opt.keyAdvance * 37 + opt.keyTakeOver * 41 + opt.keyStop * 43 + opt.keyRewind * 47;
+    const int hash = opt.keyPause * 31 + opt.keyAdvance * 37 + opt.keyTakeOver * 41 + opt.keyStop * 43 + opt.keyRewind * 47 +
+                     opt.keyRestart * 53;
     if (hash != s.hotkeyHash) {
         s.hotkeyNames.clear();
         s.hotkeyHash = hash;
@@ -148,7 +189,8 @@ bool IsHotkey(const engine::RawInput& in)
 
     const std::string name = EngineName(in.nameIndex, in.nameNumber);
     bool hit = false;
-    for (int vk : {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, VK_INSERT, VK_END})
+    for (int vk : {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart, VK_INSERT,
+                   VK_END})
         if (vk && SameName(name, UnrealKeyName(vk))) hit = true;
     s.hotkeyNames[key] = hit;
     return hit;
@@ -166,13 +208,16 @@ void Begin(Mode mode);
 void StopNow(const char* why);
 void TakeOverNow();
 void RewindNow(const char* why);
+void RestartNow();
+void PublishStatus();
 
 void PollHotkeys()
 {
-    static bool was[5]{};
-    const int keys[5] = {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind};
-    bool edge[5]{};
-    for (int i = 0; i < 5; ++i) {
+    constexpr int kKeys = 6;
+    static bool was[kKeys]{};
+    const int keys[kKeys] = {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart};
+    bool edge[kKeys]{};
+    for (int i = 0; i < kKeys; ++i) {
         const bool down = keys[i] && (GetAsyncKeyState(keys[i]) & 0x8000);
         edge[i] = down && !was[i];
         was[i] = down;
@@ -187,6 +232,7 @@ void PollHotkeys()
     if (edge[2] && s.mode == Mode::Playing) TakeOverNow();
     if (edge[3]) StopNow("stopped");
     if (edge[4] && s.mode == Mode::Recording && !s.armed) RewindNow("rewound");
+    if (edge[5]) RestartNow();
 }
 
 // ---- input --------------------------------------------------------------------------------------------------------------
@@ -247,6 +293,31 @@ int Resolve(std::uint16_t name)
     return s.resolved[name];
 }
 
+// ---- camera ----------------------------------------------------------------------------------------------------------------
+// Unreal rotations: 65536 units to a turn. Yaw keeps counting past a turn; pitch is wrapped to 16 bits.
+constexpr double kRotUnits = 65536.0 / 360.0;
+
+void ApplyCamera(float yawDeg, float pitchDeg)
+{
+    auto* pc = game::Controller();
+    if (!pc) return;
+    const auto yaw = static_cast<std::int32_t>(std::lround(yawDeg * kRotUnits));
+    const auto pitch = static_cast<std::int32_t>(std::lround(std::clamp(pitchDeg, -89.f, 89.f) * kRotUnits));
+    pc->Rotation.Yaw = static_cast<unsigned>(yaw);
+    pc->Rotation.Pitch = static_cast<unsigned>(pitch) & 0xFFFFu;
+}
+
+bool ReadCamera(float& yawDeg, float& pitchDeg)
+{
+    auto* pc = game::Controller();
+    if (!pc) return false;
+    int pitch = static_cast<int>(pc->Rotation.Pitch & 0xFFFFu);
+    if (pitch > 32768) pitch -= 65536;
+    yawDeg = static_cast<float>(static_cast<std::int32_t>(pc->Rotation.Yaw) / kRotUnits);
+    pitchDeg = static_cast<float>(pitch / kRotUnits);
+    return true;
+}
+
 // ---- world -----------------------------------------------------------------------------------------------------------------
 Sync Sample()
 {
@@ -264,11 +335,117 @@ Sync Sample()
     return out;
 }
 
+// The game's input settings and key bindings (game thread).
+Env ReadEnv()
+{
+    Env e;
+    auto* pc = game::Controller();
+    if (!pc || !pc->PlayerInput) return e;
+    auto* in = pc->PlayerInput;
+    e.valid = true;
+    e.sensitivity = in->MouseSensitivity;
+    e.invertMouse = in->bInvertMouse != 0;
+    for (std::size_t i = 0; i < in->Bindings.Num(); ++i) {
+        const auto& b = in->Bindings[i];
+        if (b.Control || b.Shift || b.Alt || !b.Command.IsValid()) continue;
+        e.binds.emplace(b.Name.GetName(), b.Command.ToString());     // the first binding of a key is the one used
+    }
+    return e;
+}
+
+void PublishEnv()
+{
+    Env e = ReadEnv();
+    if (!e.valid) return;
+    std::lock_guard lock(g_envMutex);
+    g_envShared = std::move(e);
+}
+
+// Saves what this recording depends on, for the keys it uses. Values already there are kept: a recording continued
+// later (take over, practice mode) keeps the settings it was started with.
+void WriteEnv(Replay& r, const Env& e, bool blockStreaming, const std::string& mods)
+{
+    const auto put = [&](const std::string& key, std::string value) { r.extensions.emplace(kEnv + key, std::move(value)); };
+    put("blockStreaming", blockStreaming ? "1" : "0");
+    put("mods", mods);
+    if (!e.valid) return;
+    char sens[32];
+    std::snprintf(sens, sizeof sens, "%.4f", e.sensitivity);
+    put("sensitivity", sens);
+    put("invertMouse", e.invertMouse ? "1" : "0");
+    for (const std::string& name : r.names)
+        if (const auto it = e.binds.find(name); it != e.binds.end()) put("bind." + name, it->second);
+}
+
+// The key bound to `command` now, preferring one of the same kind (gamepad or not) as `like`. Empty if none.
+std::string KeyFor(const Env& e, const std::string& command, const std::string& like)
+{
+    const bool pad = like.rfind("XboxTypeS_", 0) == 0;
+    std::string other;
+    for (const auto& [key, cmd] : e.binds) {
+        if (cmd != command || key.rfind("GBA_", 0) == 0) continue;     // GBA_ names are aliases, not keys
+        if ((key.rfind("XboxTypeS_", 0) == 0) == pad) return key;
+        if (other.empty()) other = key;
+    }
+    return other;
+}
+
+// Playback, when frame 0 starts: the recording's mouse settings for this session, and every key whose binding changed
+// played as the key that does the recorded thing now. Undone by StopNow.
+void ApplyMatch()
+{
+    if (s.mode != Mode::Playing || !opt.matchRecording) return;
+    const Env now = ReadEnv();
+    if (!now.valid) return;
+    std::lock_guard lock(g_mutex);
+    const Replay& r = g_replay;
+
+    auto* pc = game::Controller();
+    if (pc && pc->PlayerInput && HasExt(r, "sensitivity")) {
+        const float sens = std::strtof(Ext(r, "sensitivity").c_str(), nullptr);
+        const bool invert = Ext(r, "invertMouse") == "1";
+        if (sens != now.sensitivity || invert != now.invertMouse) {
+            if (!s.savedInput.valid) s.savedInput = {true, now.sensitivity, now.invertMouse};
+            pc->PlayerInput->MouseSensitivity = sens;
+            pc->PlayerInput->bInvertMouse = invert ? 1 : 0;
+            spdlog::info("TAS: mouse sensitivity {} (invert {}) as recorded, yours is {} (invert {})", sens, invert,
+                         now.sensitivity, now.invertMouse);
+        }
+    }
+
+    for (std::size_t i = 0; i < r.names.size(); ++i) {
+        const std::string& name = r.names[i];
+        if (!HasExt(r, "bind." + name)) continue;
+        const std::string recorded = Ext(r, "bind." + name);
+        const auto cur = now.binds.find(name);
+        if (cur != now.binds.end() && cur->second == recorded) continue;
+        const std::string key = KeyFor(now, recorded, name);
+        if (key.empty()) {
+            spdlog::warn("TAS: '{}' was bound to '{}' when recorded; no key is now, it plays as it is", name, recorded);
+            continue;
+        }
+        Classes::FName fn(key.c_str());
+        if (i >= s.resolved.size()) s.resolved.resize(r.names.size(), -2);
+        s.resolved[i] = fn.Index;
+        spdlog::info("TAS: '{}' ({}) plays as '{}', which is bound to that now", name, recorded, key);
+    }
+}
+
+void RestoreInput()
+{
+    if (!s.savedInput.valid) return;
+    if (auto* pc = game::Controller(); pc && pc->PlayerInput) {
+        pc->PlayerInput->MouseSensitivity = s.savedInput.sensitivity;
+        pc->PlayerInput->bInvertMouse = s.savedInput.invert ? 1 : 0;
+    }
+    s.savedInput = {};
+}
+
 // A streamed sublevel normally loads in the background and appears whenever it is done: a different frame on every
 // machine and every run. Blocking makes it appear in the frame it is requested.
 void BlockStreaming()
 {
-    if (!opt.blockStreaming) return;
+    if (!s.blockStreaming) return;
     auto* world = game::World();
     if (!world) return;
     for (std::size_t i = 0; i < world->StreamingLevels.Num(); ++i) {
@@ -357,22 +534,61 @@ double MeasureDt()
     return dt;
 }
 
-// Blocks the game thread while paused. The picture (and the menu) stand still meanwhile: rendering only happens when
-// the game ticks. Hotkeys keep working, and the window keeps answering Windows so it's never "not responding".
+// The game thread's window messages, handled the way the game's own loop does (the menu's PeekMessage hook sees them
+// first, so it gets its mouse and keyboard). Input meant for the game goes through the input filter as usual: while
+// recording it is held back to the next frame.
+void PumpMessages()
+{
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage(static_cast<int>(msg.wParam));   // for the game's own loop, once this frame goes on
+            StopNow("the game is closing");
+            return;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+// The game draws nothing while its thread waits here, so the menu is drawn over the last frame instead and stays
+// usable (Resume, Stop, Restart, files...). On the real clock: ImGui times its frames with the performance counter.
+void DrawPaused()
+{
+    // An exception from here would unwind through the engine's frame and end the game: if drawing ever fails, the
+    // session stays paused without the menu on screen (hotkeys still work) for the rest of the game.
+    static bool broken = false;
+    if (broken) return;
+    engine::SuspendVirtualClock(true);
+    try {
+        hooks::DrawWhileStalled();
+    } catch (const std::exception& e) {
+        broken = true;
+        spdlog::error("TAS: drawing the menu while paused failed ({}): not drawn while paused from now on", e.what());
+    } catch (...) {
+        broken = true;
+        spdlog::error("TAS: drawing the menu while paused failed: not drawn while paused from now on");
+    }
+    engine::SuspendVirtualClock(false);
+}
+
+// Blocks the game thread while paused. The game stands still meanwhile; the menu keeps working (DrawPaused), so do the
+// hotkeys, and the window keeps answering Windows so it's never "not responding".
 bool WaitWhilePaused()
 {
     bool waited = false;
-    while (s.mode != Mode::Idle && g_paused && g_advance == 0) {
+    for (unsigned spin = 0; s.mode != Mode::Idle && g_paused && g_advance == 0; ++spin) {
         if (!waited) {
             waited = true;
             std::lock_guard lock(g_mutex);
             g_status.paused = true;
             g_status.frame = s.frame;
         }
-        MSG msg;
-        PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE);
+        PumpMessages();
         PollHotkeys();
         RunCommands();
+        if (s.mode != Mode::Idle) PublishStatus();      // a Record / Play / Restart from the menu shows right away
+        if (spin % 16 == 15) DrawPaused();      // about 60 times a second (Sleep(1) with timeBeginPeriod(1))
         Sleep(1);
     }
     if (g_advance > 0) --g_advance;
@@ -395,6 +611,13 @@ void Begin(Mode mode)
     s.resolved.clear();
     s.held.clear();
     s.lastReal = engine::RealSeconds();
+    s.corrections = 0;
+    s.desyncInfo.clear();
+    s.blockStreaming = opt.blockStreaming;
+    if (mode == Mode::Playing && opt.matchRecording) {
+        std::lock_guard lock(g_mutex);
+        if (HasExt(g_replay, "blockStreaming")) s.blockStreaming = Ext(g_replay, "blockStreaming") == "1";
+    }
 
     g_active = true;
     engine::UseVirtualClock(true);
@@ -407,11 +630,14 @@ void Begin(Mode mode)
     }
     timeBeginPeriod(1);
     game::SetInputBlockedSuspended(true);
+    hooks::CaptureFrames(true);         // the picture the menu is drawn over while paused
 
     {
         std::lock_guard lock(g_mutex);
         g_status.verified = false;
         g_status.desyncFrame = -1;
+        g_status.desyncInfo.clear();
+        g_status.corrections = 0;
         g_status.syncChecked = 0;
     }
 
@@ -419,6 +645,7 @@ void Begin(Mode mode)
         s.armed = false;
         engine::SeedRand(g_replay.seed);
         ResetPlayerInput();
+        ApplyMatch();
         SetMessage(mode == Mode::Recording ? "recording" : "playing");
         return;
     }
@@ -438,9 +665,14 @@ void StopNow(const char* why)
     if (s.mode == Mode::Idle) return;
     ReleaseHeld();
     if (s.mode == Mode::Recording) {
+        const Env env = s.recordEnv.valid ? s.recordEnv : ReadEnv();
         std::lock_guard lock(g_mutex);
         g_replay.syncValidUntil = static_cast<std::uint32_t>(g_replay.frames.size());
+        WriteEnv(g_replay, env, s.recordEnv.valid ? s.recordStreaming : s.blockStreaming,
+                 s.recordEnv.valid ? s.recordMods : opt.gameplayMods);
     }
+    RestoreInput();
+    s.recordEnv = {};
     s.mode = Mode::Idle;
     s.armed = false;
     s.seekTo = kNoSeek;
@@ -454,7 +686,56 @@ void StopNow(const char* why)
     engine::UseVirtualClock(false);
     timeEndPeriod(1);
     game::SetInputBlockedSuspended(false);
+    hooks::CaptureFrames(false);
+    PublishStatus();        // OnFrame returns early from now on: without this the menu would show the old mode forever
     SetMessage(why, true);
+}
+
+// A new recording (the replay is replaced) with this start.
+void RecordNow(StartKind start, const std::string& command, const std::string& map, const std::string& checkpoint,
+               float hz)
+{
+    StopNow("stopped");
+    {
+        std::lock_guard lock(g_mutex);
+        g_replay.Clear();
+        g_replay.start = start;
+        g_replay.command = command;
+        g_replay.map = map;
+        g_replay.checkpoint = checkpoint;
+        g_replay.fixedHz = hz;
+        g_replay.gameStamp = engine::GameStamp();
+        g_replay.created = static_cast<std::uint64_t>(std::time(nullptr));
+    }
+    s.resolved.clear();
+    s.recordEnv = ReadEnv();            // saved with the recording when it stops
+    s.recordStreaming = opt.blockStreaming;
+    s.recordMods = opt.gameplayMods;
+    Begin(Mode::Recording);
+}
+
+// Recording: throw the take away and record again from the same start (a level start loads the level again).
+// Playing: play again from the start.
+void RestartNow()
+{
+    if (s.mode == Mode::Recording) {
+        StartKind start;
+        std::string command, map, checkpoint;
+        float hz;
+        {
+            std::lock_guard lock(g_mutex);
+            start = g_replay.start;
+            command = g_replay.command;
+            map = g_replay.map;
+            checkpoint = g_replay.checkpoint;
+            hz = g_replay.fixedHz;
+        }
+        RecordNow(start, command, map, checkpoint, hz);
+        if (s.mode != Mode::Idle) SetMessage("recording restarted", true);
+    } else if (s.mode == Mode::Playing) {
+        StopNow("restarting");
+        Begin(Mode::Playing);
+    }
 }
 
 void TakeOverNow()
@@ -543,8 +824,53 @@ void CheckDeath()
     }
 }
 
-// The player's state against the recording. Frames past the checked range (edited) get their sync data refreshed instead,
-// as long as everything before them matched.
+// What differs between the player now and the recording ("velocity off by 0.002").
+std::string DescribeDesync(const Sync& now, const Sync& want)
+{
+    if (!now.present || !want.present) return now.present ? "no player in the recording here" : "no player here";
+    const auto len = [](float x, float y, float z) { return std::sqrt(x * x + y * y + z * z); };
+    const float dp = len(now.x - want.x, now.y - want.y, now.z - want.z);
+    const float dv = len(now.vx - want.vx, now.vy - want.vy, now.vz - want.vz);
+    std::string out;
+    char part[96];
+    if (now.state != want.state) {
+        std::snprintf(part, sizeof part, "move %u (recorded %u)", now.state, want.state);
+        out += part;
+    }
+    if (dp > 0.f) {
+        std::snprintf(part, sizeof part, "%sposition off by %.3f", out.empty() ? "" : ", ", dp);
+        out += part;
+    }
+    if (dv > 0.f) {
+        std::snprintf(part, sizeof part, "%svelocity off by %.3f", out.empty() ? "" : ", ", dv);
+        out += part;
+    }
+    if (dp == 0.f && now.state == want.state) out += ", position matched";
+    return out.empty() ? "differs" : out;
+}
+
+// OnDesync::Correct: the same move and close enough to put back on the recorded state.
+bool CanCorrect(const Sync& now, const Sync& want)
+{
+    if (!now.present || !want.present || now.state != want.state) return false;
+    const float dx = now.x - want.x, dy = now.y - want.y, dz = now.z - want.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz) <= opt.correctMax;
+}
+
+void Correct(const Sync& want)
+{
+    auto* pawn = game::Pawn();
+    if (!pawn) return;
+    pawn->Location.X = want.x;          // written directly: SetLocation() doesn't move the player
+    pawn->Location.Y = want.y;
+    pawn->Location.Z = want.z;
+    pawn->Velocity.X = want.vx;
+    pawn->Velocity.Y = want.vy;
+    pawn->Velocity.Z = want.vz;
+}
+
+// The player's state against the recording, called with g_mutex held. Frames past the checked range (edited) get their
+// sync data refreshed instead, as long as everything before them matched. OnDesync decides what a mismatch does.
 void CheckSync(const Sync& now)
 {
     Replay& r = g_replay;
@@ -552,16 +878,27 @@ void CheckSync(const Sync& now)
     if (r.sync.size() != r.frames.size()) r.sync.resize(r.frames.size());
 
     if (s.frame < r.syncValidUntil) {
-        if (r.sync[s.frame] == now) {
+        const Sync& want = r.sync[s.frame];
+        if (want == now) {
+            ++s.syncChecked;
+        } else if (s.desyncFrame < 0 && opt.onDesync == OnDesync::Correct && CanCorrect(now, want)) {
+            if (s.corrections == 0)
+                spdlog::info("TAS: frame {} corrected ({}); further corrections are only counted", s.frame,
+                             DescribeDesync(now, want));
+            Correct(want);
+            ++s.corrections;
             ++s.syncChecked;
         } else if (s.desyncFrame < 0) {
             s.desyncFrame = static_cast<long long>(s.frame);
-            const Sync& want = r.sync[s.frame];
-            spdlog::warn("TAS: desync at frame {}: at ({:.3f}, {:.3f}, {:.3f}) state {}, recorded ({:.3f}, {:.3f}, {:.3f}) "
-                         "state {}", s.frame, now.x, now.y, now.z, now.state, want.x, want.y, want.z, want.state);
-            g_status.message = "desync at frame " + std::to_string(s.frame);
-            notify::Push("TAS: desync at frame " + std::to_string(s.frame));
-            if (opt.pauseOnDesync) g_paused = true;
+            s.desyncInfo = DescribeDesync(now, want);
+            spdlog::warn("TAS: desync at frame {} ({}): at ({:.3f}, {:.3f}, {:.3f}) v ({:.3f}, {:.3f}, {:.3f}) move {}, "
+                         "recorded ({:.3f}, {:.3f}, {:.3f}) v ({:.3f}, {:.3f}, {:.3f}) move {}", s.frame, s.desyncInfo,
+                         now.x, now.y, now.z, now.vx, now.vy, now.vz, now.state, want.x, want.y, want.z, want.vx,
+                         want.vy, want.vz, want.state);
+            g_status.message = "desync at frame " + std::to_string(s.frame) + ": " + s.desyncInfo;
+            g_status.desyncInfo = s.desyncInfo;
+            notify::Push("TAS: desync at frame " + std::to_string(s.frame) + ": " + s.desyncInfo);
+            if (opt.onDesync == OnDesync::Pause) g_paused = true;
         }
     } else if (s.frame == r.syncValidUntil && s.desyncFrame < 0) {
         r.sync[s.frame] = now;
@@ -576,8 +913,8 @@ void PlaybackEnded()
     {
         std::lock_guard lock(g_mutex);
         const std::size_t checkable = std::min<std::size_t>(r.syncValidUntil, r.frames.size());
-        g_status.verified = r.start != StartKind::Now && s.desyncFrame < 0 && checkable == r.frames.size() &&
-                            s.syncChecked == checkable && checkable > 0;
+        g_status.verified = r.start != StartKind::Now && s.desyncFrame < 0 && s.corrections == 0 &&
+                            checkable == r.frames.size() && s.syncChecked == checkable && checkable > 0;
     }
     switch (opt.atEnd) {
         case AtEnd::Record: TakeOverNow(); break;
@@ -598,6 +935,33 @@ void PublishStatus()
     g_status.time = s.vtime - kStartTime;
     g_status.desyncFrame = s.desyncFrame;
     g_status.syncChecked = s.syncChecked;
+    g_status.corrections = s.corrections;
+}
+
+// Arm: wait for the start level, running frames at the nominal step (they are the same in every run too).
+// True when this frame was one of those (or the session gave up): OnFrame returns `result`. False once the level is
+// there: frame 0 runs now.
+bool ArmFrame(bool& result)
+{
+    if (s.sawLoad && !game::IsLoading() && game::Pawn()) {
+        s.armed = false;
+        ApplyMatch();                  // the level's own player input exists now
+        s.vtime = kStartTime;      // frame 0 starts at the same clock in every run
+        s.lastReal = engine::RealSeconds() - NominalDt(g_replay.fixedHz);   // the load isn't part of frame 0
+        SetMessage(s.mode == Mode::Recording ? "recording" : "playing");
+        return false;
+    }
+    if (!s.sawLoad && engine::RealSeconds() - s.armStart > kArmTimeout) {
+        StopNow("the start level never loaded");
+        result = false;
+        return true;
+    }
+    const double dt = NominalDt(g_replay.fixedHz);
+    s.vtime += dt;
+    engine::SetFrameTime(s.vtime, dt);
+    PublishStatus();
+    result = true;
+    return true;
 }
 
 // Called by the engine's frame timing on the game thread, once per frame, before the engine ticks.
@@ -610,26 +974,12 @@ bool OnFrame()
     RunCommands();
     PollHotkeys();
     CheckDeath();
+    static unsigned envTick = 0;
+    if (++envTick % 30 == 1) PublishEnv();
     if (s.mode == Mode::Idle) return false;
 
-    // Arm: wait for the start level, running frames at the nominal step (they are the same in every run too).
-    if (s.armed) {
-        if (s.sawLoad && !game::IsLoading() && game::Pawn()) {
-            s.armed = false;
-            s.vtime = kStartTime;      // frame 0 starts at the same clock in every run
-            s.lastReal = engine::RealSeconds() - NominalDt(g_replay.fixedHz);   // the load isn't part of frame 0
-            SetMessage(s.mode == Mode::Recording ? "recording" : "playing");
-        } else if (!s.sawLoad && engine::RealSeconds() - s.armStart > kArmTimeout) {
-            StopNow("the start level never loaded");
-            return false;
-        } else {
-            const double dt = NominalDt(g_replay.fixedHz);
-            s.vtime += dt;
-            engine::SetFrameTime(s.vtime, dt);
-            PublishStatus();
-            return true;
-        }
-    }
+    bool result = false;
+    if (s.armed && ArmFrame(result)) return result;
 
     if (s.seekTo != kNoSeek && s.frame >= s.seekTo) {
         s.seekTo = kNoSeek;
@@ -642,6 +992,8 @@ bool OnFrame()
     }
     if (WaitWhilePaused()) s.lastReal = engine::RealSeconds();
     if (s.mode == Mode::Idle) return false;
+    // Restarted, or a playback started, from the menu while paused: its start level has only just been asked for.
+    if (s.armed && ArmFrame(result)) return result;
 
     if (s.mode == Mode::Playing && s.frame >= g_replay.frames.size()) {
         if (!s.endReached) PlaybackEnded();         // stops, pauses, or switches to recording
@@ -649,10 +1001,11 @@ bool OnFrame()
             // Paused at the end: wait there. Resuming or stepping ends the playback, taking over keeps recording.
             PublishStatus();
             WaitWhilePaused();
-            if (s.mode == Mode::Playing) StopNow("end of the replay");
             s.lastReal = engine::RealSeconds();
+            if (s.armed && ArmFrame(result)) return result;     // restarted from the menu meanwhile
+            if (s.mode == Mode::Playing && s.frame >= g_replay.frames.size()) StopNow("end of the replay");
         }
-        if (s.mode != Mode::Recording) return false;
+        if (s.mode == Mode::Idle) return false;
     }
 
     // This frame's time step.
@@ -676,9 +1029,15 @@ bool OnFrame()
         Replay& r = g_replay;
         if (s.mode == Mode::Playing) {
             CheckSync(now);
+            // Camera keys: the look direction is set here, before the engine ticks, and the recorded look input
+            // of these frames is left out.
+            float camYaw = 0.f, camPitch = 0.f;
+            const bool camera = timeline::CameraAt(r, s.frame, camYaw, camPitch);
+            if (camera) ApplyCamera(camYaw, camPitch);
             const Frame& f = r.frames[s.frame];
             for (std::uint32_t i = 0; i < f.count; ++i) {
                 const Event& e = r.events[f.first + i];
+                if (camera && e.kind == EventKind::Axis && timeline::IsLookAxis(r.Name(e.name))) continue;
                 const int name = Resolve(e.name);
                 if (name < 0) continue;
                 engine::RawInput in;
@@ -729,11 +1088,49 @@ void OnLevelLoad(bool finished)
     }
 }
 
+// The example macros built into the DLL go to replays/ once: replays/.examples lists the ones written before, so an
+// example that was deleted or renamed doesn't come back.
+void InstallExamples()
+{
+    std::error_code ec;
+    const std::filesystem::path folder = Folder();
+    std::filesystem::create_directories(folder, ec);
+    const std::filesystem::path listPath = folder / ".examples";
+
+    std::set<std::string> done;
+    {
+        std::ifstream list(listPath);
+        for (std::string line; std::getline(list, line);)
+            if (!line.empty()) done.insert(line);
+    }
+    bool changed = false;
+    for (const examples::File& f : examples::All()) {
+        if (!f.name || done.count(f.name)) continue;
+        const std::filesystem::path path = folder / f.name;
+        if (!std::filesystem::exists(path, ec)) {
+            std::ofstream out(path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(f.data), static_cast<std::streamsize>(f.size));
+            if (!out) {
+                spdlog::warn("TAS: couldn't write the example macro {}", path.string());
+                continue;
+            }
+            spdlog::info("TAS: example macro {} added", path.string());
+        }
+        done.insert(f.name);
+        changed = true;
+    }
+    if (changed) {
+        std::ofstream list(listPath, std::ios::trunc);
+        for (const auto& name : done) list << name << '\n';
+    }
+}
+
 } // namespace
 
 // ---- public ----------------------------------------------------------------------------------------------------------------
 bool Init()
 {
+    InstallExamples();
     if (!engine::Init()) return false;
     engine::SetFrameHandler(&OnFrame);
     engine::SetInputFilter(&FilterInput);
@@ -763,26 +1160,16 @@ Status GetStatus()
 void Record(StartKind start, const std::string& command, const std::string& map, const std::string& checkpoint)
 {
     Post([=] {
-        StopNow("stopped");
-        Options o;
+        float hz;
         {
             std::lock_guard lock(g_optMutex);
-            o = g_options;
+            hz = g_options.recordHz;
         }
-        {
-            std::lock_guard lock(g_mutex);
-            g_replay.Clear();
-            g_replay.start = start;
-            g_replay.command = command;
-            g_replay.map = map;
-            g_replay.checkpoint = checkpoint;
-            g_replay.fixedHz = o.recordHz;
-            g_replay.gameStamp = engine::GameStamp();
-            g_replay.created = static_cast<std::uint64_t>(std::time(nullptr));
-        }
-        Begin(Mode::Recording);
+        RecordNow(start, command, map, checkpoint, hz);
     });
 }
+
+void Restart() { Post([] { RestartNow(); }); }
 
 void Play()
 {
@@ -835,7 +1222,9 @@ void Goto(std::size_t frame)
         frame = std::min(frame, count);
 
         if (s.mode != Mode::Playing || s.armed || frame < s.frame) {
-            if (start == StartKind::Now) {
+            // A macro that starts "now" starts wherever the player is: from idle that's fine, but a running one
+            // can't get back to where it began.
+            if (start == StartKind::Now && s.mode != Mode::Idle) {
                 SetMessage("a macro (start: now) can't be rewound", true);
                 return;
             }
@@ -851,6 +1240,118 @@ void Goto(std::size_t frame)
 }
 
 void Rewind() { Post([] { RewindNow("rewound"); }); }
+
+std::vector<Issue> Preflight()
+{
+    using Level = Issue::Level;
+    Options o;
+    {
+        std::lock_guard lock(g_optMutex);
+        o = g_options;
+    }
+    Env now;
+    {
+        std::lock_guard lock(g_envMutex);
+        now = g_envShared;
+    }
+    std::vector<Issue> out;
+    std::lock_guard lock(g_mutex);
+    const Replay& r = g_replay;
+    if (r.frames.empty()) return out;
+
+    if (r.start == StartKind::Now)
+        out.push_back({Level::Info, "Starts \"now\": a playback can't be checked against the recording", false});
+    if (r.gameStamp && r.gameStamp != engine::GameStamp())
+        out.push_back({Level::Problem, "Made with a different version of the game: it will likely desync", false});
+    if (!HasExt(r, "blockStreaming")) {
+        out.push_back({Level::Info, "Recorded before the menu saved its settings with macros: nothing to compare", false});
+        return out;
+    }
+
+    const bool recStreaming = Ext(r, "blockStreaming") == "1";
+    if (recStreaming != o.blockStreaming)
+        out.push_back({Level::Warning, std::string("Recorded with deterministic streaming ") +
+                                           (recStreaming ? "on" : "off") + ", it is " + (o.blockStreaming ? "on" : "off"),
+                       o.matchRecording});
+
+    const std::string recMods = Ext(r, "mods");
+    if (recMods != o.gameplayMods)
+        out.push_back({Level::Warning, "Modules that change the game: " +
+                                           (o.gameplayMods.empty() ? std::string("none on now") : "on now: " + o.gameplayMods) +
+                                           "; " + (recMods.empty() ? std::string("none when recorded")
+                                                                   : "when recorded: " + recMods),
+                       false});
+
+    if (!now.valid) {
+        out.push_back({Level::Info, "No player: mouse settings and key bindings are checked once in a level", false});
+        return out;
+    }
+    if (HasExt(r, "sensitivity")) {
+        const float sens = std::strtof(Ext(r, "sensitivity").c_str(), nullptr);
+        const bool invert = Ext(r, "invertMouse") == "1";
+        char text[160];
+        if (std::abs(sens - now.sensitivity) > 1e-4f) {
+            std::snprintf(text, sizeof text, "Mouse sensitivity is %.2f, the macro was recorded with %.2f",
+                          now.sensitivity, sens);
+            out.push_back({Level::Warning, text, o.matchRecording});
+        }
+        if (invert != now.invertMouse)
+            out.push_back({Level::Warning, std::string("Invert mouse is ") + (now.invertMouse ? "on" : "off") +
+                                               ", it was " + (invert ? "on" : "off") + " when recorded",
+                           o.matchRecording});
+    }
+    for (const std::string& name : r.names) {
+        if (!HasExt(r, "bind." + name)) continue;
+        const std::string recorded = Ext(r, "bind." + name);
+        const auto cur = now.binds.find(name);
+        if (cur != now.binds.end() && cur->second == recorded) continue;
+        const std::string key = KeyFor(now, recorded, name);
+        const std::string does = cur == now.binds.end() ? std::string("nothing") : "\"" + cur->second + "\"";
+        if (key.empty())
+            out.push_back({Level::Problem, name + " does " + does + " now; when recorded it was \"" + recorded +
+                                               "\", which no key does now", false});
+        else
+            out.push_back({Level::Warning, name + " does " + does + " now: played as " + key + " (\"" + recorded + "\")",
+                           o.matchRecording});
+    }
+    return out;
+}
+
+void ResetSync()
+{
+    Post([] {
+        std::lock_guard lock(g_mutex);
+        g_replay.sync.clear();
+        g_replay.syncValidUntil = 0;
+    });
+    SetMessage("the next playback records the reference states again", true);
+}
+
+void KeyCameraFromView(std::uint32_t frame)
+{
+    Post([frame] {
+        float yaw = 0.f, pitch = 0.f;
+        if (!ReadCamera(yaw, pitch)) {
+            SetMessage("no player camera to take the key from", true);
+            return;
+        }
+        std::lock_guard lock(g_mutex);
+        if (frame >= g_replay.frames.size()) return;
+        // Turn the shorter way from the camera around it (the key it replaces, else the keys' path there)
+        CameraKey key;
+        key.frame = frame;
+        float nearYaw = yaw, nearPitch = 0.f;
+        if (const CameraKey* old = timeline::FindCameraKey(g_replay, frame)) {
+            key.ease = old->ease;
+            nearYaw = old->yaw;
+        } else if (!timeline::CameraAt(g_replay, frame, nearYaw, nearPitch) && !g_replay.camera.empty()) {
+            nearYaw = frame < g_replay.camera.front().frame ? g_replay.camera.front().yaw : g_replay.camera.back().yaw;
+        }
+        key.yaw = timeline::UnwrapNear(yaw, nearYaw);
+        key.pitch = pitch;
+        timeline::SetCameraKey(g_replay, key);
+    });
+}
 
 void Clear()
 {

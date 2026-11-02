@@ -36,8 +36,10 @@ namespace debugworld {
         bool cacheDirty = false;                    // Volumes found that are not on disk yet
         double lastScanMs = 0.0;
         std::size_t scans = 0;
-        bool baking = false;                        // "Bake all levels" is running
-        std::string bakeStatus;                     // Progress / result of the last bake
+        bool baking = false;                        // A bake is running
+        std::string bakeStatus;                     // The checkpoint being baked, or the result of the last bake
+        std::size_t bakeDone = 0, bakeTotal = 0;    // Checkpoints (level starts included)
+        std::size_t bakeFailed = 0;                 // Ones that never finished loading (skipped)
     };
 
     void Update(const Config& config);              // Call every tick: rebuilds the scene when it is due
@@ -47,9 +49,11 @@ namespace debugworld {
     void RescanNow();                               // Walk the object list for volumes on the next Update
     void ClearCache();                              // Forget the remembered volumes of this level, delete its file, rescan
 
-    // Loads every level and checkpoint in turn so that their volumes are scanned and written to the cache. Takes a few
-    // minutes; the game ends up in the last level. Needs the collision view to be on (it drives the scan).
-    void BakeAllLevels();
+    // Loads every level start and checkpoint in story order, waits for each to load and for its volumes to stop turning
+    // up, and writes them to the cache. A level whose checkpoints all worked gets cache/<map>.baked; `onlyMissing`
+    // skips those. Afterwards (or when cancelled) the player is taken back to the level they were in. Needs the
+    // collision view to be on (it drives the scan).
+    void BakeAllLevels(bool onlyMissing);
     void CancelBake();
 
     Info GetInfo();                                 // Any thread

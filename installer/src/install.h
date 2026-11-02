@@ -8,6 +8,8 @@
 //   Binaries\dinput8.dll              the loader (loads the menu with the game)
 //   Binaries\memenu\medge_menu.dll    the menu
 //   Binaries\memenu\...               its config, themes, cache and logs (created by the menu)
+//   Binaries\memenu\uninstall.exe     a copy of the installer, for uninstalling from Windows' Settings > Apps, where
+//                                     the install is listed as "Mirror's Edge Menu"
 //
 // Both DLLs are embedded in the installer. A dinput8.dll from another mod is kept as dinput8.dll.memenu-backup and put
 // back on uninstall.
@@ -36,4 +38,8 @@ namespace install
     // On failure `message` says why. On success it says what was done.
     bool Install(const std::filesystem::path& gameDir, std::wstring& message);
     bool Uninstall(const std::filesystem::path& gameDir, bool removeSettings, std::wstring& message);
+
+    // Starts the game the way the player would (through Steam for a Steam copy), as the user and not as the elevated
+    // installer: a game started with admin rights behaves differently.
+    void Launch(const std::filesystem::path& gameDir);
 }

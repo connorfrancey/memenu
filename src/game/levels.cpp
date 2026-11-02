@@ -32,6 +32,7 @@ namespace levels
         std::mutex g_mutex;
         std::vector<MapEntry> g_maps;
         std::vector<SublevelView> g_sublevels;
+        std::string g_currentMap;
         bool g_haveGameMaps = false;        // False while only the built-in list is known
         std::string g_message;
 
@@ -155,8 +156,12 @@ namespace levels
         void RefreshSublevels()
         {
             std::vector<SublevelView> views;
+            std::string current;
             if (auto* world = game::World())
             {
+                Classes::UObject* o = world;     // The persistent level's package: follow Outer up from the WorldInfo
+                for (int guard = 0; o->Outer && guard < 16; ++guard) o = o->Outer;
+                current = o->GetName();
                 for (size_t i = 0; i < world->StreamingLevels.Num(); ++i)
                 {
                     auto* ls = world->StreamingLevels[i];
@@ -166,6 +171,7 @@ namespace levels
             }
             std::lock_guard lock(g_mutex);
             g_sublevels = std::move(views);
+            g_currentMap = std::move(current);
         }
 
         void TickCallback(float)
@@ -210,11 +216,21 @@ namespace levels
         std::vector<MapView> v;
         for (const auto& m : g_maps)
         {
-            MapView view{m.label, {}};
-            for (const auto& c : m.checkpoints) view.checkpoints.push_back(c.label);
+            MapView view{m.label, {}, m.file, {}};
+            for (const auto& c : m.checkpoints)
+            {
+                view.checkpoints.push_back(c.label);
+                view.checkpointNames.push_back(c.name);
+            }
             v.push_back(std::move(view));
         }
         return v;
+    }
+
+    std::string CurrentMap()
+    {
+        std::lock_guard lock(g_mutex);
+        return g_currentMap;
     }
 
     void Load(int mapIndex, int checkpoint, Method method, bool saveProgress)

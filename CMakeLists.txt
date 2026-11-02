@@ -24,6 +24,7 @@ option(MEMENU_BUILD_TESTS     "Build the GoogleTest unit tests (memenu_tests)" O
 option(MEMENU_BUILD_INSTALLER "Build the dinput8.dll loader and memenu_installer.exe" OFF)
 option(MEMENU_BUILD_LAUNCHER  "Build medge_launcher.exe (injects the DLL into a running game)" OFF)
 option(MEMENU_BUILD_TESTHOST  "Build memenu_testhost.exe (loads the DLL into a D3D9 test app: memenu verbose-build)" OFF)
+option(MEMENU_BUILD_BENCHMARKS "Build the nanobench benchmarks (memenu_bench: memenu bench)" OFF)
 # Dev tooling packages (Ccache, CPMLicenses, Format.cmake): not needed to build the DLL
 option(MEMENU_DEV_TOOLS       "Fetch Ccache.cmake, CPMLicenses.cmake and Format.cmake" OFF)
 # Performance optimizations (src/core/optimizations.h): caches, cached object/name lookups, the scheduler's intervals,
@@ -94,6 +95,14 @@ memenu_add_build_info(${PROJECT_NAME})
 
 source_group(TREE ${PROJECT_SOURCE_DIR}/src FILES ${HEADER_FILES} ${SOURCE_FILES})
 
+# The example macros (examples/replays/) built into the DLL: the TAS writes them to replays/ on first start
+if("tas" IN_LIST MEMENU_ENABLED_FEATURES)
+  include(cmake/Examples.cmake)
+  memenu_embed_examples(_examples_cpp)
+  target_sources(${PROJECT_NAME} PRIVATE ${_examples_cpp})
+  source_group("Generated" FILES ${_examples_cpp})
+endif()
+
 target_include_directories(${PROJECT_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
   MEMENU_GAME=$<BOOL:${MEMENU_GAME}>
@@ -136,6 +145,12 @@ endif()
 
 include(cmake/Libraries.cmake)
 
+# The menu's font built into the DLL (hooks.cpp loads it): after the libraries, it comes from imgui's sources
+include(cmake/Fonts.cmake)
+memenu_embed_font(_font_cpp)
+target_sources(${PROJECT_NAME} PRIVATE ${_font_cpp})
+source_group("Generated" FILES ${_font_cpp})
+
 # -------------------------------------------------------------------------------------------------
 # Loader (dinput8.dll proxy next to the game exe) and its installer: the normal way to use the menu
 if(MEMENU_BUILD_INSTALLER)
@@ -158,4 +173,10 @@ endif()
 if(MEMENU_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# -------------------------------------------------------------------------------------------------
+# Benchmarks (nanobench)
+if(MEMENU_BUILD_BENCHMARKS)
+  add_subdirectory(bench)
 endif()

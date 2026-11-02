@@ -33,6 +33,9 @@ void UseVirtualClock(bool on);
 void SetFrameTime(double seconds, double dt);
 // Real seconds from the unhooked performance counter.
 double RealSeconds();
+// While suspended, the game thread reads the real clocks again (the virtual clock and the engine's time are kept). For
+// work done between frames while a session is paused, e.g. drawing the menu: ImGui times itself with the counter.
+void SuspendVirtualClock(bool suspend);
 
 // ---- input --------------------------------------------------------------------------------------------------------------
 struct RawInput {

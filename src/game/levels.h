@@ -12,6 +12,8 @@ namespace levels
     {
         std::string label;                      // "Prologue (edge_p)"
         std::vector<std::string> checkpoints;   // Checkpoint labels; The implicit "start of level" is not included
+        std::string file;                       // Package name, "edge_p"
+        std::vector<std::string> checkpointNames;   // The game's names of the checkpoints ("Scraper_Start")
     };
 
     struct SublevelView
@@ -26,6 +28,8 @@ namespace levels
 
     // Maps come from the game's own level-select data (UIDataProvider_TdMaps), with a built-in fallback list.
     std::vector<MapView> Maps();
+    // Package name of the level the player is in ("Edge_p"), empty in none. Updated about twice a second.
+    std::string CurrentMap();
     // Checkpoint: 0 = start of the level, n = the n-th entry of MapView::checkpoints.
     void Load(int map, int checkpoint, Method method, bool saveProgress);
     void RestartFromLastCheckpoint();

@@ -1,5 +1,6 @@
 #include "hooks.h"
 #include "gui.h"
+#include "font.h"
 #if !MEMENU_MINIMAL
 #include "core/module.h"
 #endif
@@ -21,6 +22,7 @@
 #define HOOKS_DIAG 1   // The diagnostics below need spdlog/fmt
 #endif
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -53,6 +55,19 @@ namespace
     HWND g_hwnd = nullptr;
     bool g_imguiReady = false;
     std::atomic<unsigned> g_endSceneCalls{0};   // hooks::EndSceneCalls(): proves the hook fires
+
+    // hooks::DrawWhileStalled(): the menu drawn over a copy of the last frame while the game thread stands still.
+    IDirect3DDevice9* g_device = nullptr;
+    std::mutex g_frameMutex;                    // one ImGui frame at a time (EndScene, or a stalled frame)
+    std::atomic<bool> g_capture{false};         // copy every frame into g_lastFrame
+    IDirect3DSurface9* g_lastFrame = nullptr;
+    unsigned g_stallSeen = 0;
+    // Set on the thread drawing a stalled frame. Overlays (Steam's, or whatever else hooks the device) draw inside
+    // Present with their own BeginScene/EndScene, which come back into HookedEndScene/HookedReset on this thread while
+    // g_frameMutex is held: re-locking it would throw. Those calls go straight to the originals instead.
+    thread_local bool t_stalledDraw = false;                   // EndScene count at the last DrawWhileStalled call
+    int g_stallQuiet = 0;
+    std::atomic<unsigned> g_stalledFrames{0};   // hooks::StalledFrames()                       // calls in a row without an EndScene in between
 
     std::mutex g_renderQueueMutex;              // hooks::RunOnRenderThread
     std::vector<std::function<void()>> g_renderQueue;
@@ -250,6 +265,11 @@ namespace
         }
         if (IsBlockedWhileMenuOpen(msg->message))
         {
+            // The game's TranslateMessage would turn this key press into WM_CHAR, which is what ImGui's text boxes
+            // type with; it only sees WM_NULL from here, so translate it now. The WM_CHAR is peeked next and goes to
+            // ImGui (and is hidden from the game) like any other message.
+            if (msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN)
+                TranslateMessage(msg);
             if (msg->message == WM_INPUT)
                 DefWindowProcW(msg->hwnd, msg->message, msg->wParam, msg->lParam);  // Frees the raw input buffer
             msg->message = WM_NULL;
@@ -293,6 +313,21 @@ namespace
         return CallWindowProcW(oWndProc, hwnd, msg, wp, lp);
     }
 
+    // The menu's font, built into the DLL (font.h). ImGui's own font if the build has none.
+    void LoadMenuFont()
+    {
+        if (font::MenuSize() == 0) return;
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;   // Static data in the DLL: ImGui must not free it
+        cfg.OversampleH = 2;
+        std::snprintf(cfg.Name, sizeof cfg.Name, "Roboto Medium");
+        ImGuiIO& io = ImGui::GetIO();
+        ImFont* f = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(font::MenuData()),
+                                                   static_cast<int>(font::MenuSize()), 15.f, &cfg);
+        if (f) io.FontDefault = f;
+        else HOOKS_LOG(warn, "The menu font could not be loaded: using ImGui's built-in font");
+    }
+
     void InitImGui(IDirect3DDevice9* dev)
     {
         D3DDEVICE_CREATION_PARAMETERS cp{};
@@ -312,6 +347,7 @@ namespace
         ImGui::CreateContext();
         static const std::string iniPath = (paths::Dir() / "MedgeMenu.ini").string();
         ImGui::GetIO().IniFilename = iniPath.c_str(); // Remembers window positions
+        LoadMenuFont();
         gui::ApplyStyle();
         if (!ImGui_ImplWin32_Init(g_hwnd)) HOOKS_LOG(error, "ImGui_ImplWin32_Init failed");
         if (!ImGui_ImplDX9_Init(dev)) HOOKS_LOG(error, "ImGui_ImplDX9_Init failed");
@@ -325,19 +361,41 @@ namespace
         HOOKS_LOG(info, "ImGui initialised (hwnd={})", static_cast<void*>(g_hwnd));
     }
 
-    HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
+    HRESULT CopySurface(IDirect3DDevice9* dev, IDirect3DSurface9* src, IDirect3DSurface9* dst)
     {
-        if (g_endSceneCalls.fetch_add(1, std::memory_order_relaxed) == 0)
-            HOOKS_LOG(info, "First EndScene call (device={}, thread {})", static_cast<void*>(dev), GetCurrentThreadId());
-        if (!g_imguiReady) InitImGui(dev);
-
-        // modules::Tick() runs on the game thread now (see game::OnTick in dllmain.cpp)
-
 #if MEMENU_GAME
-        debugrender::BeginFrame(dev);   // Matrices for this frame (labels use them too)
-        debugrender::Render(dev);       // Overlay path, when the in-scene pass did not draw
+        if (oStretchRect) return oStretchRect(dev, src, nullptr, dst, nullptr, D3DTEXF_NONE);   // not through our hook
 #endif
+        return dev->StretchRect(src, nullptr, dst, nullptr, D3DTEXF_NONE);
+    }
 
+    void ReleaseLastFrame()
+    {
+        if (g_lastFrame) g_lastFrame->Release();
+        g_lastFrame = nullptr;
+    }
+
+    // The game's frame, before the menu is drawn into it (hooks::CaptureFrames).
+    void CaptureFrame(IDirect3DDevice9* dev)
+    {
+        IDirect3DSurface9* back = nullptr;
+        if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) return;
+        D3DSURFACE_DESC want{}, have{};
+        back->GetDesc(&want);
+        if (g_lastFrame) g_lastFrame->GetDesc(&have);
+        if (!g_lastFrame || have.Width != want.Width || have.Height != want.Height || have.Format != want.Format)
+        {
+            ReleaseLastFrame();
+            dev->CreateRenderTarget(want.Width, want.Height, want.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_lastFrame,
+                                    nullptr);
+        }
+        if (g_lastFrame && FAILED(CopySurface(dev, back, g_lastFrame))) ReleaseLastFrame();
+        back->Release();
+    }
+
+    // One ImGui frame: the menu and every module's overlay, drawn into the current render target.
+    void DrawMenu()
+    {
         ImGui_ImplDX9_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -350,6 +408,27 @@ namespace
         ImGui::EndFrame();
         ImGui::Render();
         ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    }
+
+    HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
+    {
+        if (t_stalledDraw) return oEndScene(dev);   // an overlay inside our own stalled frame's Present
+        if (g_endSceneCalls.fetch_add(1, std::memory_order_relaxed) == 0)
+            HOOKS_LOG(info, "First EndScene call (device={}, thread {})", static_cast<void*>(dev), GetCurrentThreadId());
+        std::lock_guard lock(g_frameMutex);
+        if (!g_imguiReady) InitImGui(dev);
+        g_device = dev;
+
+        // modules::Tick() runs on the game thread now (see game::OnTick in dllmain.cpp)
+
+        if (g_capture.load(std::memory_order_relaxed)) CaptureFrame(dev);
+        else if (g_lastFrame) ReleaseLastFrame();
+
+#if MEMENU_GAME
+        debugrender::BeginFrame(dev);   // Matrices for this frame (labels use them too)
+        debugrender::Render(dev);       // Overlay path, when the in-scene pass did not draw
+#endif
+        DrawMenu();
 #if MEMENU_GAME
         debugrender::EndFrame();
 #endif
@@ -363,6 +442,15 @@ namespace
         debugrender::OnLostDevice();
 #endif
         if (g_imguiReady) ImGui_ImplDX9_InvalidateDeviceObjects();
+        if (t_stalledDraw)
+        {
+            ReleaseLastFrame();     // this thread holds g_frameMutex already (DrawWhileStalled)
+        }
+        else
+        {
+            std::lock_guard lock(g_frameMutex);
+            ReleaseLastFrame();     // D3DPOOL_DEFAULT: must be gone before Reset
+        }
         HRESULT hr = oReset(dev, pp);
 #if HOOKS_DIAG
         if (pp)
@@ -526,6 +614,53 @@ bool hooks::Install()
 
 unsigned hooks::EndSceneCalls() { return g_endSceneCalls.load(std::memory_order_relaxed); }
 
+void hooks::CaptureFrames(bool on) { g_capture = on; }
+
+bool hooks::DrawWhileStalled()
+{
+    // Only once the renderer has been quiet for a few calls (about 50 ms): it has finished the frames it had queued, so
+    // the device is ours. The device isn't made for two threads at once.
+    const unsigned calls = g_endSceneCalls.load(std::memory_order_relaxed);
+    if (calls != g_stallSeen)
+    {
+        g_stallSeen = calls;
+        g_stallQuiet = 0;
+        return false;
+    }
+    if (++g_stallQuiet < 3) return false;
+
+    std::lock_guard lock(g_frameMutex);
+    struct Mark {
+        Mark() { t_stalledDraw = true; }
+        ~Mark() { t_stalledDraw = false; }
+    } mark;
+    IDirect3DDevice9* dev = g_device;
+    if (!g_imguiReady || !dev || dev->TestCooperativeLevel() != D3D_OK) return false;
+
+    IDirect3DSurface9* back = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) return false;
+    IDirect3DSurface9* oldTarget = nullptr;
+    dev->GetRenderTarget(0, &oldTarget);
+    dev->SetRenderTarget(0, back);
+    if (!g_lastFrame || FAILED(CopySurface(dev, g_lastFrame, back)))
+        dev->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.f, 0);
+
+    bool drawn = false;
+    if (SUCCEEDED(dev->BeginScene()))
+    {
+        DrawMenu();
+        oEndScene(dev);     // the original: this isn't a game frame
+        drawn = SUCCEEDED(dev->Present(nullptr, nullptr, nullptr, nullptr));
+        if (drawn) g_stalledFrames.fetch_add(1, std::memory_order_relaxed);
+    }
+    dev->SetRenderTarget(0, oldTarget ? oldTarget : back);
+    if (oldTarget) oldTarget->Release();
+    back->Release();
+    return drawn;
+}
+
+unsigned hooks::StalledFrames() { return g_stalledFrames.load(std::memory_order_relaxed); }
+
 void hooks::RunOnRenderThread(std::function<void()> fn)
 {
     std::lock_guard lock(g_renderQueueMutex);
@@ -543,6 +678,11 @@ void hooks::Uninstall()
 #if MEMENU_GAME
     debugrender::Shutdown();
 #endif
+    {
+        std::lock_guard lock(g_frameMutex);
+        ReleaseLastFrame();
+        g_device = nullptr;
+    }
     if (g_imguiReady)
     {
         SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(oWndProc));

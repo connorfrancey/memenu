@@ -60,17 +60,30 @@ namespace
         const float w = ImGui::GetContentRegionAvail().x;
         const float h = tc.rowHeight;
 
-        ImGui::InvisibleButton("##row", {w, h});
-        const bool hovered = ImGui::IsItemHovered();
+        // The title opens the settings (right click closes them); the switch on the right turns the module on and off,
+        // or runs it for an action.
+        const float switchW = m.IsAction() ? 36.f : 30.f, switchH = 16.f;
+        const float titleW = w - switchW - 16.f;
+
+        ImGui::InvisibleButton("##title", {titleW, h}, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+        bool hovered = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) m.expanded = true;
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) m.expanded = false;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s%sClick: settings | Right click: close", m.Description().c_str(),
+                              m.Description().empty() ? "" : "\n");
+
+        ImGui::SameLine(0.f, 0.f);
+        ImGui::InvisibleButton("##switch", {w - titleW, h});
+        const bool switchHovered = ImGui::IsItemHovered();
+        hovered |= switchHovered;
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
         {
             m.Toggle();
             if (m.IsAction()) m.anim = 1.f; // flash on click
         }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) m.expanded = !m.expanded;
-        if (!m.Description().empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s\nLeft click: %s | Right click: settings",
-                              m.Description().c_str(), m.IsAction() ? "run" : "toggle");
+        if (switchHovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip(m.IsAction() ? "Run" : m.Enabled() ? "Turn off" : "Turn on");
 
         Approach(m.anim, (!m.IsAction() && m.Enabled()) ? 1.f : 0.f, dt);
         Approach(m.hover, hovered ? 1.f : 0.f, dt);
@@ -83,7 +96,24 @@ namespace
         const ImVec4 txt = Mix(tc.text, tc.textActive, std::max(m.anim, m.hover * 0.6f));
         const float ty = p.y + (h - ImGui::GetFontSize()) * 0.5f;
         dl->AddText({p.x + 10.f, ty}, U32(txt), m.Name().c_str());
-        dl->AddText({p.x + w - 16.f, ty}, U32(tc.textDim), m.expanded ? "-" : "+");
+
+        // Switch: a pill whose knob slides right (accent) when on. Actions get a small "Run" pill instead.
+        const ImVec2 s0{p.x + w - switchW - 8.f, p.y + (h - switchH) * 0.5f};
+        const ImVec2 s1{s0.x + switchW, s0.y + switchH};
+        const float r = switchH * 0.5f;
+        const ImVec4 hoverTint = Mix(tc.textDim, tc.text, switchHovered ? 0.5f : 0.f);
+        if (m.IsAction())
+        {
+            dl->AddRectFilled(s0, s1, U32(Mix(Mix(tc.rowBg, hoverTint, 0.35f), tc.accent, m.anim)), r);
+            const ImVec2 ts = ImGui::CalcTextSize("Run");
+            dl->AddText({s0.x + (switchW - ts.x) * 0.5f, s0.y + (switchH - ts.y) * 0.5f}, U32(tc.text), "Run");
+        }
+        else
+        {
+            dl->AddRectFilled(s0, s1, U32(Mix(Mix(tc.rowBg, hoverTint, 0.45f), tc.accent, m.anim)), r);
+            const float kx = s0.x + r + (switchW - 2.f * r) * m.anim;
+            dl->AddCircleFilled({kx, s0.y + r}, r - 2.5f, U32(Mix(tc.textDim, tc.textActive, m.anim)));
+        }
 
         if (m.expanded) DrawSettings(m, w);
         ImGui::PopID();

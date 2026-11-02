@@ -38,6 +38,7 @@ InputFilter g_inputFilter = nullptr;
 
 // Virtual clock (game thread)
 std::atomic<bool> g_virtual{false};   // read by every thread that asks for the time
+std::atomic<bool> g_suspended{false}; // SuspendVirtualClock
 long long g_virtualTicks = 0;         // counter value at the start of this frame
 long long g_frameTicks = 0;           // length of this frame in ticks
 long long g_calls = 0;                // QueryPerformanceCounter calls this frame
@@ -69,7 +70,8 @@ srand_t g_srand = nullptr;
 
 bool OnGameThreadVirtual()
 {
-    return g_virtual.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_gameThread.load(std::memory_order_relaxed);
+    return g_virtual.load(std::memory_order_relaxed) && !g_suspended.load(std::memory_order_relaxed) &&
+           GetCurrentThreadId() == g_gameThread.load(std::memory_order_relaxed);
 }
 
 // ---- hooks ------------------------------------------------------------------------------------------------------------
@@ -318,6 +320,8 @@ double RealSeconds()
     (oQPF ? oQPF : &QueryPerformanceFrequency)(&f);
     return static_cast<double>(t.QuadPart) / static_cast<double>(f.QuadPart ? f.QuadPart : 1);
 }
+
+void SuspendVirtualClock(bool suspend) { g_suspended = suspend; }
 
 void SetInputFilter(InputFilter filter) { g_inputFilter = filter; }
 

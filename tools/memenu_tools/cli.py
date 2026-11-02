@@ -5,7 +5,7 @@
     uv run memenu                       interactive menu (everything below, picked from a list)
     uv run memenu build                 debug build of medge_menu.dll (configures first if needed)
     uv run memenu build -c release      release build
-    uv run memenu build --with tests    also build an optional part (tests, installer, launcher)
+    uv run memenu build --with tests    also build an optional part (tests, benchmarks, installer, launcher)
     uv run memenu build --disable all   menu GUI only, no features (see `memenu features`)
     uv run memenu build --only levels   only the Levels features (also: --enable / --disable NAME)
     uv run memenu features              list the features and which ones the build folder builds
@@ -13,6 +13,7 @@
     uv run memenu minimal               only the D3D9 hook + ImGui demo window (INSERT), nothing else
     uv run memenu errors                build everything, list every error grouped by file
     uv run memenu test                  build and run the unit tests
+    uv run memenu bench                 build (release) and run the benchmarks
     uv run memenu install-game          build, then install into the game (UAC prompt)
     uv run memenu package               release installer -> dist/
     uv run memenu verbose-build         build stage by stage, test each one without the game, report failures
@@ -47,6 +48,23 @@ from .toolchain import ROOT, Toolchain, ToolchainError, cmake_version, find_tool
 
 console = Console(highlight=False)
 FILES_ZIP = "memenu-files.zip"   # The DLLs unpacked, for install.sh (see `package`)
+DIST_FILES = Path(__file__).parent / "dist"     # README.txt and license texts for the release zip
+
+# Everything compiled into the menu that isn't ours, for THIRD-PARTY-NOTICES.txt in the release zip:
+# (name, what it's for, where it's from, CMake package name, license files in its sources, the first that exists wins)
+THIRD_PARTY = [
+    ("Dear ImGui", "the menu's user interface", "https://github.com/ocornut/imgui", "imgui", ["LICENSE.txt"]),
+    ("MinHook", "hooking the game's functions", "https://github.com/TsudaKageyu/minhook", "minhook", ["LICENSE.txt"]),
+    ("spdlog", "the log", "https://github.com/gabime/spdlog", "spdlog", ["LICENSE"]),
+    ("{fmt} (bundled with spdlog)", "text formatting", "https://github.com/fmtlib/fmt", "spdlog",
+     ["include/spdlog/fmt/bundled/fmt.license.rst", "include/spdlog/fmt/bundled/LICENSE.rst"]),
+    ("Zstandard", "compressing old logs", "https://github.com/facebook/zstd", "zstd", ["LICENSE"]),
+    ("JSON for Modern C++", "settings, themes and macro files", "https://github.com/nlohmann/json", "nlohmann_json",
+     ["LICENSE.MIT", "LICENSE"]),
+    ("imjson", "themes", "https://github.com/moleium/imjson", "imjson", ["LICENSE.md", "LICENSE"]),
+    ("imgui-filebrowser", "the file browser", "https://github.com/AirGuanZ/imgui-filebrowser", "imgui_filebrowser",
+     ["LICENSE", "LICENSE.txt"]),
+]
 
 config_option = click.option(
     "-c", "--config", type=click.Choice(sorted(b.CONFIGS)), default="debug", show_default=True,
@@ -656,6 +674,37 @@ def test(ctx: click.Context, config: str, no_build: bool, name_filter: str | Non
     ctx.exit(code and 1)
 
 
+@cli.command("bench")
+@click.option("-c", "--config", type=click.Choice(sorted(b.CONFIGS)), default="release", show_default=True,
+              help="Build configuration (debug timings say little about the real thing).")
+@click.option("--no-build", is_flag=True, help="Run the benchmarks as they were last built.")
+@click.option("--list", "list_groups", is_flag=True, help="List the benchmark groups, then exit.")
+@click.option("--csv", is_flag=True, help="Print the results as CSV instead of tables.")
+@click.argument("groups", nargs=-1)
+@verbose_option
+@click.pass_context
+def bench(ctx: click.Context, config: str, no_build: bool, list_groups: bool, csv: bool, groups: tuple[str, ...],
+          verbose: bool) -> None:
+    """Build and run the benchmarks (nanobench): replays, macros, math, meshes.
+
+    GROUPS limits the run to the groups whose name contains one of them (case-insensitive), e.g. `memenu bench replay`.
+    """
+    if not no_build:
+        _enable_parts(ctx, config, ["benchmarks"], verbose)
+        if _build(ctx, config, ("memenu_bench",), verbose=verbose).returncode != 0:
+            ctx.exit(1)
+    exe = _artifact(config, "memenu_bench.exe")
+    if not exe.exists():
+        console.print(f"[red]{exe} not found[/]: build it first (without --no-build).")
+        ctx.exit(1)
+    if config == "debug":
+        console.print("[yellow]Debug build: the timings are far slower than a release build's.[/]")
+    args = [str(exe), *(["--list"] if list_groups else []), *(["--csv"] if csv else []), *groups]
+    console.rule("Benchmarks")
+    code = subprocess.run(args, cwd=ROOT).returncode
+    ctx.exit(code and 1)
+
+
 def _remove_build_dir(config: str) -> None:
     folder = b.build_dir(config)
     if folder.exists():
@@ -981,10 +1030,10 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
 @click.option("--no-build", is_flag=True, help="Package what was built last.")
 @click.pass_context
 def package(ctx: click.Context, no_build: bool) -> None:
-    """Build the release installer and copy it to dist/ (the one file players need)."""
+    """Build the release installer and copy it to dist/, with the zip to hand out (installer, launcher, readme, licenses)."""
     if not no_build:
-        _enable_parts(ctx, "release", ["installer"])
-        if _build(ctx, "release", ("memenu_installer",)).returncode != 0:
+        _enable_parts(ctx, "release", ["installer", "launcher"])
+        if _build(ctx, "release", ("memenu_installer", "medge_launcher")).returncode != 0:
             ctx.exit(1)
     src = _artifact("release", INSTALLER)
     if not src.exists():
@@ -1013,12 +1062,80 @@ def package(ctx: click.Context, no_build: bool) -> None:
         z.write(menu, "memenu/medge_menu.dll")
     files_digest = hashlib.sha256(files.read_bytes()).hexdigest()
 
+    # The zip to hand out: everything in one folder, the installer first.
+    launcher = _artifact("release", LAUNCHER)
+    if not launcher.exists():
+        console.print(f"[red]{launcher.relative_to(ROOT)} is missing.[/] Run without --no-build.")
+        ctx.exit(1)
+    try:
+        notices = _third_party_notices("release")
+    except FileNotFoundError as e:
+        console.print(f"[red]Can't write the license notices:[/] {e}")
+        ctx.exit(1)
+    bundle = dist / f"MirrorsEdgeMenu-{project_version()}.zip"
+    top = f"MirrorsEdgeMenu-{project_version()}"
+    readme = (DIST_FILES / "README.txt").read_text(encoding="utf-8").replace("{version}", project_version())
+    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        z.write(src, f"{top}/{INSTALLER}")
+        z.writestr(f"{top}/README.txt", _crlf(readme))
+        z.writestr(f"{top}/LICENSE.txt", _crlf((ROOT / "LICENSE").read_text(encoding="utf-8")))
+        z.writestr(f"{top}/THIRD-PARTY-NOTICES.txt", _crlf(notices))
+        z.write(launcher, f"{top}/try-without-installing/{LAUNCHER}")
+        z.write(menu, f"{top}/try-without-installing/medge_menu.dll")
+    bundle_digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+
     (dist / "SHA256SUMS.txt").write_text(f"{digest}  {versioned.name}\n{digest}  {fixed.name}\n"
-                                         f"{files_digest}  {files.name}\n", encoding="ascii")
-    console.print(Panel.fit(f"[bold]{versioned.relative_to(ROOT)}[/] (and {fixed.relative_to(ROOT)})\n"
+                                         f"{files_digest}  {files.name}\n{bundle_digest}  {bundle.name}\n",
+                                         encoding="ascii")
+    console.print(Panel.fit(f"[bold]{bundle.relative_to(ROOT)}[/] {bundle.stat().st_size / 1e6:.1f} MB: the zip to hand "
+                            f"out\nsha256 {bundle_digest}\n\n"
+                            f"[bold]{versioned.relative_to(ROOT)}[/] (and {fixed.relative_to(ROOT)})\n"
                             f"{versioned.stat().st_size / 1e6:.1f} MB\nsha256 {digest}\n"
                             f"[bold]{files.relative_to(ROOT)}[/] (for install.sh) {files.stat().st_size / 1e6:.1f} MB",
                             title="Packaged", border_style="green"))
+
+
+def _crlf(text: str) -> str:
+    """Windows line endings: the zip's text files get opened in Notepad."""
+    return text.replace("\r\n", "\n").replace("\n", "\r\n")
+
+
+def _source_dirs(config: str) -> dict[str, Path]:
+    """Where CMake fetched each dependency (from the build folder's CMakeCache.txt)."""
+    out: dict[str, Path] = {}
+    cache = b.build_dir(config) / "CMakeCache.txt"
+    for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"(?:CPM_PACKAGE_)?(\w+?)_SOURCE_DIR:\w+=(.+)", line)
+        if m:
+            out.setdefault(m.group(1).lower(), Path(m.group(2)))
+    return out
+
+
+def _third_party_notices(config: str) -> str:
+    """THIRD-PARTY-NOTICES.txt: the license of everything compiled into the menu, from the sources it was built from."""
+    dirs = _source_dirs(config)
+    parts = [f"Mirror's Edge Menu {project_version()} includes the following third-party software. Each is used under "
+             "the license below.\n"]
+
+    def section(title: str, what: str, url: str, text: str) -> None:
+        parts.append("=" * 100 + f"\n{title}: {what}\n{url}\n" + "=" * 100 + "\n\n" + text.replace("﻿", "").strip() + "\n")   # no BOMs
+
+    for name, what, url, package, files in THIRD_PARTY:
+        src = dirs.get(package.lower())
+        if src is None:
+            raise FileNotFoundError(f"{package} isn't in {b.build_dir(config).name}/CMakeCache.txt (build it first)")
+        found = next((src / f for f in files if (src / f).is_file()), None)
+        if found is None:
+            raise FileNotFoundError(f"no license file for {name} in {src} (looked for {', '.join(files)})")
+        section(name, what, url, found.read_text(encoding="utf-8", errors="replace"))
+
+    # The menu's font comes with Dear ImGui's sources; its license text isn't there, so it ships with these tools.
+    section("Roboto Medium", "the menu's font, by Christian Robertson for Google", "https://fonts.google.com/specimen/Roboto",
+            "Licensed under the Apache License, Version 2.0:\n\n" +
+            (DIST_FILES / "Apache-2.0.txt").read_text(encoding="utf-8"))
+    section("Mirror's Edge SDK", "game class layouts (generated headers)", "https://github.com/connorfrancey/mmultiplayer",
+            "Generated from the game by the mmultiplayer project. Its repository has no license file.")
+    return "\n".join(parts)
 
 
 from . import devmode as _devmode   # noqa: E402 - registers `memenu dev ...` on the group above

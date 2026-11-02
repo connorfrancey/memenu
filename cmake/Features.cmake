@@ -151,8 +151,10 @@ memenu_feature(save_state        trainer GAME STAGE 9  FILES features/trainer/sa
 memenu_feature(speedometer       trainer GAME STAGE 7  FILES features/trainer/speedometer.cpp)
 memenu_feature(tool_overlay      trainer      STAGE 5  FILES features/trainer/tool_overlay.cpp)
 
-# TAS / replay: temporarily off by default
-memenu_feature(tas               tas GAME OFF STAGE 12 FILES features/tas/tas_module.cpp tas/engine.cpp tas/replay.cpp tas/tas.cpp)
+# TAS / replay
+memenu_feature(tas               tas GAME STAGE 12 FILES features/tas/tas_module.cpp features/tas/timeline_view.cpp features/tas/replay_editor.cpp
+                  tas/engine.cpp tas/replay.cpp tas/tas.cpp
+                  tas/timeline.cpp)
 
 # World
 memenu_feature(game_speed        world GAME STAGE 9 FILES features/world/game_speed.cpp)

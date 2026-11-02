@@ -21,7 +21,7 @@ from . import features as feat
 from . import devmode
 from .game import project_version
 
-PARTS = sorted(b.OPTIONS)   # installer, launcher, testhost, tests
+PARTS = sorted(b.OPTIONS)   # benchmarks, installer, launcher, testhost, tests
 BACK = "__back__"
 
 STYLE = questionary.Style([
@@ -149,6 +149,7 @@ class Menu:
                 ("staged", "Staged build", self._stage_line(), self.staged),
                 None,
                 ("test", "Run tests", "GoogleTest unit tests", lambda: self.run("test", "-c", self.config)),
+                ("bench", "Run benchmarks", "nanobench: replays, macros, math, meshes (release build)", self.bench),
                 ("install", "Install into the game", "builds the installer, asks for admin rights", self.install),
                 ("devtest", "Dev test", "build, start the game with the menu, report crashes when you quit",
                  lambda: self.run("dev-test", "-c", self.config)),
@@ -196,6 +197,10 @@ class Menu:
 
     def build(self) -> None:
         self.run("build", "-c", self.config)
+
+    def bench(self) -> None:
+        # Always release, whatever configuration the menu is on: debug timings mostly measure the debug runtime.
+        self.run("bench", "-c", "release")
 
     def install(self) -> None:
         self.run("install-game", "-c", self.config)
@@ -256,7 +261,8 @@ class Menu:
         about = {"installer": "dinput8.dll loader + memenu_installer.exe",
                  "launcher": "medge_launcher.exe (injects without installing)",
                  "testhost": "memenu_testhost.exe (tests the DLL without the game)",
-                 "tests": "GoogleTest unit tests"}
+                 "tests": "GoogleTest unit tests",
+                 "benchmarks": "memenu_bench.exe (nanobench benchmarks)"}
         picked = checkbox(f"Optional parts ({self.config})",
                           [Choice(title=f"{p:<10} {about.get(p, '')}", value=p, checked=current[p]) for p in PARTS])
         if picked is None:

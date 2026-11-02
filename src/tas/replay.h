@@ -62,6 +62,24 @@ struct Sync {
 };
 static_assert(sizeof(Sync) == 28);
 
+// How the camera goes from one key to the next.
+enum class Ease : std::uint8_t {
+    Linear = 0,
+    Smooth = 1,         // eases in and out (smoothstep)
+    Hold = 2,           // stays at this key until the next one
+};
+
+// The look direction on a frame. From the first key to the last the TAS sets the camera itself, in between the keys
+// interpolated, and ignores the recorded mouse / right stick there. Outside that range recorded input works as normal.
+struct CameraKey {
+    std::uint32_t frame = 0;
+    float yaw = 0.f;                 // degrees, not wrapped (370 = a full turn plus 10): the way it turns is explicit
+    float pitch = 0.f;               // degrees, up is positive
+    Ease ease = Ease::Smooth;        // towards the next key
+    std::uint8_t reserved[3]{};
+};
+static_assert(sizeof(CameraKey) == 16);
+
 struct Replay {
     // ---- how it starts and runs ---------------------------------------------------------------------------------------
     StartKind start = StartKind::Now;
@@ -83,6 +101,7 @@ struct Replay {
     std::vector<Frame> frames;
     std::vector<Event> events;
     std::vector<Sync> sync;          // one per frame, or empty
+    std::vector<CameraKey> camera;   // sorted by frame, one per frame at most (see tas/timeline.h)
     std::uint32_t syncValidUntil = 0;   // frames >= this were edited after recording: their sync is not checked
 
     void Clear();
@@ -124,6 +143,7 @@ struct Replay {
 
 const char* KindName(EventKind kind);
 const char* StartName(StartKind kind);
+const char* EaseName(Ease ease);
 std::string Describe(const Replay& r, const Event& e);    // "W down", "MouseX +3.250"
 
 } // namespace tas

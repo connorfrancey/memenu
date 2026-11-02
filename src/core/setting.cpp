@@ -325,6 +325,14 @@ void Separator::Draw(float)
     else                ImGui::SeparatorText(Name().c_str());
 }
 
+Section::Section(Module* owner, std::string title, bool open) : Value(owner, std::move(title), open, {}) {}
+
+void Section::Draw(float)
+{
+    ImGui::SetNextItemOpen(value_, ImGuiCond_Always);
+    value_ = ImGui::CollapsingHeader(Name().c_str());
+}
+
 Custom::Custom(Module* owner, std::function<void(float)> draw) : Setting(owner, {}), draw_(std::move(draw)) {}
 
 void Custom::Draw(float width)

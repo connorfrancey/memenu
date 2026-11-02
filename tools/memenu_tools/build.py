@@ -77,6 +77,7 @@ OPTIONS = {
     "installer": "MEMENU_BUILD_INSTALLER",
     "launcher": "MEMENU_BUILD_LAUNCHER",
     "testhost": "MEMENU_BUILD_TESTHOST",
+    "benchmarks": "MEMENU_BUILD_BENCHMARKS",
 }
 
 

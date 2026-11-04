@@ -27,6 +27,7 @@ namespace install
         constexpr const wchar_t* kMenuDll = L"medge_menu.dll";
         constexpr char kMarker[] = "memenu-loader:";
         constexpr const wchar_t* kUninstaller = L"uninstall.exe";
+        bool g_registerApp = true;      // SetAppRegistration
         constexpr const wchar_t* kAppKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MirrorsEdgeMenu";
 
         std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
@@ -102,8 +103,8 @@ namespace install
             std::error_code ec;
             if (!fs::is_directory(menuDir, ec)) return false;
             for (const auto& e : fs::directory_iterator(menuDir, ec)) {
-                const wchar_t* name = e.path().filename().c_str();
-                if (_wcsicmp(name, kMenuDll) != 0 && _wcsicmp(name, kUninstaller) != 0) return true;
+                const std::wstring name = e.path().filename().wstring();   // Kept: filename() is a temporary
+                if (_wcsicmp(name.c_str(), kMenuDll) != 0 && _wcsicmp(name.c_str(), kUninstaller) != 0) return true;
             }
             return false;
         }
@@ -204,6 +205,8 @@ namespace install
 
     const char* Version() { return MEMENU_VERSION; }
 
+    void SetAppRegistration(bool on) { g_registerApp = on; }
+
     std::optional<fs::path> NormalizeGameDir(const fs::path& picked)
     {
         std::error_code ec;
@@ -270,7 +273,7 @@ namespace install
         }
         // Listed in Windows' installed apps. Not being able to is no reason to undo the install: say so instead.
         std::wstring appNote;
-        if (!RegisterApp(gameDir, error))
+        if (g_registerApp && !RegisterApp(gameDir, error))
             appNote = L"\n\n(" + error + L". Uninstall by running this installer again.)";
 
         message = std::wstring(s.installed ? L"Updated" : L"Installed") + L" Mirror's Edge Menu " + Widen(Version()) +
@@ -323,7 +326,7 @@ namespace install
             remove(menuDir / kMenuDll);
             if (!runningFromThere) remove(uninstaller);
         }
-        UnregisterApp();
+        if (g_registerApp) UnregisterApp();
         if (runningFromThere) DeleteAfterExit(uninstaller, menuDir);   // this exe: once it has exited
         else if (removeSettings) fs::remove(menuDir, ec);
         if (!failed.empty()) {

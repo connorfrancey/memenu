@@ -1,22 +1,22 @@
+// The TAS / Macro module: the menu side of tas/tas.h. The panel shows what the session is doing and the buttons that
+// make sense right now; the macro's files are tasui::MacroLibrary, the timeline and the frame editor have their own
+// windows (timeline_view, replay_editor).
+#include "core/keys.h"
 #include "core/module.h"
 #include "core/notify.h"
 #include "game/levels.h"
 #include "gui.h"
+#include "features/tas/macro_library.h"
 #include "features/tas/replay_editor.h"
 #include "features/tas/timeline_view.h"
 #include "tas/tas.h"
 
 #include <Windows.h>
 #include <imgui.h>
-#include <imfilebrowser.h>
 
 #include <algorithm>
-#include <cctype>
+#include <cmath>
 #include <cstdio>
-#include <cstring>
-#include <ctime>
-#include <filesystem>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,20 +32,10 @@ std::string FormatTime(double seconds)
 
 const float kRates[] = {0.f, 30.f, 50.f, 60.f, 62.f, 100.f, 120.f, 144.f, 240.f};
 
-bool IsMacroFile(const std::filesystem::path& path)
-{
-    const auto ext = path.extension();
-    return ext == tas::kFileExtension || ext == ".json";
-}
-
-bool ContainsNoCase(const std::string& text, const std::string& part)
-{
-    if (part.empty()) return true;
-    auto it = std::search(text.begin(), text.end(), part.begin(), part.end(),
-                          [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) ==
-                                                      std::tolower(static_cast<unsigned char>(b)); });
-    return it != text.end();
-}
+// Playback / recording speeds one click away (0 = as fast as possible)
+const struct { const char* label; float speed; } kSpeeds[] = {
+    {"1/4", 0.25f}, {"1/2", 0.5f}, {"1x", 1.f}, {"2x", 2.f}, {"4x", 4.f}, {"Max", 0.f},
+};
 
 class Tas final : public Module {
 public:
@@ -65,23 +55,46 @@ public:
         rewindSeconds.VisibleIf([this] { return recordSection && start.Get() != 0; });
 
         in(playSection, {&maxSpeed, &atEnd, &gotoFrame});
+        speed.VisibleIf([this] { return playSection && !maxSpeed.Get(); });
+        in(bookmarkSection, {&bookmarks});
         in(desyncSection, {&desyncChecks, &onDesync, &matchRecording});
         correctMax.VisibleIf([this] { return desyncSection && onDesync.Get() == 1; });
-        speed.VisibleIf([this] { return playSection && !maxSpeed.Get(); });
-
         in(filesSection, {&files});
-        in(keysSection, {&pauseKey, &advanceKey, &restartKey, &rewindKey, &takeOverKey, &stopKey});
-        in(moreSection, {&blockStreaming, &seekNoRender, &showOverlay, &showInputDisplay, &showTimeline, &showEditor, &details, &translator});
+        in(keysSection, {&recordKey, &playKey, &pauseKey, &advanceKey, &restartKey, &rewindKey, &takeOverKey, &stopKey,
+                         &bookmarkKey});
+        in(moreSection, {&blockStreaming, &seekNoRender, &showOverlay, &showInputDisplay, &showTimeline, &showEditor,
+                         &details, &translator});
     }
 
     void OnDisable() override
     {
         tas::Stop();
-        if (openBrowser_) openBrowser_->Close();
-        if (saveBrowser_) saveBrowser_->Close();
+        modules::SetReservedKeys({});
     }
 
     void OnRender() override
+    {
+        tas::SetOptions(Options());
+        status_ = tas::GetStatus();
+        ReserveKeys();
+
+        if (showOverlay) DrawOverlay();
+        if (showEditor) {
+            bool open = true;
+            editor_.Draw(open, status_, {keys::Name(pauseKey), keys::Name(advanceKey)});
+            if (!open) showEditor.Set(false);
+        }
+        if (showInputDisplay) tasui::ReplayEditor::DrawInputDisplay(status_);
+        if (showTimeline) {
+            bool open = true;
+            timeline_.Draw(open, status_);
+            if (!open) showTimeline.Set(false);
+        }
+        if (gui::visible) library_.DrawPopups();
+    }
+
+private:
+    tas::Options Options() const
     {
         tas::Options o;
         o.recordHz = kRates[std::clamp(rate.Get(), 0, static_cast<int>(std::size(kRates)) - 1)];
@@ -94,34 +107,68 @@ public:
         o.blockStreaming = blockStreaming;
         o.seekWithoutRendering = seekNoRender;
         o.atEnd = static_cast<tas::AtEnd>(atEnd.Get());
+        o.onDeath = static_cast<tas::OnDeath>(onDeath.Get());
+        o.rewindSeconds = rewindSeconds;
         o.keyPause = pauseKey;
         o.keyAdvance = advanceKey;
         o.keyTakeOver = takeOverKey;
         o.keyStop = stopKey;
         o.keyRewind = rewindKey;
         o.keyRestart = restartKey;
-        o.onDeath = static_cast<tas::OnDeath>(onDeath.Get());
-        o.rewindSeconds = rewindSeconds;
-        tas::SetOptions(o);
-
-        status_ = tas::GetStatus();
-        if (showOverlay) DrawOverlay();
-        if (showEditor) {
-            bool open = true;
-            editor_.Draw(open, status_, {KeyLabel(pauseKey), KeyLabel(advanceKey)});
-            if (!open) showEditor.Set(false);
-        }
-        if (showInputDisplay) tasui::ReplayEditor::DrawInputDisplay(status_);
-        if (showTimeline) {
-            bool open = true;
-            timeline_.Draw(open, status_);
-            if (!open) showTimeline.Set(false);
-        }
-        if (gui::visible) DrawBrowsers();
+        o.keyRecord = recordKey;
+        o.keyPlay = playKey;
+        o.keyBookmark = bookmarkKey;
+        const RecordStart rs = Start();
+        o.recordStart = rs.kind;
+        o.recordCommand = rs.command;
+        o.recordMap = rs.map;
+        o.recordCheckpoint = rs.checkpoint;
+        return o;
     }
 
-private:
-    // ---- panel ----------------------------------------------------------------------------------------------------------
+    // While a session runs its keys belong to it: a module bound to the same key (No Clip's F5) must not switch too.
+    // Idle, only Record and Play are taken (they start a session when the menu is closed).
+    void ReserveKeys()
+    {
+        std::vector<int> keys;
+        if (status_.mode == tas::Mode::Idle) keys = {recordKey, playKey};
+        else keys = {pauseKey, advanceKey, restartKey, rewindKey, takeOverKey, stopKey, bookmarkKey, recordKey, playKey};
+        keys.erase(std::remove(keys.begin(), keys.end(), 0), keys.end());
+        if (keys != reserved_) {
+            reserved_ = keys;
+            modules::SetReservedKeys(keys);
+        }
+    }
+
+    // ---- where a recording starts ------------------------------------------------------------------------------------
+    struct RecordStart {
+        tas::StartKind kind = tas::StartKind::Now;
+        std::string command, map, checkpoint;
+        bool ok = true;
+    };
+
+    RecordStart Start() const
+    {
+        RecordStart rs;
+        rs.kind = static_cast<tas::StartKind>(start.Get());
+        rs.command = commandBuf_;
+        if (rs.kind == tas::StartKind::Checkpoint) {
+            const auto maps = levels::Maps();
+            if (map_ < 0 || map_ >= static_cast<int>(maps.size())) { rs.ok = false; return rs; }
+            rs.map = maps[map_].label;
+            if (checkpoint_ > 0 && checkpoint_ <= static_cast<int>(maps[map_].checkpoints.size()))
+                rs.checkpoint = maps[map_].checkpoints[checkpoint_ - 1];
+        }
+        return rs;
+    }
+
+    void StartRecording()
+    {
+        const RecordStart rs = Start();
+        if (!rs.ok) { notify::Push("TAS: pick a level"); return; }
+        library_.Guard("Recording", [rs] { tas::Record(rs.kind, rs.command, rs.map, rs.checkpoint); });
+    }
+
     void DrawCommand(float width)
     {
         ImGui::SetNextItemWidth(width);
@@ -150,19 +197,7 @@ private:
         }
     }
 
-    void StartRecording()
-    {
-        std::string mapLabel, cpLabel;
-        if (start.Get() == 2) {
-            const auto maps = levels::Maps();
-            if (map_ < 0 || map_ >= static_cast<int>(maps.size())) { notify::Push("TAS: pick a level"); return; }
-            mapLabel = maps[map_].label;
-            if (checkpoint_ > 0 && checkpoint_ <= static_cast<int>(maps[map_].checkpoints.size()))
-                cpLabel = maps[map_].checkpoints[checkpoint_ - 1];
-        }
-        tas::Record(static_cast<tas::StartKind>(start.Get()), commandBuf_, mapLabel, cpLabel);
-    }
-
+    // ---- the top of the panel ------------------------------------------------------------------------------------------
     // A row of buttons that work like radio buttons: the one that matches the state is drawn pressed.
     static bool ModeButton(const char* label, bool on, float width, ImU32 onColor)
     {
@@ -175,8 +210,8 @@ private:
         return clicked && !on;
     }
 
-    // Like Mega Hack's replay bot: one switch for the mode (Off / Record / Play), what's happening, the buttons that
-    // make sense right now, and the macro's name with Save and Load. Everything else is in the sections below.
+    // One switch for the mode (Off / Record / Play), what's happening, a bar to see and move through the run, the
+    // buttons that make sense right now, and the macro's name with Save and Load. Everything else is in the sections.
     void DrawControls(float width)
     {
         const tas::Status& st = status_;
@@ -184,21 +219,27 @@ private:
             ImGui::TextWrapped("Unavailable: the engine hooks were not found (see the log).");
             return;
         }
-        const float third = (width - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.f;
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float third = (width - 2 * spacing) / 3.f;
         const bool idle = st.mode == tas::Mode::Idle;
 
         if (ModeButton("Off", idle, third, IM_COL32(90, 90, 90, 255))) tas::Stop();
-        ImGui::SetItemTooltip("Stop recording / playing (%s)", KeyLabel(stopKey).c_str());
+        ImGui::SetItemTooltip("Stop recording / playing (%s)", keys::Name(stopKey).c_str());
         ImGui::SameLine();
         if (ModeButton("Record", st.mode == tas::Mode::Recording, third, IM_COL32(190, 50, 45, 255))) StartRecording();
-        ImGui::SetItemTooltip("A new recording from the start set under Recording. Replaces the macro in memory");
+        ImGui::SetItemTooltip("A new recording from the start set under Recording (%s with the menu closed)",
+                              keys::Name(recordKey).c_str());
         ImGui::SameLine();
         if (ModeButton("Play", st.mode == tas::Mode::Playing, third, IM_COL32(45, 140, 70, 255))) tas::Play();
-        ImGui::SetItemTooltip("Play the macro from its start. Your own input is ignored meanwhile");
+        ImGui::SetItemTooltip("Play the macro from its start. Your own input is ignored meanwhile (%s with the menu closed)",
+                              keys::Name(playKey).c_str());
 
         DrawStatus();
+        if (st.frames > 0 || !idle) DrawProgress(width);
         if (!idle) DrawTransport(width);
-        DrawMacroName(width);
+        if (st.frames > 0 || !idle) DrawSpeeds(width);
+        DrawNameRow(width);
+        if (idle && st.frames == 0) DrawFirstSteps(width);
         DrawGameplayWarning();
     }
 
@@ -227,57 +268,108 @@ private:
         ImGui::Spacing();
     }
 
+    // How far into the run, with the bookmarks on it. Click (or drag) to go to a frame; idle, that plays up to it.
+    void DrawProgress(float width)
+    {
+        const tas::Status& st = status_;
+        const bool recording = st.mode == tas::Mode::Recording;
+        const std::size_t total = std::max<std::size_t>(recording ? st.frame : st.frames, 1);
+        const float fraction = recording ? 1.f : static_cast<float>(std::min(st.frame, total)) / static_cast<float>(total);
+        char overlay[64];
+        std::snprintf(overlay, sizeof overlay, "%zu / %zu", std::min(st.frame, total), total);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, recording ? IM_COL32(170, 55, 50, 255) : IM_COL32(60, 140, 80, 255));
+        ImGui::ProgressBar(fraction, {width, 0}, overlay);
+        ImGui::PopStyleColor();
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+
+        std::vector<tas::Marker> marks;
+        tas::WithReplay([&](tas::Replay& r) { marks = r.markers; });
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        for (const auto& m : marks) {
+            const float x = a.x + (b.x - a.x) * static_cast<float>(m.frame) / static_cast<float>(total);
+            if (x > b.x) continue;
+            dl->AddTriangleFilled({x - 4.f, a.y}, {x + 4.f, a.y}, {x, a.y + 6.f}, IM_COL32(255, 210, 80, 255));
+        }
+
+        if (recording || !ImGui::IsItemHovered()) return;
+        const float t = std::clamp((ImGui::GetIO().MousePos.x - a.x) / std::max(1.f, b.x - a.x), 0.f, 1.f);
+        const auto frame = static_cast<std::size_t>(std::lround(t * static_cast<float>(total - 1)));
+        const tas::Marker* mark = nullptr;     // The bookmark under the mouse
+        for (const auto& m : marks)
+            if (std::fabs(a.x + (b.x - a.x) * static_cast<float>(m.frame) / static_cast<float>(total) -
+                          ImGui::GetIO().MousePos.x) < 5.f) mark = &m;
+        if (mark) ImGui::SetTooltip("%s (frame %u): click to go there", mark->name.c_str(), mark->frame);
+        else ImGui::SetTooltip("Frame %zu: click to go there", frame);
+        if (ImGui::IsItemClicked()) tas::Goto(mark ? mark->frame : frame);
+    }
+
     // Only while a session runs, and only the buttons that work in its mode.
     void DrawTransport(float width)
     {
         const tas::Status& st = status_;
         const float quarter = (width - 3 * ImGui::GetStyle().ItemSpacing.x) / 4.f;
         if (ImGui::Button(st.paused ? "Resume" : "Pause", {quarter, 0})) tas::TogglePause();
-        ImGui::SetItemTooltip("%s", KeyLabel(pauseKey).c_str());
+        ImGui::SetItemTooltip("%s", keys::Name(pauseKey).c_str());
         ImGui::SameLine();
         if (ImGui::Button("Step", {quarter, 0})) tas::Advance();
-        ImGui::SetItemTooltip("Pause, then one frame per click (%s)", KeyLabel(advanceKey).c_str());
+        ImGui::SetItemTooltip("Pause, then one frame per click (%s)", keys::Name(advanceKey).c_str());
         ImGui::SameLine();
         if (ImGui::Button("Restart", {quarter, 0})) tas::Restart();
         ImGui::SetItemTooltip("%s (%s)", st.mode == tas::Mode::Playing ? "Play again from the start"
                                                                        : "Throw this take away and record again",
-                              KeyLabel(restartKey).c_str());
+                              keys::Name(restartKey).c_str());
         ImGui::SameLine();
         if (st.mode == tas::Mode::Recording) {
             if (ImGui::Button("Rewind", {quarter, 0})) tas::Rewind();
             ImGui::SetItemTooltip("Go back %.1f s and keep recording from there (%s)", rewindSeconds.Get(),
-                                  KeyLabel(rewindKey).c_str());
+                                  keys::Name(rewindKey).c_str());
         } else {
             if (ImGui::Button("Take over", {quarter, 0})) tas::TakeOver();
             ImGui::SetItemTooltip("Keep the playback up to here and record from this frame on (%s)",
-                                  KeyLabel(takeOverKey).c_str());
+                                  keys::Name(takeOverKey).c_str());
         }
     }
 
-    void DrawGoto(float width)
+    // The speed of fixed-step frames, for playing and recording alike: slow down for a hard part, speed up through
+    // the rest.
+    void DrawSpeeds(float width)
     {
-        const float half = (width - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-        ImGui::SetNextItemWidth(half);
-        ImGui::InputInt("##goto", &gotoFrame_, 0, 0);
-        gotoFrame_ = std::max(gotoFrame_, 0);
-        ImGui::SameLine();
-        if (ImGui::Button("Go to frame", {half, 0})) tas::Goto(static_cast<std::size_t>(gotoFrame_));
+        const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float w = (width - spacing * (std::size(kSpeeds) - 1)) / static_cast<float>(std::size(kSpeeds));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {spacing, ImGui::GetStyle().ItemSpacing.y});
+        for (std::size_t i = 0; i < std::size(kSpeeds); ++i) {
+            if (i) ImGui::SameLine();
+            const float s = kSpeeds[i].speed;
+            const bool on = s == 0.f ? maxSpeed.Get() : !maxSpeed.Get() && std::fabs(speed.Get() - s) < 1e-3f;
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(ImGuiCol_ButtonActive));
+            if (ImGui::Button(kSpeeds[i].label, {w, 0})) {
+                maxSpeed.Set(s == 0.f);
+                if (s > 0.f) speed.Set(s);
+            }
+            if (on) ImGui::PopStyleColor();
+        }
+        ImGui::PopStyleVar();
     }
 
-    // The macro's name, and Save / Load into the macros folder under that name (Mega Hack's layout).
-    void DrawMacroName(float width)
+    // The macro's name, Save / Load under that name, and the timeline.
+    void DrawNameRow(float width)
     {
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
         const float button = (width - 3 * spacing) * 0.2f;
-        ImGui::SetNextItemWidth(width - 3 * (button + spacing));
-        ImGui::InputTextWithHint("##file", "macro name", fileBuf_, sizeof fileBuf_);
-        const bool named = fileBuf_[0] != 0;
+        library_.DrawNameBox(width - 3 * (button + spacing));
         ImGui::SameLine();
-        ImGui::BeginDisabled(!named);
-        if (ImGui::Button("Save", {button, 0})) SaveNamed();
-        ImGui::SetItemTooltip("Save to replays/%s%s (next to the menu DLL)", fileBuf_, tas::kFileExtension);
+        const bool unsaved = library_.Unsaved();
+        if (unsaved) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1.f, 0.82f, 0.4f, 1.f});
+        if (ImGui::Button(unsaved ? "Save*" : "Save", {button, 0})) library_.Save();
+        if (unsaved) ImGui::PopStyleColor();
+        ImGui::SetItemTooltip(unsaved ? "Not saved yet: save it to replays\\ (a name is made up if the box is empty)"
+                                      : "Save to replays\\ (a name is made up if the box is empty)");
         ImGui::SameLine();
-        if (ImGui::Button("Load", {button, 0})) LoadPath(NamedPath());
+        ImGui::BeginDisabled(!library_.Name()[0]);
+        if (ImGui::Button("Load", {button, 0})) {
+            const std::filesystem::path path = tas::Folder() / (std::string(library_.Name()) + tas::kFileExtension);
+            library_.Guard("Loading " + path.filename().string(), [this, path] { library_.Load(path); });
+        }
         ImGui::EndDisabled();
         ImGui::SameLine();
         const bool open = showTimeline;
@@ -285,21 +377,32 @@ private:
         const bool toggle = ImGui::Button("Edit", {button, 0});
         if (open) ImGui::PopStyleColor();
         if (toggle) showTimeline.Set(!open);
-        ImGui::SetItemTooltip("%s the timeline: key holds, camera keyframes", showTimeline ? "Close" : "Open");
+        ImGui::SetItemTooltip("%s the timeline: key holds, camera keyframes, bookmarks", showTimeline ? "Close" : "Open");
     }
+
+    // With nothing loaded: how to get going.
+    void DrawFirstSteps(float width)
+    {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
+        ImGui::TextDisabled("1. Pick where it starts under Recording.  2. Record (or close the menu and press %s).  "
+                            "3. Stop with %s.  4. Play it back, or Save.",
+                            keys::Name(recordKey).c_str(), keys::Name(stopKey).c_str());
+        ImGui::PopTextWrapPos();
+    }
+
     // Modules that change the game make a recording unverifiable (and its playback desync when they're off).
     template <class F>
-    void ForEachGameplayMod(F&& f)
+    void ForEachGameplayMod(F&& f) const
     {
         modules::ForEach([&](modules::Tab& tab, Module& m) {
             if (!m.Enabled() || &m == this || m.IsAction()) return;
             if (tab.name != "Player" && tab.name != "World" && tab.name != "Trainer") return;
-            if (m.Name() == "Tool Overlay" || m.Name() == "Speedometer") return;
+            if (m.Name() == "Tool Overlay" || m.Name() == "Speedometer" || m.Name() == "Speedrun Timer") return;
             f(m);
         });
     }
 
-    std::string GameplayMods()
+    std::string GameplayMods() const
     {
         std::string on;
         ForEachGameplayMod([&](Module& m) {
@@ -312,10 +415,102 @@ private:
     void DrawGameplayWarning()
     {
         const std::string on = GameplayMods();
-        if (!on.empty()) ImGui::TextColored({1.f, 0.75f, 0.3f, 1.f}, "Changes the game: %s", on.c_str());
+        if (on.empty()) return;
+        ImGui::TextColored({1.f, 0.75f, 0.3f, 1.f}, "Changes the game: %s", on.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Turn off")) ForEachGameplayMod([](Module& m) { m.SetEnabled(false); });
+        ImGui::SetItemTooltip("Recording or playing with these on makes the run play differently without them");
     }
 
-    // ---- desync ---------------------------------------------------------------------------------------------------------------
+    std::string StatusLine() const
+    {
+        const tas::Status& st = status_;
+        char buf[128];
+        switch (st.mode) {
+            case tas::Mode::Idle:
+                if (st.frames == 0) return "No macro loaded";
+                tas::WithReplay([&](tas::Replay& r) {
+                    std::snprintf(buf, sizeof buf, "Ready: %s, %zu frames", FormatTime(r.Duration()).c_str(),
+                                  r.frames.size());
+                });
+                break;
+            case tas::Mode::Recording:
+                std::snprintf(buf, sizeof buf, "%s %zu  %s", st.armed ? "Loading..." : "REC", st.frame,
+                              FormatTime(st.time).c_str());
+                break;
+            case tas::Mode::Playing:
+                std::snprintf(buf, sizeof buf, "%s %zu / %zu  %s", st.armed ? "Loading..." : st.seeking ? "SEEK" : "PLAY",
+                              st.frame, st.frames, FormatTime(st.time).c_str());
+                break;
+        }
+        std::string s = buf;
+        if (st.paused) s += "  (paused)";
+        return s;
+    }
+
+    // ---- sections -------------------------------------------------------------------------------------------------------
+    void DrawGoto(float width)
+    {
+        const float half = (width - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        ImGui::SetNextItemWidth(half);
+        ImGui::InputInt("##goto", &gotoFrame_, 0, 0);
+        gotoFrame_ = std::max(gotoFrame_, 0);
+        ImGui::SameLine();
+        if (ImGui::Button("Go to frame", {half, 0})) tas::Goto(static_cast<std::size_t>(gotoFrame_));
+    }
+
+    // Named frames: add one where the session is (or at the Go to frame), click to go there, rename, delete.
+    void DrawBookmarks(float width)
+    {
+        const tas::Status& st = status_;
+        std::vector<tas::Marker> marks;
+        std::size_t frames = 0;
+        tas::WithReplay([&](tas::Replay& r) {
+            marks = r.markers;
+            frames = r.frames.size();
+        });
+        const bool session = st.mode != tas::Mode::Idle;
+        const std::size_t here = session ? st.frame : static_cast<std::size_t>(gotoFrame_);
+        const bool canAdd = session || here < frames;
+        char label[64];
+        std::snprintf(label, sizeof label, "+ Bookmark frame %zu", here);
+        ImGui::BeginDisabled(!canAdd);
+        if (ImGui::Button(label, {width, 0}))
+            tas::WithReplay([&](tas::Replay& r) {
+                r.SetMarker(static_cast<std::uint32_t>(here), "Bookmark " + std::to_string(r.markers.size() + 1));
+            });
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("%s (%s while a session runs)",
+                              session ? "Where the session is now" : "The frame in Playback > Go to frame",
+                              keys::Name(bookmarkKey).c_str());
+        if (marks.empty()) {
+            ImGui::TextDisabled("No bookmarks yet");
+            return;
+        }
+
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float frameW = ImGui::CalcTextSize("000000").x;
+        const float goW = ImGui::GetFrameHeight() * 1.6f;
+        for (const auto& m : marks) {
+            ImGui::PushID(static_cast<int>(m.frame));
+            char name[64];
+            std::snprintf(name, sizeof name, "%s", m.name.c_str());
+            ImGui::SetNextItemWidth(width - frameW - 2 * goW - 3 * spacing);
+            if (ImGui::InputText("##name", name, sizeof name, ImGuiInputTextFlags_EnterReturnsTrue) ||
+                ImGui::IsItemDeactivatedAfterEdit())
+                tas::WithReplay([&](tas::Replay& r) { r.SetMarker(m.frame, name); });
+            ImGui::SameLine();
+            ImGui::TextDisabled("%6u", m.frame);
+            ImGui::SameLine();
+            if (ImGui::Button("Go", {goW, 0})) tas::Goto(m.frame);
+            ImGui::SetItemTooltip("Play up to frame %u and pause there", m.frame);
+            ImGui::SameLine();
+            if (ImGui::Button("x", {goW, 0})) tas::WithReplay([&](tas::Replay& r) { r.EraseMarker(m.frame); });
+            ImGui::SetItemTooltip("Delete this bookmark");
+            ImGui::PopID();
+        }
+    }
+
     // What differs from when the macro was recorded, and what playback does about it. Refreshed twice a second.
     void DrawDesyncChecks(float width)
     {
@@ -361,249 +556,15 @@ private:
         ImGui::EndDisabled();
     }
 
-    std::string StatusLine() const
-    {
-        const tas::Status& st = status_;
-        char buf[128];
-        switch (st.mode) {
-            case tas::Mode::Idle:
-                if (st.frames == 0) return "No macro loaded";
-                tas::WithReplay([&](tas::Replay& r) {
-                    std::snprintf(buf, sizeof buf, "Ready: %s, %zu frames", FormatTime(r.Duration()).c_str(),
-                                  r.frames.size());
-                });
-                break;
-            case tas::Mode::Recording:
-                std::snprintf(buf, sizeof buf, "%s %zu  %s", st.armed ? "Loading..." : "REC", st.frame,
-                              FormatTime(st.time).c_str());
-                break;
-            case tas::Mode::Playing:
-                std::snprintf(buf, sizeof buf, "%s %zu / %zu  %s", st.armed ? "Loading..." : st.seeking ? "SEEK" : "PLAY",
-                              st.frame, st.frames, FormatTime(st.time).c_str());
-                break;
-        }
-        std::string s = buf;
-        if (st.paused) s += "  (paused)";
-        return s;
-    }
-
-    struct MacroFile {
-        std::filesystem::path path;
-        std::string label;                 // file name: "run.merp", "showcase.json"
-        std::string name;                  // without the extension
-        std::uintmax_t size = 0;
-        std::filesystem::file_time_type time;
-    };
-
-    void RefreshFiles()
-    {
-        files_.clear();
-        std::error_code ec;
-        for (const auto& e : std::filesystem::directory_iterator(tas::Folder(), ec)) {
-            if (!e.is_regular_file(ec) || !IsMacroFile(e.path())) continue;
-            MacroFile f;
-            f.path = e.path();
-            f.label = e.path().filename().string();
-            f.name = e.path().stem().string();
-            f.size = e.file_size(ec);
-            f.time = e.last_write_time(ec);
-            files_.push_back(std::move(f));
-        }
-        // Newest first, like a recent list
-        std::sort(files_.begin(), files_.end(), [](const MacroFile& a, const MacroFile& b) { return a.time > b.time; });
-        filesLoaded_ = true;
-    }
-
-    // Where Save writes the name in the box: replays/<name>.merp
-    std::filesystem::path FilePath() const { return tas::Folder() / (std::string(fileBuf_) + tas::kFileExtension); }
-
-    // The file Load / Delete mean: the one picked in the list, else <name>.merp, else <name>.json.
-    std::filesystem::path NamedPath() const
-    {
-        if (!selectedFile_.empty() && selectedFile_.stem().string() == fileBuf_) return selectedFile_;
-        std::error_code ec;
-        const auto merp = FilePath();
-        if (std::filesystem::exists(merp, ec)) return merp;
-        const auto json = tas::Folder() / (std::string(fileBuf_) + ".json");
-        return std::filesystem::exists(json, ec) ? json : merp;
-    }
-
-    void SaveTo(const std::filesystem::path& path)
-    {
-        std::string error;
-        tas::WithReplay([&](tas::Replay& r) {
-            if (r.description.empty()) r.description = path.stem().string();
-        });
-        if (tas::SaveFile(path, &error)) {
-            notify::Push("Saved " + path.filename().string());
-            std::snprintf(fileBuf_, sizeof fileBuf_, "%s", path.stem().string().c_str());
-            selectedFile_ = path;
-        } else {
-            notify::Push("TAS: " + error);
-        }
-        RefreshFiles();
-    }
-
-    void SaveNamed() { SaveTo(FilePath()); }
-
-    void LoadPath(const std::filesystem::path& path)
-    {
-        std::string error;
-        if (tas::LoadFile(path, &error)) {
-            notify::Push("Loaded " + path.filename().string());
-            std::snprintf(fileBuf_, sizeof fileBuf_, "%s", path.stem().string().c_str());
-            selectedFile_ = path;
-        } else {
-            notify::Push("TAS: " + error);
-        }
-    }
-
-    // ---- file browser (imgui-filebrowser: drawn by the menu, so it is never behind the game or stuck) ------------------
-    static constexpr ImGuiFileBrowserFlags kBrowserFlags =
-        ImGuiFileBrowserFlags_CloseOnEsc | ImGuiFileBrowserFlags_ConfirmOnEnter |
-        ImGuiFileBrowserFlags_SkipItemsCausingError | ImGuiFileBrowserFlags_EditPathString;
-
-    // Created the first time they are opened: the constructor reads the disk (folders, drive letters).
-    ImGui::FileBrowser& Browser(bool save)
-    {
-        auto& browser = save ? saveBrowser_ : openBrowser_;
-        if (!browser) {
-            std::error_code ec;
-            std::filesystem::create_directories(tas::Folder(), ec);
-            browser.emplace(save ? kBrowserFlags | ImGuiFileBrowserFlags_EnterNewFilename |
-                                       ImGuiFileBrowserFlags_CreateNewDir
-                                 : kBrowserFlags,
-                            tas::Folder());
-            browser->SetWindowSize(720, 460);
-        }
-        return *browser;
-    }
-
-    void OpenBrowser(bool save)
-    {
-        ImGui::FileBrowser& b = Browser(save);
-        b.SetTypeFilters({".merp", ".json"});
-        if (save) {
-            b.SetTitle("Save macro as");
-            b.SetInputName(std::string(fileBuf_[0] ? fileBuf_ : "macro") + tas::kFileExtension);
-        } else {
-            b.SetTitle("Open macro");
-        }
-        b.Open();
-    }
-
-    void DrawBrowsers()
-    {
-        if (openBrowser_) {
-            openBrowser_->Display();
-            if (openBrowser_->HasSelected()) {
-                LoadPath(openBrowser_->GetSelected());
-                openBrowser_->ClearSelected();
-            }
-        }
-        if (saveBrowser_) {
-            saveBrowser_->Display();
-            if (saveBrowser_->HasSelected()) {
-                std::filesystem::path path = saveBrowser_->GetSelected();
-                saveBrowser_->ClearSelected();
-                if (!IsMacroFile(path)) path += tas::kFileExtension;     // .json only when asked for by name
-                std::error_code ec;
-                if (std::filesystem::exists(path, ec)) {
-                    overwrite_ = path;
-                    ImGui::OpenPopup("Replace file?##tas");
-                } else {
-                    SaveTo(path);
-                }
-            }
-        }
-
-        if (ImGui::BeginPopupModal("Replace file?##tas", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("%s already exists. Replace it?", overwrite_.filename().string().c_str());
-            ImGui::TextDisabled("%s", overwrite_.parent_path().string().c_str());
-            if (ImGui::Button("Replace", {120.f, 0})) {
-                SaveTo(overwrite_);
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel", {120.f, 0}) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
-        }
-    }
-
-    void DrawFiles(float width)
-    {
-        // The folder is small: looking again every couple of seconds keeps the list current without a Refresh button.
-        const double now = ImGui::GetTime();
-        if (!filesLoaded_ || now - filesTime_ > 2.0) {
-            RefreshFiles();
-            filesTime_ = now;
-        }
-        const float quarter = (width - 3 * ImGui::GetStyle().ItemSpacing.x) / 4.f;
-
-        // The macros folder, newest first
-        ImGui::SetNextItemWidth(width);
-        ImGui::InputTextWithHint("##search", "search", searchBuf_, sizeof searchBuf_);
-        const float rowH = ImGui::GetTextLineHeightWithSpacing();
-        if (ImGui::BeginListBox("##macros", {width, rowH * 5.f + 4.f})) {
-            int shown = 0;
-            for (const auto& f : files_) {
-                if (!ContainsNoCase(f.label, searchBuf_)) continue;
-                ++shown;
-                const bool selected = f.path == selectedFile_;
-                if (ImGui::Selectable(f.label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick)) {
-                    std::snprintf(fileBuf_, sizeof fileBuf_, "%s", f.name.c_str());
-                    selectedFile_ = f.path;
-                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) LoadPath(f.path);
-                }
-                ImGui::SetItemTooltip("Double click to load (%.1f KB)", static_cast<double>(f.size) / 1024.0);
-            }
-            if (shown == 0) ImGui::TextDisabled(files_.empty() ? "No saved macros yet" : "No match");
-            ImGui::EndListBox();
-        }
-
-        // Any file, anywhere: the file browser
-        if (ImGui::Button("Open...", {quarter, 0})) OpenBrowser(false);
-        ImGui::SetItemTooltip("Open a .merp or .json macro from anywhere");
-        ImGui::SameLine();
-        if (ImGui::Button("Save as...", {quarter, 0})) OpenBrowser(true);
-        ImGui::SetItemTooltip("Save anywhere: .merp, or .json for readable, editable text");
-        ImGui::SameLine();
-
-        const bool named = fileBuf_[0] != 0;
-        ImGui::BeginDisabled(!named);
-        if (ImGui::Button(confirmDelete_ ? "Sure?" : "Delete", {quarter, 0})) {
-            if (!confirmDelete_) {
-                confirmDelete_ = true;
-            } else {
-                confirmDelete_ = false;
-                const auto path = NamedPath();
-                std::error_code ec;
-                if (std::filesystem::remove(path, ec)) notify::Push("Deleted " + path.filename().string());
-                else notify::Push("TAS: couldn't delete " + path.filename().string());
-                if (path == selectedFile_) selectedFile_.clear();
-                RefreshFiles();
-            }
-        }
-        if (!ImGui::IsItemHovered()) confirmDelete_ = false;
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button("New", {quarter, 0})) {
-            tas::Clear();
-            fileBuf_[0] = 0;
-            selectedFile_.clear();
-        }
-        ImGui::SetItemTooltip("Stop and empty the macro in memory (saved files are kept)");
-    }
-
     // The macro in memory: what it is, its ids, and the text saved with it.
     void DrawDetails(float width)
     {
         tas::WithReplay([&](tas::Replay& r) {
-            const std::string rate = r.fixedHz > 0.f ? std::to_string(static_cast<int>(r.fixedHz)) + " fps" : "real time";
+            const std::string fps = r.fixedHz > 0.f ? std::to_string(static_cast<int>(r.fixedHz)) + " fps" : "real time";
             const std::string from = r.start == tas::StartKind::Now       ? "from anywhere"
                                    : r.start == tas::StartKind::Command   ? r.command
                                    : r.map + (r.checkpoint.empty() ? "" : " @ " + r.checkpoint);
-            ImGui::TextDisabled("%zu inputs, %u rerecords, %s, %s", r.events.size(), r.rerecords, rate.c_str(),
+            ImGui::TextDisabled("%zu inputs, %u rerecords, %s, %s", r.events.size(), r.rerecords, fps.c_str(),
                                 from.c_str());
             ImGui::TextDisabled("input %016llx  sync %016llx", static_cast<unsigned long long>(r.InputHash()),
                                 static_cast<unsigned long long>(r.SyncHash()));
@@ -647,7 +608,12 @@ private:
         if (st.mode == tas::Mode::Recording) color = IM_COL32(255, 90, 80, 255);
         if (st.desyncFrame >= 0) text += "  desync @" + std::to_string(st.desyncFrame);
         else if (st.verified) text += "  verified";
-        if (st.paused) text += "   [" + KeyLabel(advanceKey) + "] step  [" + KeyLabel(pauseKey) + "] resume";
+        if (st.paused) text += "   [" + keys::Name(advanceKey) + "] step  [" + keys::Name(pauseKey) + "] resume";
+        if (!maxSpeed && std::fabs(speed.Get() - 1.f) > 1e-3f && st.mode != tas::Mode::Idle) {
+            char s[24];
+            std::snprintf(s, sizeof s, "  %.2gx", speed.Get());
+            text += s;
+        }
 
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         const ImVec2 ts = ImGui::CalcTextSize(text.c_str());
@@ -655,34 +621,19 @@ private:
         dl->AddText({12.f, 10.f}, color, text.c_str());
     }
 
-    static std::string KeyLabel(int vk)
-    {
-        char name[32] = "?";
-        if (const UINT sc = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC))
-            GetKeyNameTextA(static_cast<LONG>(sc << 16), name, sizeof name);
-        return name;
-    }
-
     // ---- state ------------------------------------------------------------------------------------------------------------
     tas::Status status_;
     tasui::TimelineView timeline_;
     tasui::ReplayEditor editor_;
+    tasui::MacroLibrary library_;
     std::vector<tas::Issue> issues_;
     double issuesTime_ = -1.0;
     bool confirmResync_ = false;
     char commandBuf_[128] = "open edge_p";
-    char fileBuf_[96] = "";
     char fromBuf_[48] = "", toBuf_[48] = "";
     int map_ = 0, checkpoint_ = 0;
     int gotoFrame_ = 0;
-    std::vector<MacroFile> files_;
-    bool filesLoaded_ = false;
-    double filesTime_ = 0.0;
-    char searchBuf_[64] = "";
-    bool confirmDelete_ = false;
-    std::filesystem::path selectedFile_;           // picked in the macro list (or last loaded / saved)
-    std::optional<ImGui::FileBrowser> openBrowser_, saveBrowser_;
-    std::filesystem::path overwrite_;              // "Replace file?" asks about this one
+    std::vector<int> reserved_;
 
     // ---- controls (drawn in this order) -----------------------------------------------------------------------------------------
     ctl::Custom controls{this, [this](float w) { DrawControls(w); }};
@@ -702,11 +653,15 @@ private:
                               "How far back practice mode (and the Rewind key) goes"};
 
     ctl::Section playSection{this, "Playback", false};
-    ctl::Slider speed{this, "Speed", 1.f, 0.05f, 8.f, "%.2fx", 0.05f};
+    ctl::Slider speed{this, "Speed", 1.f, 0.05f, 8.f, "%.2fx", 0.05f,
+                      "Of fixed-step frames, playing and recording (the buttons under the progress bar set it too)"};
     ctl::Checkbox maxSpeed{this, "As fast as possible", false};
-    ctl::Combo atEnd{this, "At the end", {"Stop", "Pause", "Keep recording"}, 1};
-
+    ctl::Combo atEnd{this, "At the end", {"Stop", "Pause", "Keep recording", "Loop"}, 1,
+                     "Keep recording: carry on from the last frame. Loop: play it again from the start"};
     ctl::Custom gotoFrame{this, [this](float w) { DrawGoto(w); }};
+
+    ctl::Section bookmarkSection{this, "Bookmarks", false};
+    ctl::Custom bookmarks{this, [this](float w) { DrawBookmarks(w); }};
 
     ctl::Section desyncSection{this, "Desync", false};
     ctl::Custom desyncChecks{this, [this](float w) { DrawDesyncChecks(w); }};
@@ -721,15 +676,18 @@ private:
                                  "whose binding changed as the key that does that now. Your settings come back after"};
 
     ctl::Section filesSection{this, "Macros", true};
-    ctl::Custom files{this, [this](float w) { DrawFiles(w); }};
+    ctl::Custom files{this, [this](float w) { library_.DrawList(w); }};
 
     ctl::Section keysSection{this, "Keys", false};
+    ctl::KeyHold recordKey{this, "Record", VK_F2};
+    ctl::KeyHold playKey{this, "Play", VK_F3};
     ctl::KeyHold pauseKey{this, "Pause / resume", VK_F5};
     ctl::KeyHold advanceKey{this, "Frame advance", VK_F6};
     ctl::KeyHold restartKey{this, "Restart", VK_F4};
     ctl::KeyHold rewindKey{this, "Rewind", VK_F9};
     ctl::KeyHold takeOverKey{this, "Take over", VK_F7};
     ctl::KeyHold stopKey{this, "Stop", VK_F8};
+    ctl::KeyHold bookmarkKey{this, "Bookmark", VK_F1};
 
     ctl::Section moreSection{this, "Advanced", false};
     ctl::Checkbox blockStreaming{this, "Deterministic streaming", true,

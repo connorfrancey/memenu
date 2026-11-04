@@ -4,6 +4,7 @@
 #include "core/scheduler.h"
 
 #include <algorithm>
+#include <mutex>
 #include <spdlog/spdlog.h>
 
 // ---- Module --------------------------------------------------------------------------------------------------------------
@@ -132,8 +133,23 @@ void modules::Render()
     }
 }
 
+namespace {
+std::mutex g_reservedMutex;
+std::vector<int> g_reserved;
+}
+
+void modules::SetReservedKeys(std::vector<int> keys)
+{
+    std::lock_guard lock(g_reservedMutex);
+    g_reserved = std::move(keys);
+}
+
 void modules::OnKey(int vk)
 {
+    {
+        std::lock_guard lock(g_reservedMutex);
+        if (std::find(g_reserved.begin(), g_reserved.end(), vk) != g_reserved.end()) return;
+    }
     for (auto& m : g_modules) {
         if (m->key == vk) {
             m->Toggle();

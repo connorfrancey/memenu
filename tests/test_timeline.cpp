@@ -203,3 +203,65 @@ TEST(Timeline, UnwrapTakesTheShortWay)
     EXPECT_FLOAT_EQ(UnwrapNear(10.f, 715.f), 730.f);
     EXPECT_FLOAT_EQ(UnwrapNear(-170.f, 170.f), 190.f);
 }
+
+TEST(Timeline, MoveHoldsTogether)
+{
+    Replay r = Sample();                    // W 10..20, SpaceBar 15..17
+    const auto w = Name(r, "W"), space = Name(r, "SpaceBar");
+    auto moved = MoveHolds(r, {{w, {10, 20}}, {space, {15, 17}}}, 5);
+    ASSERT_EQ(moved.size(), 2u);
+    EXPECT_EQ(Holds(r, w).front(), (Hold{15, 25}));
+    EXPECT_EQ(Holds(r, space).front(), (Hold{20, 22}));
+    MoveHolds(r, moved, -100);              // Stops at frame 0: the first lands there, the other keeps its distance
+    EXPECT_EQ(Holds(r, w).front(), (Hold{0, 10}));
+    EXPECT_EQ(Holds(r, space).front(), (Hold{5, 7}));
+    EraseHolds(r, {{w, {0, 10}}});
+    EXPECT_TRUE(Holds(r, w).empty());
+    EXPECT_EQ(Holds(r, space).size(), 1u);
+}
+
+TEST(Timeline, CopyAndPaste)
+{
+    Replay r = Sample();
+    const auto w = Name(r, "W"), space = Name(r, "SpaceBar");
+    CameraKey k;
+    k.frame = 12;
+    k.yaw = 45.f;
+    SetCameraKey(r, k);
+    const Clip clip = Copy(r, {{w, {10, 20}}, {space, {15, 17}}}, {12});
+    EXPECT_EQ(clip.length, 10u);
+    ASSERT_EQ(clip.holds.size(), 2u);
+    EXPECT_EQ(clip.holds[1].second, (Hold{5, 7}));         // Relative to the first frame copied
+
+    std::vector<std::uint32_t> cams;
+    const auto pasted = Paste(r, clip, 35, &cams);          // Past the end: frames are added
+    EXPECT_EQ(pasted.size(), 2u);
+    EXPECT_GE(r.frames.size(), 45u);
+    EXPECT_EQ(Holds(r, w).back(), (Hold{35, 45}));
+    ASSERT_EQ(cams.size(), 1u);
+    EXPECT_EQ(cams[0], 37u);
+    EXPECT_FLOAT_EQ(FindCameraKey(r, 37)->yaw, 45.f);
+
+    // Into another replay, by key name
+    Replay other;
+    Paste(other, clip, 0);
+    EXPECT_EQ(Holds(other, other.NameIndex("SpaceBar")).front(), (Hold{5, 7}));
+}
+
+TEST(Timeline, MoveCameraKeysTogether)
+{
+    Replay r = Sample();
+    for (std::uint32_t f : {5u, 6u, 30u}) {
+        CameraKey k;
+        k.frame = f;
+        k.yaw = static_cast<float>(f);
+        SetCameraKey(r, k);
+    }
+    const auto to = MoveCameraKeys(r, {5, 6}, 1);           // 5 lands where 6 was: all are taken out first
+    ASSERT_EQ(to.size(), 2u);
+    EXPECT_FLOAT_EQ(FindCameraKey(r, 6)->yaw, 5.f);
+    EXPECT_FLOAT_EQ(FindCameraKey(r, 7)->yaw, 6.f);
+    EXPECT_EQ(FindCameraKey(r, 5), nullptr);
+    const auto end = MoveCameraKeys(r, {30}, 1000);         // Kept inside the replay
+    EXPECT_EQ(end[0], static_cast<std::uint32_t>(r.frames.size() - 1));
+}

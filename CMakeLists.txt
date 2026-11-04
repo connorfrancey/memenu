@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.2)
 project(medge_menu LANGUAGES C CXX)
-set(MEMENU_VERSION "2.0.1-dev")   # Shown by the installer, stamped into the loader
+set(MEMENU_VERSION "2.0.2-dev")   # Shown by the installer, stamped into the loader
 
 # -------------------------------------------------------------------------------------------------
 # Platform Guards (Mirror's Edge is a 32-bit Windows process)
@@ -60,7 +60,7 @@ file(GLOB_RECURSE HEADER_FILES CONFIGURE_DEPENDS
 # Only the always-built files stay from the glob: core, menu, hooks, config, themes and features/tabs.cpp.
 set(_feature_files ${SOURCE_FILES})
 list(FILTER _feature_files INCLUDE REGEX "/src/features/[^/]+/")
-list(FILTER SOURCE_FILES EXCLUDE REGEX "/src/(features/[^/]+|tas|game|render)/")
+list(FILTER SOURCE_FILES EXCLUDE REGEX "/src/(features/[^/]+|tas|game|render|speedrun)/")
 foreach(file IN LISTS _feature_files)   # A new module file has to be listed there, or it would silently not build
   if(NOT file IN_LIST MEMENU_ALL_FEATURE_SOURCES)
     message(FATAL_ERROR "${file} is not listed in cmake/Features.cmake: add a memenu_feature() for it")

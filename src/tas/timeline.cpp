@@ -294,4 +294,136 @@ float UnwrapNear(float deg, float near)
     return deg + 360.f * std::round((near - deg) / 360.f);
 }
 
+// ---- several at once ---------------------------------------------------------------------------------------------------------
+Hold Containing(const Replay& r, std::uint16_t name, const Hold& h)
+{
+    for (const Hold& now : Holds(r, name))
+        if (now.start <= h.start && now.end >= h.end) return now;
+    return h;
+}
+
+namespace {
+// The selected holds of each key, by key.
+std::vector<std::pair<std::uint16_t, std::vector<Hold>>> ByName(const std::vector<KeyHold>& holds)
+{
+    std::vector<std::pair<std::uint16_t, std::vector<Hold>>> out;
+    for (const KeyHold& k : holds) {
+        auto it = std::find_if(out.begin(), out.end(), [&](const auto& p) { return p.first == k.name; });
+        if (it == out.end()) out.push_back({k.name, {k.hold}});
+        else it->second.push_back(k.hold);
+    }
+    return out;
+}
+
+std::vector<Hold> Without(std::vector<Hold> all, const std::vector<Hold>& drop)
+{
+    all.erase(std::remove_if(all.begin(), all.end(),
+                             [&](const Hold& h) { return std::find(drop.begin(), drop.end(), h) != drop.end(); }),
+              all.end());
+    return all;
+}
+
+float NominalDt(const Replay& r)
+{
+    return r.fixedHz > 0.f ? 1.f / r.fixedHz : (r.frames.empty() ? 1.f / 60.f : r.frames.back().dt);
+}
+}
+
+std::vector<KeyHold> MoveHolds(Replay& r, const std::vector<KeyHold>& holds, int delta)
+{
+    if (holds.empty()) return {};
+    std::uint32_t first = holds.front().hold.start;
+    for (const KeyHold& k : holds) first = std::min(first, k.hold.start);
+    delta = std::max(delta, -static_cast<int>(first));
+    std::vector<KeyHold> moved;
+    for (const auto& [name, mine] : ByName(holds)) {
+        std::vector<Hold> rest = Without(Holds(r, name), mine);
+        for (const Hold& h : mine) {
+            const Hold to{static_cast<std::uint32_t>(static_cast<int>(h.start) + delta),
+                          static_cast<std::uint32_t>(static_cast<int>(h.end) + delta)};
+            rest.push_back(to);
+            moved.push_back({name, to});
+        }
+        SetHolds(r, name, std::move(rest));
+    }
+    for (KeyHold& k : moved) k.hold = Containing(r, k.name, k.hold);
+    return moved;
+}
+
+void EraseHolds(Replay& r, const std::vector<KeyHold>& holds)
+{
+    for (const auto& [name, mine] : ByName(holds)) SetHolds(r, name, Without(Holds(r, name), mine));
+}
+
+std::vector<std::uint32_t> MoveCameraKeys(Replay& r, const std::vector<std::uint32_t>& frames, int delta)
+{
+    if (frames.empty() || r.frames.empty()) return frames;
+    std::vector<std::uint32_t> sorted = frames;
+    std::sort(sorted.begin(), sorted.end());
+    const int last = static_cast<int>(r.frames.size()) - 1;
+    delta = std::clamp(delta, -static_cast<int>(sorted.front()), last - static_cast<int>(sorted.back()));
+    if (delta == 0) return sorted;
+    std::vector<CameraKey> keys;
+    for (std::uint32_t f : sorted)
+        if (const CameraKey* k = FindCameraKey(r, f)) keys.push_back(*k);
+    for (const CameraKey& k : keys) EraseCameraKey(r, k.frame);     // All out first: they may land on each other
+    std::vector<std::uint32_t> out;
+    for (CameraKey k : keys) {
+        k.frame = static_cast<std::uint32_t>(static_cast<int>(k.frame) + delta);
+        SetCameraKey(r, k);
+        out.push_back(k.frame);
+    }
+    return out;
+}
+
+Clip Copy(const Replay& r, const std::vector<KeyHold>& holds, const std::vector<std::uint32_t>& cameraFrames)
+{
+    Clip c;
+    std::uint32_t first = UINT32_MAX, end = 0;
+    for (const KeyHold& k : holds) { first = std::min(first, k.hold.start); end = std::max(end, k.hold.end); }
+    for (std::uint32_t f : cameraFrames)
+        if (FindCameraKey(r, f)) { first = std::min(first, f); end = std::max(end, f + 1); }
+    if (first == UINT32_MAX) return c;
+    for (const KeyHold& k : holds) c.holds.push_back({r.Name(k.name), {k.hold.start - first, k.hold.end - first}});
+    for (std::uint32_t f : cameraFrames)
+        if (const CameraKey* k = FindCameraKey(r, f)) {
+            CameraKey copy = *k;
+            copy.frame -= first;
+            c.camera.push_back(copy);
+        }
+    c.length = end - first;
+    return c;
+}
+
+std::vector<KeyHold> Paste(Replay& r, const Clip& clip, std::uint32_t at, std::vector<std::uint32_t>* cameraFrames)
+{
+    std::vector<KeyHold> pasted;
+    std::vector<std::pair<std::uint16_t, std::vector<Hold>>> add;
+    for (const auto& [name, h] : clip.holds) {
+        const std::uint16_t idx = r.NameIndex(name);
+        const Hold to{h.start + at, h.end + at};
+        pasted.push_back({idx, to});
+        auto it = std::find_if(add.begin(), add.end(), [&](const auto& p) { return p.first == idx; });
+        if (it == add.end()) add.push_back({idx, {to}});
+        else it->second.push_back(to);
+    }
+    for (auto& [name, holds] : add) {
+        std::vector<Hold> all = Holds(r, name);
+        all.insert(all.end(), holds.begin(), holds.end());
+        SetHolds(r, name, std::move(all));
+    }
+    if (!clip.camera.empty()) {
+        std::uint32_t needed = 0;
+        for (const CameraKey& k : clip.camera) needed = std::max(needed, k.frame + at + 1);
+        if (needed > r.frames.size()) r.InsertFrames(r.frames.size(), needed - r.frames.size(), NominalDt(r));
+        for (CameraKey k : clip.camera) {
+            k.frame += at;
+            SetCameraKey(r, k);
+            if (cameraFrames) cameraFrames->push_back(k.frame);
+        }
+    }
+    for (KeyHold& k : pasted) k.hold = Containing(r, k.name, k.hold);
+    return pasted;
+}
+
 } // namespace tas::timeline

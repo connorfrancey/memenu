@@ -80,6 +80,13 @@ struct CameraKey {
 };
 static_assert(sizeof(CameraKey) == 16);
 
+// A named frame to come back to ("before the jump"): shown on the timeline, a click away from Go to. Doesn't change how
+// the replay plays.
+struct Marker {
+    std::uint32_t frame = 0;
+    std::string name;
+};
+
 struct Replay {
     // ---- how it starts and runs ---------------------------------------------------------------------------------------
     StartKind start = StartKind::Now;
@@ -102,6 +109,7 @@ struct Replay {
     std::vector<Event> events;
     std::vector<Sync> sync;          // one per frame, or empty
     std::vector<CameraKey> camera;   // sorted by frame, one per frame at most (see tas/timeline.h)
+    std::vector<Marker> markers;     // sorted by frame, one per frame at most
     std::uint32_t syncValidUntil = 0;   // frames >= this were edited after recording: their sync is not checked
 
     void Clear();
@@ -125,6 +133,11 @@ struct Replay {
     void ReplaceEvent(std::size_t frame, std::size_t indexInFrame, const Event& e);
     void SetFrameDt(std::size_t frame, float dt);
     void InvalidateSyncFrom(std::size_t frame);
+    // Bookmarks. Setting one on a frame that has one renames it. An empty name is "Frame <n>".
+    void SetMarker(std::uint32_t frame, std::string name);
+    bool EraseMarker(std::uint32_t frame);
+    const Marker* MarkerAt(std::uint32_t frame) const;
+
     // Every event using `from` uses `to` instead. Returns how many changed.
     std::size_t RenameKey(const std::string& from, const std::string& to);
 

@@ -45,11 +45,13 @@ namespace
     using Reset_t = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
     using StretchRect_t = HRESULT(WINAPI*)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*,
                                            const RECT*, D3DTEXTUREFILTERTYPE);
+    using SetVertexShaderConstantF_t = HRESULT(WINAPI*)(IDirect3DDevice9*, UINT, const float*, UINT);
 
     EndScene_t oEndScene = nullptr;
     Reset_t oReset = nullptr;
 #if MEMENU_GAME
     StretchRect_t oStretchRect = nullptr;
+    SetVertexShaderConstantF_t oSetVertexShaderConstantF = nullptr;
 #endif
     WNDPROC oWndProc = nullptr;
     HWND g_hwnd = nullptr;
@@ -61,13 +63,14 @@ namespace
     std::mutex g_frameMutex;                    // one ImGui frame at a time (EndScene, or a stalled frame)
     std::atomic<bool> g_capture{false};         // copy every frame into g_lastFrame
     IDirect3DSurface9* g_lastFrame = nullptr;
-    unsigned g_stallSeen = 0;
+    unsigned g_stallSeen = 0;                   // EndScene count at the last DrawWhileStalled call
     // Set on the thread drawing a stalled frame. Overlays (Steam's, or whatever else hooks the device) draw inside
     // Present with their own BeginScene/EndScene, which come back into HookedEndScene/HookedReset on this thread while
     // g_frameMutex is held: re-locking it would throw. Those calls go straight to the originals instead.
-    thread_local bool t_stalledDraw = false;                   // EndScene count at the last DrawWhileStalled call
-    int g_stallQuiet = 0;
-    std::atomic<unsigned> g_stalledFrames{0};   // hooks::StalledFrames()                       // calls in a row without an EndScene in between
+    thread_local bool t_stalledDraw = false;
+    int g_stallQuiet = 0;                       // DrawWhileStalled calls in a row without an EndScene in between
+    std::atomic<unsigned> g_stalledFrames{0};   // hooks::StalledFrames()
+    std::atomic<unsigned> g_menuVertices{0};    // hooks::MenuVertices()
 
     std::mutex g_renderQueueMutex;              // hooks::RunOnRenderThread
     std::vector<std::function<void()>> g_renderQueue;
@@ -407,8 +410,43 @@ namespace
         gui::Render();
         ImGui::EndFrame();
         ImGui::Render();
+        g_menuVertices.store(static_cast<unsigned>(ImGui::GetDrawData()->TotalVtxCount), std::memory_order_relaxed);
         ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
     }
+
+    // The game also ends scenes on its own offscreen targets now and then (a 16x16 luminance target, ...). Only the
+    // scene that ends on the back buffer is the frame being presented: drawing the menu into another target would put it
+    // into the game's own textures, and the debug renderer would take the end of that scene for the end of the frame
+    // (and draw twice, or lose the frame's view matrix). Unknown (the calls fail): treated as the back buffer.
+    bool EndsOnBackBuffer(IDirect3DDevice9* dev)
+    {
+        IDirect3DSurface9* rt = nullptr;
+        IDirect3DSurface9* back = nullptr;
+        bool same = true;
+        if (SUCCEEDED(dev->GetRenderTarget(0, &rt)) && rt &&
+            SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) && back)
+            same = rt == back;
+        if (rt) rt->Release();
+        if (back) back->Release();
+        return same;
+    }
+    int g_offscreenInARow = 0;      // EndScenes on other targets since the last one on the back buffer
+
+    // Unloading: the menu's D3D objects (ImGui's font texture and buffers, the debug renderer's vertex buffers and state
+    // block, the captured frame) are released on the render thread, in one last EndScene. Released from the unloading
+    // thread instead, while the game renders on its own, they could corrupt the device: the game then crashed or hung
+    // when it quit (seen with the collision view on).
+    std::atomic<bool> g_releaseRequested{false}, g_released{false};
+
+    void ReleaseDeviceObjects()
+    {
+#if MEMENU_GAME
+        debugrender::OnLostDevice();
+#endif
+        if (g_imguiReady) ImGui_ImplDX9_InvalidateDeviceObjects();
+        ReleaseLastFrame();
+    }
+    bool g_loggedOffscreen = false;
 
     HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
     {
@@ -418,6 +456,32 @@ namespace
         std::lock_guard lock(g_frameMutex);
         if (!g_imguiReady) InitImGui(dev);
         g_device = dev;
+
+        if (g_releaseRequested.load())
+        {
+            if (!g_released.load())
+            {
+                ReleaseDeviceObjects();
+                g_released = true;
+            }
+            return oEndScene(dev);      // Nothing more is drawn
+        }
+
+        // A game that never ends a scene on the back buffer (it would copy into it) still gets the menu: after a few
+        // in a row every one counts, as before.
+        if (EndsOnBackBuffer(dev)) g_offscreenInARow = 0;
+        else if (++g_offscreenInARow <= 8)
+        {
+            if (!g_loggedOffscreen)
+            {
+                g_loggedOffscreen = true;
+                D3DVIEWPORT9 vp{};
+                dev->GetViewport(&vp);
+                HOOKS_LOG(info, "EndScene on an offscreen target ({}x{}): the menu only draws on the back buffer's", vp.Width,
+                          vp.Height);
+            }
+            return oEndScene(dev);
+        }
 
         // modules::Tick() runs on the game thread now (see game::OnTick in dllmain.cpp)
 
@@ -469,6 +533,13 @@ namespace
     {
         debugrender::OnStretchRect(dev, src, dst);
         return oStretchRect(dev, src, srcRect, dst, dstRect, filter);
+    }
+
+    // The engine's shader constants: the debug renderer picks the frame's own view-projection matrix out of them.
+    HRESULT WINAPI HookedSetVertexShaderConstantF(IDirect3DDevice9* dev, UINT start, const float* data, UINT count)
+    {
+        debugrender::OnVertexShaderConstants(start, data, count);
+        return oSetVertexShaderConstantF(dev, start, data, count);
     }
 #endif
 
@@ -571,7 +642,7 @@ bool hooks::Install()
 
     constexpr int kReset = 16, kEndScene = 42;
 #if MEMENU_GAME
-    constexpr int kStretchRect = 34;
+    constexpr int kStretchRect = 34, kSetVertexShaderConstantF = 94;
 #endif
 #if HOOKS_DIAG
     // Where the methods we hook live, and whether something else hooked them first
@@ -598,6 +669,10 @@ bool hooks::Install()
     // Optional: only the collision view's in-scene drawing needs it (it falls back to an overlay).
     if ((st = MH_CreateHook(vt[kStretchRect], reinterpret_cast<void*>(&HookedStretchRect), reinterpret_cast<void**>(&oStretchRect))) != MH_OK)
         HOOKS_LOG(warn, "Hooking StretchRect failed ({}): the collision view will draw as an overlay", MH_StatusToString(st));
+    if ((st = MH_CreateHook(vt[kSetVertexShaderConstantF], reinterpret_cast<void*>(&HookedSetVertexShaderConstantF),
+                            reinterpret_cast<void**>(&oSetVertexShaderConstantF))) != MH_OK)
+        HOOKS_LOG(warn, "Hooking SetVertexShaderConstantF failed ({}): the collision view will use the game camera",
+                  MH_StatusToString(st));
 #endif
 
     // Optional: without these the menu still works, but the game keeps reading the mouse while it is open.
@@ -660,6 +735,7 @@ bool hooks::DrawWhileStalled()
 }
 
 unsigned hooks::StalledFrames() { return g_stalledFrames.load(std::memory_order_relaxed); }
+unsigned hooks::MenuVertices() { return g_menuVertices.load(std::memory_order_relaxed); }
 
 void hooks::RunOnRenderThread(std::function<void()> fn)
 {
@@ -669,6 +745,15 @@ void hooks::RunOnRenderThread(std::function<void()> fn)
 
 void hooks::Uninstall()
 {
+    // The menu's D3D objects go first, on the render thread (see g_releaseRequested). If no frame comes (minimized, a
+    // lost device), they are released here as before.
+#if MEMENU_GAME
+    debugrender::SetActive(false);     // Draws nothing more (it would create its buffers again)
+#endif
+    g_releaseRequested = true;
+    for (int i = 0; i < 200 && !g_released.load() && g_imguiReady; ++i) Sleep(5);
+    if (!g_released.load()) HOOKS_LOG(warn, "No frame within 1 s to release the menu's D3D objects on: releasing them here");
+    else HOOKS_LOG(info, "Released the menu's D3D objects on the render thread");
     MH_DisableHook(MH_ALL_HOOKS);
     Sleep(250);     // Let in-flight hooked calls drain
     {

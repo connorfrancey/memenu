@@ -5,4 +5,5 @@
 namespace notify {
     void Push(std::string text);    // Any thread
     void Draw();                    // Render thread, inside the ImGui frame
+    void SetMuted(bool muted);      // Any thread. Muted: nothing is drawn (the self-test measures what modules draw)
 }

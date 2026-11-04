@@ -36,6 +36,7 @@ constexpr std::uint32_t kEvnt = Tag("EVNT");   // sparse inputs: u32 frame + Eve
 constexpr std::uint32_t kSync = Tag("SYNC");   // Sync per frame
 constexpr std::uint32_t kExtn = Tag("EXTN");   // key/value strings, free for anyone
 constexpr std::uint32_t kCamk = Tag("CAMK");   // camera keys: u32 count + CameraKey, sorted by frame
+constexpr std::uint32_t kMark = Tag("MARK");   // bookmarks: u32 count + (u32 frame, string name), sorted by frame
 constexpr std::uint32_t kEnd  = Tag("END ");
 
 constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
@@ -174,7 +175,33 @@ void Replay::Truncate(std::size_t frame)
     if (sync.size() > frame) sync.resize(frame);
     camera.erase(std::remove_if(camera.begin(), camera.end(), [&](const CameraKey& k) { return k.frame >= frame; }),
                  camera.end());
+    markers.erase(std::remove_if(markers.begin(), markers.end(), [&](const Marker& m) { return m.frame >= frame; }),
+                  markers.end());
     InvalidateSyncFrom(frame);
+}
+
+void Replay::SetMarker(std::uint32_t frame, std::string name)
+{
+    if (name.empty()) name = "Frame " + std::to_string(frame);
+    auto it = std::lower_bound(markers.begin(), markers.end(), frame,
+                               [](const Marker& m, std::uint32_t f) { return m.frame < f; });
+    if (it != markers.end() && it->frame == frame) it->name = std::move(name);
+    else markers.insert(it, Marker{frame, std::move(name)});
+}
+
+bool Replay::EraseMarker(std::uint32_t frame)
+{
+    const auto it = std::find_if(markers.begin(), markers.end(), [&](const Marker& m) { return m.frame == frame; });
+    if (it == markers.end()) return false;
+    markers.erase(it);
+    return true;
+}
+
+const Marker* Replay::MarkerAt(std::uint32_t frame) const
+{
+    for (const Marker& m : markers)
+        if (m.frame == frame) return &m;
+    return nullptr;
 }
 
 void Replay::InsertFrames(std::size_t at, std::size_t count, float dt)
@@ -187,6 +214,8 @@ void Replay::InsertFrames(std::size_t at, std::size_t count, float dt)
     if (!sync.empty()) sync.insert(sync.begin() + std::min(at, sync.size()), count, Sync{});
     for (CameraKey& k : camera)
         if (k.frame >= at) k.frame += static_cast<std::uint32_t>(count);
+    for (Marker& m : markers)
+        if (m.frame >= at) m.frame += static_cast<std::uint32_t>(count);
     InvalidateSyncFrom(at);
 }
 
@@ -205,6 +234,15 @@ void Replay::EraseFrames(std::size_t at, std::size_t count)
                  camera.end());
     for (CameraKey& k : camera)
         if (k.frame >= at + count) k.frame -= static_cast<std::uint32_t>(count);
+    // A bookmark on an erased frame moves to the first frame after the cut (it still marks that point of the run)
+    for (Marker& m : markers)
+        if (m.frame >= at + count) m.frame -= static_cast<std::uint32_t>(count);
+        else if (m.frame >= at) m.frame = static_cast<std::uint32_t>(at);
+    for (std::size_t i = markers.size(); i-- > 1;)
+        if (markers[i].frame == markers[i - 1].frame) markers.erase(markers.begin() + static_cast<std::ptrdiff_t>(i));
+    if (!markers.empty() && markers.back().frame >= frames.size())
+        markers.erase(std::remove_if(markers.begin(), markers.end(), [&](const Marker& m) { return m.frame >= frames.size(); }),
+                      markers.end());
     InvalidateSyncFrom(at);
 }
 
@@ -360,6 +398,16 @@ bool Replay::Save(const std::filesystem::path& path, std::string* error) const
         w.End();
     }
 
+    if (!markers.empty()) {
+        w.Begin(kMark);
+        w.Put(static_cast<std::uint32_t>(markers.size()));
+        for (const Marker& m : markers) {
+            w.Put(m.frame);
+            w.Str(m.name);
+        }
+        w.End();
+    }
+
     if (!extensions.empty()) {
         w.Begin(kExtn);
         w.Put(static_cast<std::uint32_t>(extensions.size()));
@@ -483,6 +531,14 @@ bool Replay::Load(const std::filesystem::path& path, std::string* error)
                 ok = c.Get(k) && static_cast<std::uint8_t>(k.ease) <= static_cast<std::uint8_t>(Ease::Hold);
                 rep.camera.push_back(k);
             }
+        } else if (tag == kMark) {
+            std::uint32_t n = 0;
+            ok = c.Get(n);
+            for (std::uint32_t i = 0; ok && i < n; ++i) {
+                Marker m;
+                ok = c.Get(m.frame) && c.Str(m.name);
+                rep.markers.push_back(std::move(m));
+            }
         } else if (tag == kExtn) {
             std::uint32_t n = 0;
             ok = c.Get(n);
@@ -524,6 +580,11 @@ bool Replay::Load(const std::filesystem::path& path, std::string* error)
         }
     }
     rep.syncValidUntil = std::min<std::uint32_t>(rep.syncValidUntil, frameCount);
+    // Bookmarks are only notes: bad ones are dropped, not an error
+    std::vector<Marker> marks;
+    marks.swap(rep.markers);
+    for (Marker& m : marks)
+        if (m.frame < frameCount && !rep.MarkerAt(m.frame)) rep.SetMarker(m.frame, std::move(m.name));
 
     *this = std::move(rep);
     return true;
@@ -578,6 +639,11 @@ bool Replay::ExportJson(const std::filesystem::path& path, std::string* error) c
         for (const CameraKey& k : camera)
             keys.push_back({{"frame", k.frame}, {"yaw", k.yaw}, {"pitch", k.pitch}, {"ease", EaseName(k.ease)}});
         j["camera"] = std::move(keys);
+    }
+    if (!markers.empty()) {
+        json marks = json::array();
+        for (const Marker& m : markers) marks.push_back({{"frame", m.frame}, {"name", m.name}});
+        j["markers"] = std::move(marks);
     }
 
     std::ofstream out(path, std::ios::trunc);
@@ -687,6 +753,12 @@ bool Replay::ImportJson(const std::filesystem::path& path, std::string* error)
             for (std::size_t i = rep.camera.size(); i-- > 1;)
                 if (rep.camera[i].frame == rep.camera[i - 1].frame) rep.camera.erase(rep.camera.begin() + i - 1);
         }
+        if (j.contains("markers") && j["markers"].is_array())
+            for (const json& m : j["markers"]) {
+                if (!m.is_object() || !m.contains("frame")) continue;
+                const auto frame = m["frame"].get<std::uint32_t>();
+                if (frame < frameCount) rep.SetMarker(frame, m.value("name", std::string()));
+            }
         rep.syncValidUntil = 0;
         *this = std::move(rep);
         return true;

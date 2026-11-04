@@ -1,8 +1,10 @@
 #include "debug_world.h"
 #include "game.h"
+#include "game/uobject.h"
 #include "levels.h"
 #include "paths.h"
 #include "render/debug_renderer.h"
+#include "render/geometry.h"
 #include "render/mesh.h"
 
 #include <Windows.h>
@@ -33,12 +35,15 @@ namespace debugworld
         using Clock = std::chrono::steady_clock;
         namespace fs = std::filesystem;
 
-        enum class Kind : std::uint8_t { None, Cylinder, Brush };
+        // Components this view can draw: cylinders, brushes (volumes), and the box/sphere shapes some actors use to show
+        // an area (AI grenade areas, radial impulses, ...).
+        enum class Kind : std::uint8_t { None, Cylinder, Brush, DrawBox, DrawSphere };
         enum class ShapeType : std::uint8_t { Box, Sphere, Capsule, Cylinder, Mesh };
 
         constexpr int kNoCategory = -1;      // Not something this view shows (static meshes, world geometry, ...)
         const char* const kCategoryNames[kCategoryCount] = {
-            "triggers", "kill zones", "checkpoints", "blocking", "movement", "volumes", "cylinders"
+            "triggers", "kill zones", "checkpoints", "blocking", "movement", "volumes", "cylinders",
+            "spawns", "pickups", "AI", "navigation"
         };
 
         // A volume, remembered in world space: everything needed to draw it without touching the game again.
@@ -81,11 +86,31 @@ namespace debugworld
         std::uint64_t g_scanCount = 0;
         double g_lastScanMs = 0.0;
 
+        // Live cylinders (pawns and other moving actors). They move, so they are drawn every tick from a list of their
+        // components, and not with the rest at the update rate (a pawn running past would lag behind its cylinder).
+        // The list is found by walking the object list a slice per tick, never all at once (a full walk is a hitch).
+        struct LiveCylinder
+        {
+            Classes::UPrimitiveComponent* component = nullptr;
+            std::size_t index = 0;          // In the object list: checked before every use (game::AliveAt)
+        };
+        constexpr std::size_t kCylinderScanPerTick = 2500;     // ~100k objects: the whole list in about a second
+        std::vector<LiveCylinder> g_cylinders;          // The last complete walk
+        std::vector<LiveCylinder> g_cylindersNext;      // The walk in progress
+        std::size_t g_cylinderScanAt = 0;
+        bool g_cylindersShown = false;                  // Something was published to debugrender::SetDynamic
+        std::vector<std::string> g_shapeNames;          // Lower-case name of each g_shapes entry's component
+        std::size_t g_shapeNamesFor = ~std::size_t{0};  // g_shapes.size() they were made for
+        int g_lookShape = -1;                           // g_shapes index under the crosshair, -1: none
+
+
         std::mutex g_infoMutex;
         Info g_info;
 
         constexpr std::uint32_t kCacheMagic = 0x4356454Du; // "MEVC"
-        constexpr std::uint32_t kCacheVersion = 1;
+        // 2: AI-only volumes have their own category (were blocking/movement); spawns, pickups, navigation points and
+        // box/sphere components are remembered. Older files are ignored and the level is read again.
+        constexpr std::uint32_t kCacheVersion = 2;
         constexpr double kSlowMs = 50.0;
 
         bool Has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
@@ -96,9 +121,22 @@ namespace debugworld
             return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
         }
 
+        // Volumes and areas only AI cares about: they don't block or affect the player (an AI blocking volume is not a
+        // wall for Faith), so they are kept apart from the blocking and movement volumes.
+        bool IsAiOnly(const std::string& name)
+        {
+            static const char* const ai[] = {
+                "TdAIBlockingVolume", "TdAIPawnBlockingVolume", "TdAIKeepMovingVolume", "PathBlockingVolume",
+                "PathLimitsVolume", "CoverGroupVolume", "GrenadeArea", "GrenadeTargetArea", "ExplosiveTargetArea"
+            };
+            for (const char* a : ai) if (Has(name, a)) return true;
+            return false;
+        }
+
         int Classify(const std::string& name)
         {
             if (Has(name, "KillVolume") || Has(name, "KillZone")) return static_cast<int>(Category::Kill);
+            if (IsAiOnly(name)) return static_cast<int>(Category::AI);
             if (Has(name, "Trigger")) return static_cast<int>(Category::Trigger);
             if (Has(name, "Checkpoint")) return static_cast<int>(Category::Checkpoint);
             if (Has(name, "BlockingVolume")) return static_cast<int>(Category::Blocking);
@@ -106,12 +144,25 @@ namespace debugworld
             {
                 static const char* const movement[] = {
                     "Movement", "Ladder", "Zipline", "Swing", "BalanceWalk", "LedgeWalk",
-                    "BarbedWire", "FallHeight", "PhysicsVolume", "WaterVolume", "GravityVolume",
-                    "AIKeepMoving"
+                    "BarbedWire", "FallHeight", "PhysicsVolume", "WaterVolume", "GravityVolume"
                 };
                 for (const char* m : movement) if (Has(name, m)) return static_cast<int>(Category::Movement);
                 return static_cast<int>(Category::Volume);
             }
+            return kNoCategory;
+        }
+
+        // Actors that aren't volumes, by what they derive from (a level's subclasses have all sorts of names). Only asked
+        // when the name didn't place them. Everything left is drawn live, as a cylinder (pawns, dropped weapons, ...).
+        int ClassifyActor(Classes::UObject* o)
+        {
+            using namespace Classes;
+            if (game::IsA(o, APlayerStart::StaticClass())) return static_cast<int>(Category::Spawn);
+            if (game::IsA(o, APickupFactory::StaticClass()) || game::IsA(o, ATdStashpoint::StaticClass()))
+                return static_cast<int>(Category::Pickup);
+            if (game::IsA(o, ALadder::StaticClass()) || game::IsA(o, ATeleporter::StaticClass()))
+                return static_cast<int>(Category::Movement);
+            if (game::IsA(o, ANavigationPoint::StaticClass())) return static_cast<int>(Category::Navigation);
             return kNoCategory;
         }
 
@@ -127,13 +178,19 @@ namespace debugworld
             const std::string className = o->Class ? o->Class->GetName() : std::string();
             info.category = Classify(className);
             info.skip = Has(className, "DefaultPhysicsVolume");
-            if (EndsWith(className, "CylinderComponent")) info.kind = Kind::Cylinder;
+            if (EndsWith(className, "DrawCylinderComponent")) info.kind = Kind::None;     // A cone: no shape for it
+            else if (EndsWith(className, "CylinderComponent")) info.kind = Kind::Cylinder;
             else if (EndsWith(className, "BrushComponent")) info.kind = Kind::Brush;
+            else if (EndsWith(className, "DrawBoxComponent")) info.kind = Kind::DrawBox;
+            else if (EndsWith(className, "DrawSphereComponent")) info.kind = Kind::DrawSphere;
+            if (info.kind == Kind::None && info.category == kNoCategory && !EndsWith(className, "Component"))
+                info.category = ClassifyActor(o);
 
             if (info.kind != Kind::None || info.category != kNoCategory || info.skip)
                 spdlog::debug("Debug world: classified '{}' (skip={}, category={}, kind={})", className, info.skip,
                               info.category == kNoCategory ? "-" : kCategoryNames[info.category],
-                              info.kind == Kind::Cylinder ? "cylinder" : info.kind == Kind::Brush ? "brush" : "-");
+                              info.kind == Kind::Cylinder ? "cylinder" : info.kind == Kind::Brush ? "brush" :
+                              info.kind == Kind::DrawBox ? "box" : info.kind == Kind::DrawSphere ? "sphere" : "-");
             return g_classes.emplace(o->Class, info).first->second;
         }
 
@@ -222,8 +279,31 @@ namespace debugworld
             if (radius <= 0.f && center.x == 0.f && center.y == 0.f && center.z == 0.f) center = ownerLocation;
             if (!FiniteVec(center) || !std::isfinite(radius) || radius > 100000.f) return 0; // Unregistered / world-sized
 
+            // Sizes the shape components report must be real ones (they can be left at 0)
+            const auto sane = [](float f) { return std::isfinite(f) && f > 0.5f && f < 100000.f; };
+
             const std::size_t first = out.size();
-            if (kind == Kind::Cylinder)
+            if (kind == Kind::DrawBox)
+            {
+                const auto& e = static_cast<Classes::UDrawBoxComponent*>(pc)->BoxExtent;
+                if (!sane(e.X) || !sane(e.Y) || !sane(e.Z)) return 0;
+                Shape s;
+                s.type = ShapeType::Box;
+                s.world = l2w;
+                s.a = e.X; s.b = e.Y; s.c = e.Z;
+                out.push_back(std::move(s));
+            }
+            else if (kind == Kind::DrawSphere)
+            {
+                const float r = static_cast<Classes::UDrawSphereComponent*>(pc)->SphereRadius;
+                if (!sane(r)) return 0;
+                Shape s;
+                s.type = ShapeType::Sphere;
+                s.world = l2w;
+                s.a = r;
+                out.push_back(std::move(s));
+            }
+            else if (kind == Kind::Cylinder)
             {
                 auto* cyl = static_cast<Classes::UCylinderComponent*>(pc);
                 Shape s;
@@ -256,6 +336,78 @@ namespace debugworld
             }
             if (out.size() > first) out[first].name = label;
             return out.size() - first;
+        }
+
+        // Where the ray first hits the shape (t >= 0), < 0 for a miss. A ray starting inside hits at 0.
+        float RayShape(const Shape& s, rmath::Vec3 o, rmath::Vec3 d)
+        {
+            // A hull's triangles would report where the ray leaves it: starting inside is a hit at 0, like the others
+            if (s.type == ShapeType::Mesh)
+                return rgeom::InConvex(o, s.verts, s.idx) ? 0.f : rgeom::RayTriangles(o, d, s.verts, s.idx);
+            rmath::Mat4 inv;
+            if (!rgeom::InverseAffine(s.world, inv)) return rgeom::kNoHit;
+            const rmath::Vec3 lo = rmath::TransformPoint(inv, o), ld = rgeom::TransformDir(inv, d);
+            switch (s.type)
+            {
+                case ShapeType::Box:      return rgeom::RayBox(lo, ld, {s.a, s.b, s.c});
+                case ShapeType::Sphere:   return rgeom::RaySphere(lo, ld, {}, s.a);
+                case ShapeType::Capsule:  return rgeom::RayCapsule(lo, ld, s.a, s.b);
+                case ShapeType::Cylinder: return rgeom::RayCylinder(lo, ld, s.a, s.b);
+                default:                  return rgeom::kNoHit;
+            }
+        }
+
+        bool Contains(const Shape& s, rmath::Vec3 p)
+        {
+            if (rmath::Length(p - s.center) > s.radius + 1.f) return false;
+            if (s.type == ShapeType::Mesh) return rgeom::InConvex(p, s.verts, s.idx);
+            rmath::Mat4 inv;
+            if (!rgeom::InverseAffine(s.world, inv)) return false;
+            const rmath::Vec3 l = rmath::TransformPoint(inv, p);
+            switch (s.type)
+            {
+                case ShapeType::Box:      return rgeom::InBox(l, {s.a, s.b, s.c});
+                case ShapeType::Sphere:   return rgeom::InSphere(l, s.a);
+                case ShapeType::Capsule:  return rgeom::InCapsule(l, s.a, s.b);
+                case ShapeType::Cylinder: return rgeom::InCylinder(l, s.a, s.b);
+                default:                  return false;
+            }
+        }
+
+        std::string LowerCase(std::string s)
+        {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return s;
+        }
+
+        // Scales the alpha of the vertices from `from` on (fading a shape out with distance).
+        void FadeFrom(std::vector<rmesh::Vertex>& v, std::size_t from, float alpha)
+        {
+            for (std::size_t i = from; i < v.size(); ++i)
+            {
+                const auto a = static_cast<std::uint32_t>(static_cast<float>(v[i].color >> 24) * alpha + 0.5f);
+                v[i].color = (v[i].color & 0x00FFFFFFu) | (std::min<std::uint32_t>(a, 255u) << 24);
+            }
+        }
+
+        // Names follow the component's first shape; the rest of its shapes have none.
+        void RefreshShapeNames()
+        {
+            if (g_shapeNamesFor == g_shapes.size()) return;
+            g_shapeNames.assign(g_shapes.size(), std::string());
+            std::string current;
+            for (std::size_t i = 0; i < g_shapes.size(); ++i)
+            {
+                if (!g_shapes[i].name.empty()) current = g_shapes[i].name;
+                g_shapeNames[i] = current;
+            }
+            g_shapeNamesFor = g_shapes.size();
+        }
+
+        bool Passes(const Config& cfg, std::size_t i)
+        {
+            if (!cfg.enabled[g_shapes[i].category]) return false;
+            return cfg.filter.empty() || LowerCase(g_shapeNames[i]).find(cfg.filter) != std::string::npos;
         }
 
         void Build(rmesh::Builder& b, const Shape& s)
@@ -507,7 +659,7 @@ namespace debugworld
         // Story order; maps not in it come after, in the game's order.
         int StoryRank(const std::string& file)
         {
-            static const char* const order[] = {"edge_p", "escape_p", "stormdrain_p", "cranes_p", "subway_p",
+            static const char* const order[] = {"edge_p", "escape_p", "stromdrain_p", "cranes_p", "subway_p",
                                                 "mall_p", "factory_p", "boat_p", "convoy_p", "scraper_p"};
             for (int i = 0; i < static_cast<int>(std::size(order)); ++i)
                 if (file == order[i]) return i;
@@ -515,14 +667,23 @@ namespace debugworld
         }
 
         fs::path BakedMarker(const std::string& map) { return paths::Dir() / "cache" / (map + ".baked"); }
+        // What a .baked file holds: the cache version it was baked with. Older bakes (just "baked") don't count: their
+        // cache files are no longer read.
+        const std::string kBakedMarker = "baked " + std::to_string(kCacheVersion);
 
-        // Lower-case names of the maps that have been baked completely.
+        // Lower-case names of the maps that have been baked completely, with this cache version.
         std::unordered_set<std::string> BakedMaps()
         {
             std::unordered_set<std::string> out;
             std::error_code ec;
             for (fs::directory_iterator it(paths::Dir() / "cache", ec), end; !ec && it != end; it.increment(ec))
-                if (it->path().extension() == ".baked") out.insert(Lower(it->path().stem().string()));
+            {
+                if (it->path().extension() != ".baked") continue;
+                std::ifstream in(it->path());
+                std::string text;
+                std::getline(in, text);
+                if (text == kBakedMarker) out.insert(Lower(it->path().stem().string()));
+            }
             return out;
         }
 
@@ -576,7 +737,7 @@ namespace debugworld
             {
                 if (g_bake.mapOk && !g_map.empty())
                 {
-                    std::ofstream(BakedMarker(g_map)) << "baked\n";
+                    std::ofstream(BakedMarker(g_map)) << kBakedMarker << '\n';
                     spdlog::info("Debug world: '{}' baked ({} volumes)", g_map, g_shapes.size());
                 }
                 g_bake.mapOk = true;
@@ -659,6 +820,208 @@ namespace debugworld
     }
 
     // =================================================================================================================
+    namespace
+    {
+        void ClearCylinders()
+        {
+            g_cylinders.clear();
+            g_cylindersNext.clear();
+            g_cylinderScanAt = 0;
+            if (g_cylindersShown) debugrender::SetDynamic({});
+            g_cylindersShown = false;
+        }
+
+        // A slice of the object list: cylinder components of actors that aren't remembered volumes.
+        void ScanCylinders()
+        {
+            const auto& objects = Classes::UObject::GetGlobalObjects();
+            const std::size_t n = objects.Num();
+            const std::size_t end = std::min(n, g_cylinderScanAt + kCylinderScanPerTick);
+            // Objects of one class tend to sit together: remember the last class instead of a map lookup for each
+            Classes::UClass* lastClass = nullptr;
+            bool lastIsCylinder = false;
+            for (std::size_t i = g_cylinderScanAt; i < end; ++i)
+            {
+                Classes::UObject* o = objects.GetByIndex(i);
+                if (!o || !o->Class) continue;
+                if (o->Class != lastClass)
+                {
+                    lastClass = o->Class;
+                    lastIsCylinder = ClassOf(o).kind == Kind::Cylinder;
+                }
+                if (!lastIsCylinder) continue;
+                auto* pc = static_cast<Classes::UPrimitiveComponent*>(o);
+                Classes::AActor* owner = pc->Owner;
+                if (!owner || !owner->Class || owner->bDeleteMe) continue;
+                const ClassInfo& ownerInfo = ClassOf(owner);
+                if (ownerInfo.skip || ownerInfo.category != kNoCategory) continue;   // Those are remembered volumes
+                g_cylindersNext.push_back({pc, i});
+            }
+            g_cylinderScanAt = end;
+            if (end >= n)
+            {
+                g_cylinders.swap(g_cylindersNext);
+                g_cylindersNext.clear();
+                g_cylinderScanAt = 0;
+            }
+        }
+
+        // Every tick: the cylinders where they are now. The local player's own is left out: the camera is inside it, and
+        // its walls would sweep across the screen as you move.
+        std::size_t DrawCylinders(const Config& cfg, const rmath::Camera& cam, rmesh::MeshData& mesh)
+        {
+            constexpr auto kCyl = static_cast<std::size_t>(Category::Cylinder);
+            if (!cfg.enabled[kCyl] || !cam.valid) return 0;
+            ScanCylinders();
+
+            const Classes::AActor* self = game::Pawn();
+            std::size_t drawn = 0;
+            rmesh::Builder builder(mesh);
+            rmesh::Style style;
+            style.color = cfg.colors[kCyl];
+            style.fill = cfg.style != DrawStyle::Wireframe;
+            style.outline = cfg.style != DrawStyle::Solid;
+            builder.SetStyle(style);
+            std::vector<Shape> tmp;
+            for (const LiveCylinder& c : g_cylinders)
+            {
+                if (!game::AliveAt(c.component, c.index)) continue;
+                Classes::AActor* owner = c.component->Owner;
+                if (!owner || owner->bDeleteMe || (owner == self && !cfg.ownCylinder)) continue;
+                tmp.clear();
+                if (Extract(c.component, Kind::Cylinder, static_cast<int>(kCyl), std::string(), ToVec3(owner->Location), tmp) == 0)
+                    continue;
+                if (rmath::Length(tmp[0].center - cam.pos) - tmp[0].radius > cfg.maxDistance) continue;
+                if (owner == self)
+                {
+                    // The camera is inside it: only its outline, or its walls would cover the screen
+                    rmesh::Style own = style;
+                    own.fill = false;
+                    own.outline = true;
+                    builder.SetStyle(own);
+                    Build(builder, tmp[0]);
+                    builder.SetStyle(style);
+                }
+                else Build(builder, tmp[0]);
+                ++drawn;
+            }
+            return drawn;
+        }
+
+        // The volume under the crosshair, and the ones the player is in. Every tick: a bounding sphere test first, so
+        // only the few volumes near the view ray or the player are looked at closely.
+        void Inspect(const Config& cfg, const rmath::Camera& cam, rmesh::MeshData& dynamic)
+        {
+            Info::Look look;
+            std::vector<std::pair<std::string, int>> inside;
+            g_lookShape = -1;
+            if (cfg.inspect && cam.valid)
+            {
+                RefreshShapeNames();
+                const rmath::Mat4 r = rmath::RotationMatrix(cam.pitch, cam.yaw, cam.roll);
+                const rmath::Vec3 dir{r.m[0][0], r.m[0][1], r.m[0][2]};
+                float best = cfg.maxDistance;
+                std::vector<std::pair<std::size_t, float>> hits;     // Every volume the view ray hits: shape, t
+                const auto* pawn = game::Pawn();
+                const rmath::Vec3 at = pawn ? ToVec3(pawn->Location) : cam.pos;
+                std::string lastInside;
+                for (std::size_t i = 0; i < g_shapes.size(); ++i)
+                {
+                    const Shape& s = g_shapes[i];
+                    if (!cfg.enabled[s.category]) continue;
+                    if (Contains(s, at) && g_shapeNames[i] != lastInside && inside.size() < 12)
+                    {
+                        lastInside = g_shapeNames[i];
+                        inside.emplace_back(lastInside, s.category);
+                    }
+                    if (!Passes(cfg, i)) continue;
+                    const float sphere = rgeom::RaySphere(cam.pos, dir, s.center, s.radius);
+                    if (sphere < 0.f || sphere > best) continue;
+                    const float t = RayShape(s, cam.pos, dir);
+                    if (t <= 0.f || t >= cfg.maxDistance) continue;  // 0: the camera is inside it (that's the inside list)
+                    hits.push_back({i, t});
+                    if (t < best) { best = t; g_lookShape = static_cast<int>(i); }
+                }
+                if (cfg.nearby)
+                {
+                    std::vector<Info::Near> all;
+                    for (std::size_t i = 0; i < g_shapes.size(); ++i)
+                    {
+                        const Shape& s = g_shapes[i];
+                        if (s.name.empty() || !Passes(cfg, i)) continue;     // One per component: its first shape
+                        // 0 only when really inside (any of its shapes); else to its center
+                        const float toCenter = rmath::Length(s.center - at);
+                        if (toCenter - s.radius > cfg.maxDistance) continue;
+                        bool in = false;
+                        for (std::size_t j = i; j < g_shapes.size() && !in && g_shapeNames[j] == g_shapeNames[i]; ++j)
+                            in = (j == i || g_shapes[j].name.empty()) && Contains(g_shapes[j], at);
+                        const float d = in ? 0.f : toCenter;
+                        all.push_back({g_shapeNames[i], s.category, d, s.center.x, s.center.y, s.center.z});
+                    }
+                    const std::size_t n = std::min<std::size_t>(all.size(), 8);
+                    std::partial_sort(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(n), all.end(),
+                                      [](const Info::Near& a, const Info::Near& b) { return a.distance < b.distance; });
+                    all.resize(n);
+                    std::lock_guard lock(g_infoMutex);
+                    g_info.nearby = std::move(all);
+                }
+                if (g_lookShape >= 0)
+                {
+                    const Shape& s = g_shapes[static_cast<std::size_t>(g_lookShape)];
+                    look.valid = true;
+                    look.name = g_shapeNames[static_cast<std::size_t>(g_lookShape)];
+                    look.category = s.category;
+                    look.distance = best;
+                    look.size = s.radius * 2.f;
+                    const rmath::Vec3 hit = cam.pos + dir * best;
+                    look.x = hit.x; look.y = hit.y; look.z = hit.z;
+                    std::sort(hits.begin(), hits.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+                    for (const auto& [j, tj] : hits)
+                    {
+                        if (look.behind.size() >= 4) break;
+                        const std::string& name = g_shapeNames[j];
+                        const bool seen = name == look.name || std::any_of(look.behind.begin(), look.behind.end(),
+                                                                           [&](const auto& b) { return b.first == name; });
+                        if (!seen) look.behind.emplace_back(name, tj);
+                    }
+
+                    if (cfg.highlight)
+                    {
+                        // Every shape of the component, as a white outline
+                        rmesh::Builder builder(dynamic);
+                        rmesh::Style hl;
+                        hl.color = 0xFFFFFFFFu;
+                        hl.fill = false;
+                        hl.outline = true;
+                        builder.SetStyle(hl);
+                        for (std::size_t i = 0; i < g_shapes.size(); ++i)
+                            if (g_shapeNames[i] == look.name && rmath::Length(g_shapes[i].center - s.center) < 1.f + s.radius + g_shapes[i].radius)
+                                Build(builder, g_shapes[i]);
+                    }
+                }
+            }
+            std::lock_guard lock(g_infoMutex);
+            g_info.look = std::move(look);
+            g_info.inside = std::move(inside);
+        }
+
+        // Every tick: the moving and inspected geometry, published together.
+        void UpdateDynamic(const Config& cfg, const rmath::Camera& cam)
+        {
+            rmesh::MeshData mesh;
+            const std::size_t cylinders = DrawCylinders(cfg, cam, mesh);
+            Inspect(cfg, cam, mesh);
+            {
+                std::lock_guard lock(g_infoMutex);
+                g_info.drawn[static_cast<std::size_t>(Category::Cylinder)] = cylinders;
+                g_info.remembered[static_cast<std::size_t>(Category::Cylinder)] = g_cylinders.size();
+            }
+            const bool any = !mesh.tris.empty() || !mesh.lines.empty();
+            if (any || g_cylindersShown) debugrender::SetDynamic(std::move(mesh));
+            g_cylindersShown = any;
+        }
+    }
+
     void Update(const Config& cfg)
     {
         TickBake();
@@ -670,6 +1033,7 @@ namespace debugworld
                 spdlog::info("Debug world: paused ({})", !game::Ready() ? "game not ready" : "game is loading");
                 g_waitingForGame = true;
             }
+            ClearCylinders();       // Their objects go with the level
             return;
         }
         if (g_waitingForGame)
@@ -689,7 +1053,7 @@ namespace debugworld
             if (g_cacheDirty && cfg.useCache) SaveCache(g_map);
             spdlog::info("Debug world: level '{}' (was '{}')", map, g_map.empty() ? "none" : g_map);
             g_map = map;
-            g_shapes.clear();
+            g_shapes.clear(); g_shapeNamesFor = ~std::size_t{0};
             g_keys.clear();
             g_cacheDirty = false;
             g_fromDisk = cfg.useCache && LoadCache(map);
@@ -697,6 +1061,7 @@ namespace debugworld
             g_forceScan = !g_fromDisk || cfg.scanCached;
             g_dirty = true;
             debugrender::SetScene(nullptr);
+            ClearCylinders();
         }
 
         // ---- Look for volumes that are not remembered yet --------------------------------------------------------------
@@ -720,6 +1085,7 @@ namespace debugworld
             g_fromDisk = true;
         }
         PublishInfo();
+        UpdateDynamic(cfg, game::GetCamera());
 
         // ---- Rebuild the scene ------------------------------------------------------------------------------------------
         const double interval = 1.0 / std::clamp(cfg.updateHz, 0.5f, 30.f);
@@ -755,45 +1121,42 @@ namespace debugworld
         bool capHit = false;
 
         // Remembered volumes: just a distance test, then geometry. No contact with the game.
-        for (const Shape& s : g_shapes)
+        RefreshShapeNames();
+        std::array<std::size_t, kCategoryCount> remembered{};
+        const float fadeFrom = cfg.maxDistance * 0.75f;     // The last quarter of the range fades out
+        for (std::size_t i = 0; i < g_shapes.size(); ++i)
         {
-            if (!cfg.enabled[s.category]) continue;
-            if (rmath::Length(s.center - cam.pos) - s.radius > cfg.maxDistance) { ++culled; continue; }
+            const Shape& s = g_shapes[i];
+            if (!s.name.empty()) ++remembered[s.category];      // Components, not shapes
+            if (!Passes(cfg, i)) continue;
+            const float distance = rmath::Length(s.center - cam.pos) - s.radius;
+            if (distance > cfg.maxDistance) { ++culled; continue; }
             if (scene->mesh.tris.size() + scene->mesh.lines.size() > kMaxVertices) { capHit = true; break; }
 
+            const std::size_t tris = scene->mesh.tris.size(), lines = scene->mesh.lines.size();
             builder.SetStyle(styleFor(s.category));
             Build(builder, s);
-            ++perCategory[s.category];
+            if (cfg.fade && distance > fadeFrom)
+            {
+                const float alpha = std::clamp((cfg.maxDistance - distance) / (cfg.maxDistance - fadeFrom), 0.f, 1.f);
+                FadeFrom(scene->mesh.tris, tris, alpha);
+                FadeFrom(scene->mesh.lines, lines, alpha);
+            }
+            if (!s.name.empty()) ++perCategory[s.category];
             addLabel(s, cfg.colors[s.category]);
         }
-
-        // Live cylinders (pawns and other moving actors) are looked up every rebuild: they are not static.
-        constexpr auto kCyl = static_cast<std::size_t>(Category::Cylinder);
-        if (cfg.enabled[kCyl])
         {
-            const auto& objects = Classes::UObject::GetGlobalObjects();
-            std::vector<Shape> tmp;
-            for (std::size_t i = 0; i < objects.Num(); ++i)
-            {
-                Classes::UObject* o = objects.GetByIndex(i);
-                if (!o || !o->Class) continue;
-                const ClassInfo& compInfo = ClassOf(o);
-                if (compInfo.kind != Kind::Cylinder) continue;
-
-                auto* pc = static_cast<Classes::UPrimitiveComponent*>(o);
-                Classes::AActor* owner = pc->Owner;
-                if (!owner || !owner->Class || owner->bDeleteMe) continue;
-                const ClassInfo& ownerInfo = ClassOf(owner);
-                if (ownerInfo.skip || ownerInfo.category != kNoCategory) continue;   // Those are remembered above
-
-                tmp.clear();
-                if (Extract(pc, Kind::Cylinder, static_cast<int>(kCyl), std::string(), ToVec3(owner->Location), tmp) == 0) continue;
-                if (rmath::Length(tmp[0].center - cam.pos) - tmp[0].radius > cfg.maxDistance) { ++culled; continue; }
-                builder.SetStyle(styleFor(static_cast<int>(kCyl)));
-                Build(builder, tmp[0]);
-                ++perCategory[kCyl];
-            }
+            std::lock_guard lock(g_infoMutex);
+            for (int c = 0; c < kCategoryCount; ++c)
+                if (c != static_cast<int>(Category::Cylinder))
+                {
+                    g_info.drawn[static_cast<std::size_t>(c)] = perCategory[static_cast<std::size_t>(c)];
+                    g_info.remembered[static_cast<std::size_t>(c)] = remembered[static_cast<std::size_t>(c)];
+                }
         }
+
+        // Live cylinders are drawn every tick on their own (DrawCylinders).
+        perCategory[static_cast<std::size_t>(Category::Cylinder)] = g_cylinders.size();
 
         scene->shapes = builder.Shapes();
         scene->buildMs = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
@@ -828,6 +1191,7 @@ namespace debugworld
     {
         spdlog::info("Debug world: scene cleared ({} volumes stay remembered)", g_shapes.size());
         debugrender::SetScene(nullptr);
+        ClearCylinders();
         g_dirty = true;
     }
 
@@ -848,7 +1212,7 @@ namespace debugworld
                 fs::remove(CachePath(g_map), ec);
                 fs::remove(BakedMarker(g_map), ec);
             }
-            g_shapes.clear();
+            g_shapes.clear(); g_shapeNamesFor = ~std::size_t{0};
             g_keys.clear();
             g_cacheDirty = false;
             g_fromDisk = false;
@@ -914,6 +1278,29 @@ namespace debugworld
             FinishBake("cancelled after " + std::to_string(g_bake.job) + " of " + std::to_string(g_bake.jobs.size()) +
                        " checkpoints", true);
         });
+    }
+
+    void FaceTowards(float x, float y, float z)
+    {
+        game::RunOnGameThread([x, y, z] {
+            auto* pc = game::Controller();
+            const rmath::Camera cam = game::GetCamera();
+            if (!pc || !cam.valid) return;
+            const rmath::Vec3 d = rmath::Vec3{x, y, z} - cam.pos;
+            const float k = 32768.f / rmath::kPi;
+            const float yaw = std::atan2(d.y, d.x) * k;
+            const float pitch = std::clamp(std::atan2(d.z, std::sqrt(d.x * d.x + d.y * d.y)) * k, -16000.f, 16000.f);
+            pc->Rotation.Yaw = static_cast<unsigned>(static_cast<int>(std::lround(yaw)));
+            pc->Rotation.Pitch = static_cast<unsigned>(static_cast<int>(std::lround(pitch))) & 0xFFFFu;
+        });
+    }
+
+    const char* CategoryName(int category)
+    {
+        static const char* const names[kCategoryCount] = {"trigger", "kill zone", "checkpoint", "blocking volume",
+                                                          "movement", "volume", "cylinder", "spawn point", "pickup",
+                                                          "AI only", "navigation point"};
+        return category >= 0 && category < kCategoryCount ? names[category] : "?";
     }
 
     Info GetInfo()

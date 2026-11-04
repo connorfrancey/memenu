@@ -51,6 +51,7 @@ void ReplayEditor::Draw(bool& open, const tas::Status& st, const EditorKeys& key
         return;
     }
     tas::WithReplay([&](tas::Replay& r) {
+        History().Watch(r);     // Shared with the timeline: an edit here can be undone there and the other way round
         const auto count = static_cast<long long>(r.frames.size());
         if (follow_ && Running(st) && count > 0) selected_ = std::min(static_cast<long long>(st.frame), count - 1);
         if (selected_ >= count) selected_ = count - 1;
@@ -133,6 +134,7 @@ void ReplayEditor::DrawTransport(tas::Replay& r, const tas::Status& st, const Ed
     if (st.mode == tas::Mode::Playing && running && st.paused && st.frame >= count) {
         ImGui::SameLine();
         if (ImGui::Button("+ Frame & step")) {
+            History().Push(r, "Add a frame");
             r.InsertFrames(r.frames.size(), 1, r.frames.empty() ? NominalDt(r) : r.frames.back().dt);
             selected_ = static_cast<long long>(r.frames.size()) - 1;
             tas::Advance(1);
@@ -219,7 +221,10 @@ void ReplayEditor::DrawInputs(tas::Replay& r, const tas::Status& st)
 
     if (count == 0 || selected_ < 0) {
         ImGui::TextDisabled("No frames yet: record or load a macro, or add frames");
-        if (ImGui::Button("+ Frames")) r.InsertFrames(0, static_cast<std::size_t>(frameCount_), NominalDt(r));
+        if (ImGui::Button("+ Frames")) {
+            History().Push(r, "Add frames");
+            r.InsertFrames(0, static_cast<std::size_t>(frameCount_), NominalDt(r));
+        }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(70.f);
         ImGui::InputInt("##n", &frameCount_, 0, 0);
@@ -272,7 +277,10 @@ void ReplayEditor::DrawInputs(tas::Replay& r, const tas::Status& st)
         ImGui::PushStyleColor(ImGuiCol_Button, held ? KeyColor(label) : ImGui::GetColorU32(ImGuiCol_FrameBg));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, held ? KeyColor(label, 0.8f) : ImGui::GetColorU32(ImGuiCol_FrameBgHovered));
         if (held) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(20, 20, 20, 255));
-        if (ImGui::Button(label.c_str())) tas::timeline::SetHeld(r, name, static_cast<std::uint32_t>(fi), !held);
+        if (ImGui::Button(label.c_str())) {
+            History().Push(r, (held ? "Let go of " : "Hold ") + r.Name(name));
+            tas::timeline::SetHeld(r, name, static_cast<std::uint32_t>(fi), !held);
+        }
         ImGui::PopStyleColor(held ? 3 : 2);
         if (held) {
             for (const Hold& h : holds)
@@ -305,7 +313,9 @@ void ReplayEditor::DrawInputs(tas::Replay& r, const tas::Status& st)
         const int idx = FindName(r, axis);
         float v = idx >= 0 ? tas::timeline::AxisAt(r, fi, static_cast<std::uint16_t>(idx)) : 0.f;
         ImGui::SetNextItemWidth(120.f);
-        if (ImGui::DragFloat(axis, &v, 0.05f, 0.f, 0.f, "%+.3f"))
+        const bool moved = ImGui::DragFloat(axis, &v, 0.05f, 0.f, 0.f, "%+.3f");
+        if (ImGui::IsItemActivated()) History().Push(r, std::string("Change ") + axis);
+        if (moved)
             tas::timeline::SetAxis(r, fi, idx >= 0 ? static_cast<std::uint16_t>(idx) : r.NameIndex(axis), v);
         ImGui::SetItemTooltip("Mouse movement on this frame, as the game got it (0: none)");
         if (std::string(axis) == "MouseX") ImGui::SameLine();
@@ -315,10 +325,13 @@ void ReplayEditor::DrawInputs(tas::Replay& r, const tas::Status& st)
     ImGui::SeparatorText("Frame");
     float ms = r.frames[fi].dt * 1000.f;
     ImGui::SetNextItemWidth(110.f);
-    if (ImGui::InputFloat("ms long", &ms, 0.f, 0.f, "%.4f", ImGuiInputTextFlags_EnterReturnsTrue))
+    if (ImGui::InputFloat("ms long", &ms, 0.f, 0.f, "%.4f", ImGuiInputTextFlags_EnterReturnsTrue)) {
+        History().Push(r, "Frame length");
         r.SetFrameDt(fi, std::clamp(ms, 0.1f, 100.f) / 1000.f);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Add after")) {
+        History().Push(r, "Add frames");
         r.InsertFrames(fi + 1, static_cast<std::size_t>(frameCount_), r.frames[fi].dt);
         selected_ = static_cast<long long>(fi) + 1;
         follow_ = false;
@@ -326,6 +339,7 @@ void ReplayEditor::DrawInputs(tas::Replay& r, const tas::Status& st)
     ImGui::SetItemTooltip("Add frames after this one (keys held here stay held through them)");
     ImGui::SameLine();
     if (ImGui::Button("Delete")) {
+        History().Push(r, "Delete frames");
         r.EraseFrames(fi, static_cast<std::size_t>(frameCount_));
         ImGui::EndDisabled();
         return;
@@ -355,6 +369,7 @@ void ReplayEditor::DrawRaw(tas::Replay& r, std::size_t fi)
         std::snprintf(name, sizeof name, "%s", r.Name(e.name).c_str());
         ImGui::SetNextItemWidth(110.f);
         if (ImGui::InputText("##name", name, sizeof name, ImGuiInputTextFlags_EnterReturnsTrue)) {
+            History().Push(r, "Edit an input");
             e.name = r.NameIndex(name);
             changed = true;
         }
@@ -365,12 +380,15 @@ void ReplayEditor::DrawRaw(tas::Replay& r, std::size_t fi)
         if (ImGui::Combo("##kind", &kind, kinds, 5)) {
             e.kind = kind == 4 ? tas::EventKind::Axis : static_cast<tas::EventKind>(kind);
             changed = true;
+            History().Push(r, "Edit an input");
         }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(75.f);
         changed |= ImGui::DragFloat("##v", &e.value, 0.05f, 0.f, 0.f, "%.3f");
+        if (ImGui::IsItemActivated()) History().Push(r, "Edit an input");     // Once per drag, not every frame of it
         ImGui::SameLine();
         if (ImGui::SmallButton("x")) {
+            History().Push(r, "Delete an input");
             r.EraseEvent(fi, k);
             ImGui::PopID();
             break;
@@ -390,6 +408,7 @@ void ReplayEditor::DrawRaw(tas::Replay& r, std::size_t fi)
             e.kind = kind;
             e.value = kind == tas::EventKind::Axis ? 0.f : 1.f;
             e.value2 = kind == tas::EventKind::Axis ? r.frames[fi].dt : 0.f;
+            History().Push(r, "Add an input");
             r.InsertEvent(fi, r.frames[fi].count, e);
         }
     }

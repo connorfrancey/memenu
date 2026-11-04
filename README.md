@@ -107,6 +107,11 @@ Default keys are in brackets. All of them can be changed.
 **Trainer**: tools from the mmultiplayer trainer
 - **Save State** [4] / **Load State** [5]: remember position, speed, rotation and current move, and go back to it.
 - **Speedometer**: position, speed, angles and more in a small window. Its checkpoint key [3] marks a split.
+- **Speedrun Timer**: a load removed timer with splits, after softsoundd's Softimer (Mirror's Edge Tweaks). It
+  starts with a new game, splits when the game completes a chapter, stops when the Shard is done, and stands still
+  during loads. It compares against your personal best (ahead/behind, gold for a best segment) and keeps one per
+  category: Any%, Glitchless, 100% and Individual level (each level its own). Keys: [Num 1] start/split, [Num 3]
+  reset, [Num 8] undo, [Num 2] skip.
 - **Kickglitch**, **Beamer**, **Strang**: one-shot tools. Switch one on to arm it. It does its move at the right moment,
   then switches itself off. **Tool Overlay** lists the armed tools in the top-right corner.
 - **Refill Reaction Time**.
@@ -117,10 +122,25 @@ Default keys are in brackets. All of them can be changed.
 - **Game Speed**: slow motion or faster.
 - **Freeze Timer**: stops the time trial clock.
 
-**Visual**: **Crosshair**, **FOV**, **Show FPS**.
+**Visual**: **Crosshair**, **FOV**, **Show FPS**, **Input Overlay**.
+- **Input Overlay**: the keyboard and mouse on screen, like NohBoard: keys light up while held and fade out, the mouse
+  pad shows which way and how fast the mouse moves, and KPS counts presses per second. It shows what the game gets:
+  your own input while you play, and a macro's while the TAS records or plays it back (**Show** can limit it to one
+  of the two). Pick a layout (Movement, Minimal, Mouse, Left hand) or make your own: they are small JSON files in
+  `memenu\input_layouts\`, one line per key (`{"key": "W", "x": 1, "y": 0}`, sizes and places in key widths, Unreal
+  key names: `SpaceBar`, `LeftShift`, `LeftMouseButton`, `MouseScrollUp`, `one`...). Saved edits show up within a
+  second. Size, spacing, rounding, outline, text size, fade, colors and press counts are in its settings; drag it
+  anywhere while the menu is open.
 
 **Debug**: **Collision View** (draws collision and trigger volumes), **Performance** (frame times, the module
 scheduler, caches), **Log Viewer** (the menu's log, filterable).
+- **Collision View** draws triggers, kill zones, checkpoints, blocking and movement volumes and pawn cylinders, and
+  (off by default) spawn points, pickups, AI-only volumes and areas, and the AI's navigation points, hidden
+  by the world like real geometry and locked to the game's own camera. Each layer shows how many are drawn of how many
+  the level has; a name filter (e.g. `kill`) shows only matching ones, and far volumes fade out.
+  *Inspect*: aim at a volume to see its name, kind, distance and size under the crosshair (outlined in white, with what
+  is behind it), see the volumes you are standing in (top left), and list the nearby ones in the panel; click one to
+  turn toward it. *Own cylinder* shows your collision cylinder as an outline, for checking clearance.
 
 **Levels**
 - **Levels**: every chapter, listed last to first (the final chapter at the top, the Prologue at the bottom). Click a chapter to open it, then
@@ -166,12 +186,28 @@ runs on a fixed time step, so a playback does exactly what the recording did, fr
      reset, so it can't be checked and practice mode doesn't work.
 2. Pick a **Frame rate**. 60 is a good default. *Real time* stores each frame's real length instead (for speedruns
    recorded at normal speed).
-3. Click **Record** and play. The overlay in the top-left corner shows `REC <frame>`.
+3. Click **Record** (or close the menu and press **F2**) and play. The overlay in the top-left corner shows
+   `REC <frame>`.
 4. Click **Off** (or press **F8**) to stop.
-5. Type a name and click **Save**. It goes to `replays/<name>.merp` in the `memenu` folder.
+5. Click **Save**. With a name in the box it goes to `replays/<name>.merp` in the `memenu` folder; with an empty box it
+   gets one from the date and time. **Save\*** means there are changes that aren't saved yet.
 
-To play it back, click **Play**. Your own input is ignored until it ends. When it has finished, the overlay says
-**verified** if every frame matched the recording, or **desync @ frame N** at the first frame that didn't.
+To play it back, click **Play** (or **F3** with the menu closed). Your own input is ignored until it ends. When it has
+finished, the overlay says **verified** if every frame matched the recording, or **desync @ frame N** at the first
+frame that didn't.
+
+The bar under the status shows where the run is: click it to go to that frame. The buttons under it (**1/4**, **1/2**,
+**1x**, **2x**, **4x**, **Max**) set the speed, for recording too: slow down for a hard part, speed through the rest.
+
+Nothing recorded is lost: every recording is also saved in `replays/autosave/` when it stops (the newest 10 are kept,
+listed under **Macros → Autosaves**), and recording, loading or **New** ask first when the macro in memory isn't saved.
+
+#### Bookmarks
+
+Mark frames to come back to: **Bookmarks → + Bookmark** (or **F1** during a session) adds one where the session is.
+They show as flags on the progress bar and the timeline's ruler; click one to go there, rename them in the list.
+Double click the timeline's ruler to add one, right click its flag to delete it. Bookmarks are saved with the macro
+and move with the frames when you insert or delete some.
 
 #### Practice mode (rewind on death)
 
@@ -186,7 +222,16 @@ With a level start, **On death** decides what happens when you die while recordi
 You can also rewind any time with **Rewind** (F9), for example after a sloppy jump. Every rewind counts as a
 *rerecord* (shown in the file info).
 
-#### Hotkeys while a macro runs
+#### Hotkeys
+
+With the menu closed and nothing running:
+
+| Key | Action |
+|-----|--------|
+| **F2** | Record (from the start set under Recording) |
+| **F3** | Play the macro |
+
+While a macro runs:
 
 | Key | Action |
 |-----|--------|
@@ -195,12 +240,16 @@ You can also rewind any time with **Rewind** (F9), for example after a sloppy ju
 | **F7** | Take over: during playback, keep the macro up to this frame and record from here |
 | **F8** | Stop |
 | **F9** | Rewind (practice) |
+| **F4** | Restart |
+| **F1** | Bookmark the current frame |
 
-These keys never reach the game while a macro runs, so they are never recorded. INSERT and END aren't either.
-F5 is also No Clip's default key: if you use both, give one of them another key.
+These keys never reach the game while a macro runs, so they are never recorded. INSERT and END aren't either. They
+don't reach the menu's module hotkeys either: F5 pauses the TAS without also switching No Clip (its default key) on.
+Change any of them under **Keys**.
 
 #### Playback options
 
+- **At the end**: Stop, Pause, Keep recording, or **Loop** (play it again from the start).
 - **Speed** (or **As fast as possible**): 0.5 for slow motion while studying a run, 8x to skip ahead. It doesn't
   change the result, only how fast it is shown.
 - **At the end**: *Stop*, *Pause* (the last frame stays on screen) or *Keep recording*, to extend a macro.
@@ -257,12 +306,26 @@ translator. To get it in the **Macros** list, type a name and click **Save**.
 **Edit** (next to Save / Load) opens the **Timeline**: the macro as rows, one per key, with every time the key is held
 drawn as a bar, the mouse / stick movement as ticks, and a **Camera** row for keyframes on top.
 
-- **Double click** a key's row to hold the key there (for the frames set in the toolbar), or the Camera row to add a
-  camera key. **Add track** gives you a row for a key the macro doesn't use yet.
-- **Drag** a bar to move it, drag its ends to change when the key goes down or up; drag a camera key to another frame.
-  **Right click** deletes. Below the timeline you can type exact frames, yaw and pitch, the easing to the next key
-  (Linear, Smooth or Hold), or take the key from where the player is looking right now (**From camera**).
-- **Click the ruler** to go to that frame. **Ctrl + wheel** zooms, **Shift + wheel** scrolls.
+- **Double click** a key's row to hold the key there (for the frames set in the toolbar), the Camera row to add a
+  camera key, or the ruler to add a bookmark. **Add track** gives you a row for a key the macro doesn't use yet.
+- **Click** a bar or camera key to select it, **Ctrl + click** to add more, **Shift + drag** (or drag over empty space)
+  to select everything in a box. **Drag** the selection to move it all; drag a bar's ends to change when the key goes
+  down or up.
+- **Right click** for what can be done there: delete, **split** a hold at that frame, duplicate, copy, select the whole
+  row, change a camera key's easing, **insert or delete frames** (everything after moves along), paste, bookmark.
+- Below the timeline you can type exact frames, yaw and pitch, the easing to the next key (Linear, Smooth or Hold), or
+  take the key from where the player is looking right now (**From camera**). With several selected: nudge, duplicate,
+  copy, delete.
+- **Click the ruler** to go to that frame. **Ctrl + wheel** zooms, **Shift + wheel** scrolls, **Fit** (or F) shows it all.
+- Mouse and stick rows show how much they moved: bars up for one way, down for the other.
+- Every edit can be undone, in the timeline and the replay editor alike: **Undo** / **Redo** in the toolbar.
+
+| Key | | Key | |
+|-----|-----|-----|-----|
+| Ctrl+Z / Ctrl+Y | undo / redo | Delete | delete the selection |
+| Ctrl+C / X / V | copy / cut / paste (at the mouse) | Left / Right | nudge a frame (Shift: 10) |
+| Ctrl+D | duplicate right after | Ctrl+A / Esc | select all / nothing |
+| F | fit the macro in the window | Space | pause / resume the session |
 
 Camera keys are keyframes for the look direction: from the first key to the last, playback turns the camera itself,
 in between the keys smoothly, and leaves out the recorded mouse movement there. Before the first key and after the
@@ -325,6 +388,8 @@ Everything is in the `memenu` folder next to `MirrorsEdge.exe`:
 | `MedgeMenu.json`             | your settings: theme, every module's on/off state, keys, options |
 | `themes/*.json`              | color themes; edit or add your own, then **Misc → Themes** to reload |
 | `replays/*.merp`             | saved macros / runs                                              |
+| `input_layouts/*.json`       | the Input Overlay's layouts (the built-in ones are written here to copy and edit) |
+| `speedrun/*.json`            | the Speedrun Timer's personal bests, best segments and attempts  |
 | `logs/memenu.log`            | this session's log; older ones are compressed in `logs/.old/`    |
 | `disabled`                   | create this (empty) file to start the game without the menu      |
 
@@ -519,6 +584,8 @@ last. That is what `verbose-build` walks through to find the first stage that br
 | `tas/timeline.*`   | the replay as key holds and camera keys: holds from events and back, camera interpolation (unit tested) |
 | `features/tas/tas_module.cpp` | the panel and the file browser                                                   |
 | `features/tas/timeline_view.*` | the Timeline window (ImGui draw list: rows, bars, camera keys, ruler)          |
+| `tas/history.*`                | undo / redo for the timeline and the replay editor (whole-replay snapshots)    |
+| `features/tas/macro_library.*` | the macro files: name, save / load, the list, autosaves, file browsers         |
 | `features/tas/replay_editor.*` | the Replay Editor (transport, frame list, per-frame keys) and the input display |
 
 How a session works: while one runs, the game thread sees a virtual 10 MHz clock that advances by exactly one frame's
@@ -539,9 +606,13 @@ skip.
 
 ### Testing
 
-- **Unit tests** (`tests/`, `uv run memenu test`): math, meshes, the replay format (save/load, damage detection,
-  editing, JSON round trip and import), macros. They don't need the game. Add a test for anything that can run
-  without it.
+- **Unit tests** (`tests/`, `uv run memenu test`, about a second): math, meshes, the replay format (save/load, damage
+  detection, editing, JSON round trip and import), macros, the TAS timeline (holds, camera keys, bookmarks, moving /
+  copying / pasting several at once), undo / redo, the speedrun timer's clock and records, the collision view's ray
+  and inside tests, the input overlay's layouts, the settings framework (values kept in range, saved and loaded back,
+  bad values in the file ignored, key presses), and the installer on a fake game folder (`installer_tests`: install,
+  update, uninstall with and without settings, another mod's dinput8.dll kept and put back; Windows' installed apps
+  list is never touched). They don't need the game. Add a test for anything that can run without it.
 - **`verbose-build`**: builds every stage, checks it (32-bit, no Visual C++ runtime DLLs, warnings) and loads it twice
   into `memenu_testhost.exe`, a small D3D9 program that stands in for the game: draws with the menu closed and open,
   resets the device, unloads. It writes `build/verbose-build/<time>/report.md` and stops at the first failing stage.
@@ -550,10 +621,19 @@ skip.
   intro cutscene, which pins the player), input blocking, every module switched on and off with its controls pressed,
   checks of what it does to the game (God Mode keeps health full, Load State puts a moved player back, a TAS macro
   plays back, ...), everything at once, and a clean unload. The game closes by itself and the tool prints every step,
-  the log's errors and, after a crash, the crashing source line. Options: `--late 20` (load 20 s late, like the
-  launcher), `--only` / `--skip` to pick modules. It needs a writable game folder and a game that doesn't run
-  elevated. Self-test checks must not pass by gravity or time alone: wait in ticks, and check something only the
-  feature can cause.
+  the log's errors and, after a crash, the crashing source line. HUD modules (Crosshair, Show FPS, Watermark,
+  Speedometer, Input Overlay, Speedrun Timer) must draw with the menu closed while on and stop when off; the TAS,
+  collision view, speedrun timer and input overlay have steps of their own. A full run takes about 33 s.
+  - It runs in **fast mode**: the game's 62 fps cap is off and TAS playbacks that don't depend on pacing run unpaced,
+    so the frame and tick counted waits pass as fast as the PC draws. `--real-speed` tests the game exactly as players
+    run it (about 52 s).
+  - When the game itself doesn't get going (a Steam error window, no frame ever drawn, the game gone before the menu
+    started) the run counts as an environment problem, not a failure, and is tried again (`--retries`, 1 by default).
+  - Options: `--late 20` (load 20 s late, like the launcher), `--only` / `--skip` to pick modules or steps by name
+    (`--only "TAS macro"`). It needs a writable game folder and a game that doesn't run elevated.
+  - Self-test checks must not pass by gravity or time alone: check something only the feature can cause. Wait for
+    the state that matters (`WaitPlayerReady` after a load, `WaitFor` a condition), not a number of frames: in fast
+    mode 30 ticks are a tenth of a second.
 
 ### Logs, diagnostics and developer mode
 

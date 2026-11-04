@@ -54,6 +54,11 @@ void SetInputFilter(InputFilter filter);
 // Hands an input to the engine as if it came from the keyboard/mouse/gamepad. False: the viewport isn't known yet.
 bool Inject(const RawInput& input);
 
+// Sees every input the engine actually gets: real input that the filter let through, and every injected one (a TAS
+// recording's deferred input, a playback's). What the game does is what this sees. Game thread.
+using InputMonitor = void (*)(const RawInput& input);
+void SetInputMonitor(InputMonitor monitor);
+
 // ---- misc -----------------------------------------------------------------------------------------------------------------
 void SeedRand(std::uint32_t seed);          // the game thread's rand() state (msvcr80)
 void SetWorldRendering(bool on);            // GameViewportClient.bDisableWorldRendering

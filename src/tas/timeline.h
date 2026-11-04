@@ -2,6 +2,8 @@
 #include "tas/replay.h"
 
 #include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
 
 // The replay as a timeline: each key as the spans it is held (press to release), the axes as the frames they move on,
@@ -53,5 +55,33 @@ const CameraKey* FindCameraKey(const Replay& r, std::uint32_t frame);
 
 // `deg` turned by whole turns to be as close as possible to `near`: keeps the camera from spinning the long way round.
 float UnwrapNear(float deg, float near);
+
+// ---- several at once (the timeline's selection) ---------------------------------------------------------------------------
+struct KeyHold {
+    std::uint16_t name = 0;
+    Hold hold;
+    bool operator==(const KeyHold& o) const { return name == o.name && hold == o.hold; }
+};
+
+// The hold of `name` that contains `h` now (after a merge with a neighbour), or `h` itself.
+Hold Containing(const Replay& r, std::uint16_t name, const Hold& h);
+// Moves the holds by `delta` frames, together (no earlier than frame 0: the delta is cut so the first one stops there).
+// Returns them where they are now.
+std::vector<KeyHold> MoveHolds(Replay& r, const std::vector<KeyHold>& holds, int delta);
+void EraseHolds(Replay& r, const std::vector<KeyHold>& holds);
+// Moves camera keys by `delta` frames, together (kept inside the replay). Returns their new frames.
+std::vector<std::uint32_t> MoveCameraKeys(Replay& r, const std::vector<std::uint32_t>& frames, int delta);
+
+// Copied holds and camera keys, relative to the first frame copied. Holds by key name, so they paste into any replay.
+struct Clip {
+    std::vector<std::pair<std::string, Hold>> holds;
+    std::vector<CameraKey> camera;
+    std::uint32_t length = 0;       // From the first frame to past the last
+    bool Empty() const { return holds.empty() && camera.empty(); }
+};
+Clip Copy(const Replay& r, const std::vector<KeyHold>& holds, const std::vector<std::uint32_t>& cameraFrames);
+// Pastes with the clip's first frame on `at` (adding frames at the end when needed). Returns what was pasted, for the
+// selection: the holds as they are now, and the camera keys' frames.
+std::vector<KeyHold> Paste(Replay& r, const Clip& clip, std::uint32_t at, std::vector<std::uint32_t>* cameraFrames = nullptr);
 
 } // namespace tas::timeline

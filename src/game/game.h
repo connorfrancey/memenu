@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <string>
 
 #include "render/math.h"
 
@@ -12,6 +13,7 @@
 // or queue work with RunOnGameThread().
 
 namespace Classes {
+	class UObject;
 	class AWorldInfo;
 	class ATdPlayerController;
 	class ATdPlayerPawn;
@@ -58,8 +60,7 @@ namespace game {
 
 	void OnTick(TickCallback callback); // Runs on the game thread, once per engine tick, not while loading
 	void RunOnGameThread(std::function<void()> fn);   // Runs on the next tick
-	
-	
+
 	// The local player's move state handler just switched to a new state (the hook mmultiplayer's trainer uses for its
 	// "strang" tool). Game thread. Return true to skip the engine's handler for this call.
 	using StateChangeCallback = bool(*)();
@@ -69,6 +70,21 @@ namespace game {
 	using LevelLoadCallback = void (*)(bool finished);
 	void OnLevelLoad(LevelLoadCallback callback);
 	
+	// A script function the engine calls from native code through UObject::ProcessEvent: events like a Kismet action's
+	// Activated(), delegates of the UI. `fullName` as the engine names it ("Function TdGame.SeqAct_TdLevelCompleted.Activated").
+	// The callback runs on the game thread before the function itself, with the object it is called on and its parameters.
+	// ProcessEvent is only hooked once something asks for an event. Up to 8 events; returns false if the hook failed.
+	using ScriptEventCallback = void (*)(Classes::UObject* self, void* params);
+	bool OnScriptEvent(const char* fullName, ScriptEventCallback callback);
+	// Hooked and every watched function found in the game (they are looked up on the game thread, after a tick).
+	bool ScriptEventsReady();
+
+	// The world asked the engine to finish its streaming loads before the next frame: the game freezes on a loading
+	// icon for a moment (elevators, doors). Game thread.
+	bool BlockingLoad();
+	// Package name of the level the player is in ("edge_p"), as the game spells it. Empty while loading. Game thread.
+	std::string MapName();
+
 	// Byte pattern scan over MirrorsEdge.exe ('x' = must match, '?' = any byte). nullptr if not found.
 	void* FindPattern(const char* pattern, const char* mask);
 	

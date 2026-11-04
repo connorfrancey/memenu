@@ -3,6 +3,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <mutex>
@@ -21,7 +22,10 @@ namespace {
 
     std::mutex g_mutex;
     std::deque<Message> g_messages;
+    std::atomic<bool> g_muted{false};
 }
+
+void notify::SetMuted(bool muted) { g_muted = muted; }
 
 void notify::Push(std::string text)
 {
@@ -44,7 +48,7 @@ void notify::Draw()
             g_messages.pop_front();
         messages = g_messages;
     }
-    if (messages.empty()) return;
+    if (messages.empty() || g_muted) return;
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const ImVec2 display = ImGui::GetIO().DisplaySize;

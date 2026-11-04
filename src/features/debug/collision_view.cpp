@@ -1,4 +1,5 @@
-// Collision view: trigger, kill, checkpoint, blocking and movement volumes drawn as solid, translucent geometry.
+// Collision view: trigger, kill, checkpoint, blocking and movement volumes drawn as solid, translucent geometry, and the
+// actors placed with them (player starts, pickups, AI-only volumes and areas, navigation points).
 // The volumes are collected from the SDK on the game thread (game/debug_world.*) and drawn by the Direct3D 9 renderer in
 // the EndScene / StretchRect hooks (render/debug_renderer.*). This module only owns the settings and wires the two together.
 #include "core/module.h"
@@ -8,9 +9,12 @@
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <initializer_list>
 #include <cstdio>
+#include <string>
 
 namespace {
 
@@ -43,8 +47,9 @@ public:
         const auto in = [](ctl::Section& section, std::initializer_list<ctl::Setting*> controls) {
             for (ctl::Setting* c : controls) c->VisibleIf([&section] { return section.Get(); });
         };
-        in(showSection, {&layerGrid});
-        in(displaySection, {&style, &opacity, &depth, &maxDistance, &labels});
+        in(showSection, {&layerGrid, &filterBox});
+        in(displaySection, {&style, &opacity, &depth, &maxDistance, &fade, &labels});
+        in(inspectSection, {&lookAt, &highlight, &insideList, &ownCylinder, &inspectInfo});
         in(cacheSection, {&cacheStatus});
         in(advancedSection, {&updateRate, &fovOffset, &aspectOverride, &useCache, &scanCached, &statsLine, &tools});
     }
@@ -60,6 +65,7 @@ public:
     {
         debugrender::SetActive(false);
         debugrender::SetScene(nullptr);
+        debugrender::SetDynamic({});
         game::SetCameraTracking(false);
     }
 
@@ -68,13 +74,21 @@ public:
         debugrender::SetCamera(game::GetCamera());
         debugrender::SetEngineNear(game::EngineNear());
         debugrender::SetStyle(RenderStyle());
-        debugworld::Update(WorldConfig());
+        const auto cfg = WorldConfig();
+        if (cfg.filter != lastFilter_) {
+            lastFilter_ = cfg.filter;
+            debugworld::RequestRebuild();
+        }
+        debugworld::Update(cfg);
     }
 
     void OnRender() override
     {
+        info_ = debugworld::GetInfo();
         if (labels) DrawLabels();
         if (statsLine) DrawStatsLine();
+        if (lookAt) DrawLookAt();
+        if (insideList) DrawInsideList();
     }
 
 private:
@@ -94,10 +108,142 @@ private:
         dl->AddText({10.f, 64.f}, st.overlayFallback ? IM_COL32(255, 190, 90, 255) : IM_COL32(200, 200, 210, 255), line);
     }
 
+    // ---- Inspect ---------------------------------------------------------------------------------------------------
+    // Every layer, in the order of debugworld::Category
+    std::array<const Layer*, debugworld::kCategoryCount> Layers() const
+    {
+        return {&triggers, &killZones, &checkpoints, &blocking, &movement, &otherVolumes, &cylinders,
+                &spawns, &pickups, &aiOnly, &navigation};
+    }
+
+    const Layer& LayerOf(int category) const
+    {
+        return *Layers()[static_cast<std::size_t>(std::clamp(category, 0, debugworld::kCategoryCount - 1))];
+    }
+
+    static void ShadowText(ImDrawList* dl, ImVec2 at, ImU32 color, const char* text)
+    {
+        dl->AddText({at.x + 1.f, at.y + 1.f}, IM_COL32(0, 0, 0, 220), text);
+        dl->AddText(at, color, text);
+    }
+
+    // Under the crosshair: what the view ray hits first.
+    void DrawLookAt() const
+    {
+        const auto& look = info_.look;
+        if (!look.valid) return;
+        const auto& rgba = LayerOf(look.category).color.Get();
+        const ImU32 color = ImGui::ColorConvertFloat4ToU32({rgba[0], rgba[1], rgba[2], 1.f});
+        char line2[96];
+        std::snprintf(line2, sizeof line2, "%s  |  %.0f away  |  %.0f across", debugworld::CategoryName(look.category),
+                      look.distance, look.size);
+        const ImVec2 screen = ImGui::GetIO().DisplaySize;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        const char* name = look.name.empty() ? "(unnamed)" : look.name.c_str();
+        const float w1 = ImGui::CalcTextSize(name).x, w2 = ImGui::CalcTextSize(line2).x;
+        const float y = screen.y * 0.5f + 28.f;
+        ShadowText(dl, {screen.x * 0.5f - w1 * 0.5f, y}, color, name);
+        ShadowText(dl, {screen.x * 0.5f - w2 * 0.5f, y + ImGui::GetTextLineHeight()}, IM_COL32(220, 220, 225, 255), line2);
+        if (!look.behind.empty()) {
+            std::string more = "behind: " + look.behind[0].first;
+            if (look.behind.size() > 1) more += " +" + std::to_string(look.behind.size() - 1);
+            const float w3 = ImGui::CalcTextSize(more.c_str()).x;
+            ShadowText(dl, {screen.x * 0.5f - w3 * 0.5f, y + 2.f * ImGui::GetTextLineHeight()}, IM_COL32(160, 160, 170, 255),
+                       more.c_str());
+        }
+    }
+
+    // Top left: the volumes the player is in.
+    void DrawInsideList() const
+    {
+        if (info_.inside.empty()) return;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        float y = statsLine ? 86.f : 64.f;
+        ShadowText(dl, {10.f, y}, IM_COL32(200, 200, 210, 255), "Inside:");
+        for (const auto& [name, category] : info_.inside) {
+            y += ImGui::GetTextLineHeight();
+            const auto& rgba = LayerOf(category).color.Get();
+            char line[160];
+            std::snprintf(line, sizeof line, "%s  (%s)", name.empty() ? "(unnamed)" : name.c_str(),
+                          debugworld::CategoryName(category));
+            ShadowText(dl, {18.f, y}, ImGui::ColorConvertFloat4ToU32({rgba[0], rgba[1], rgba[2], 1.f}), line);
+        }
+    }
+
+    // In the panel: the same, for when the HUD text is off.
+    void DrawInspectInfo(float)
+    {
+        const auto& look = info_.look;
+        if (look.valid) {
+            ImGui::TextDisabled("Looking at");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(look.name.empty() ? "(unnamed)" : look.name.c_str());
+            ImGui::TextDisabled("%s, %.0f away, %.0f across", debugworld::CategoryName(look.category), look.distance, look.size);
+            ImGui::TextDisabled("hit at %.0f, %.0f, %.0f", look.x, look.y, look.z);
+            if (ImGui::IsItemClicked()) {
+                char buf[64];
+                std::snprintf(buf, sizeof buf, "%.0f %.0f %.0f", look.x, look.y, look.z);
+                ImGui::SetClipboardText(buf);
+            }
+            ImGui::SetItemTooltip("Click to copy");
+            for (const auto& [name, at] : look.behind) ImGui::TextDisabled("  behind it: %s (%.0f)", name.c_str(), at);
+        } else ImGui::TextDisabled("Not looking at a volume");
+        if (info_.inside.empty()) ImGui::TextDisabled("Not inside any volume");
+        else ImGui::TextDisabled("Inside %zu volume%s", info_.inside.size(), info_.inside.size() == 1 ? "" : "s");
+
+        // The closest volumes: click one to turn toward it
+        if (info_.nearby.empty()) return;
+        ImGui::Spacing();
+        ImGui::TextDisabled("Nearby (click to face it)");
+        if (!ImGui::BeginTable("##nearby", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) return;
+        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("dist", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("00000").x);
+        for (std::size_t i = 0; i < info_.nearby.size(); ++i) {
+            const auto& n = info_.nearby[i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(i));
+            const auto& rgba = LayerOf(n.category).color.Get();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{rgba[0], rgba[1], rgba[2], 1.f});
+            if (ImGui::Selectable(n.name.empty() ? "(unnamed)" : n.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns))
+                debugworld::FaceTowards(n.x, n.y, n.z);
+            ImGui::PopStyleColor();
+            ImGui::SetItemTooltip("%s at %.0f, %.0f, %.0f", debugworld::CategoryName(n.category), n.x, n.y, n.z);
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            if (n.distance <= 0.f) ImGui::TextDisabled("in");
+            else ImGui::TextDisabled("%.0f", n.distance);
+        }
+        ImGui::EndTable();
+    }
+
+    void DrawFilter(float width)
+    {
+        ImGui::SetNextItemWidth(width);
+        if (ImGui::InputTextWithHint("##filter", "Filter by name (e.g. kill)", filter_, sizeof filter_)) MarkDirty();
+        ImGui::SetItemTooltip("Only volumes whose name contains this. Names are the level's actor names: "
+                              "TdKillVolume, TdTriggerVolume, BlockingVolume, ...");
+    }
+
+    std::string Filter() const
+    {
+        std::string f = filter_;
+        f.erase(0, f.find_first_not_of(' '));
+        f.erase(f.find_last_not_of(' ') + 1);
+        std::transform(f.begin(), f.end(), f.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return f;
+    }
+
     debugworld::Config WorldConfig() const
     {
         using debugworld::Category;
         debugworld::Config c;
+        c.fade = fade;
+        c.filter = Filter();
+        c.ownCylinder = ownCylinder;
+        c.inspect = lookAt || highlight || insideList || expanded;
+        c.highlight = highlight;
+        c.nearby = expanded && inspectSection;
         c.style = static_cast<debugworld::DrawStyle>(style.Get());
         c.maxDistance = maxDistance;
         c.updateHz = updateRate;
@@ -105,19 +251,12 @@ private:
         c.useCache = useCache;
         c.scanCached = scanCached;
 
-        const auto set = [&c](Category cat, const Layer& layer) {
-            const auto i = static_cast<std::size_t>(cat);
-            const auto& rgba = layer.color.Get();
-            c.enabled[i] = layer.show;
+        const auto layers = Layers();
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& rgba = layers[i]->color.Get();
+            c.enabled[i] = layers[i]->show;
             c.colors[i] = rmesh::PackColor(rgba[0], rgba[1], rgba[2], 1.f);
-        };
-        set(Category::Trigger, triggers);
-        set(Category::Kill, killZones);
-        set(Category::Checkpoint, checkpoints);
-        set(Category::Blocking, blocking);
-        set(Category::Movement, movement);
-        set(Category::Volume, otherVolumes);
-        set(Category::Cylinder, cylinders);
+        }
         return c;
     }
 
@@ -148,9 +287,10 @@ private:
     // Every kind of volume in two columns: shown or not, and its color as a small swatch next to it.
     void DrawLayers(float)
     {
-        Layer* const all[] = {&triggers, &killZones, &checkpoints, &blocking, &movement, &otherVolumes, &cylinders};
+        const auto all = Layers();
         if (!ImGui::BeginTable("##layers", 2, ImGuiTableFlags_SizingStretchSame)) return;
-        for (Layer* layer : all) {
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            Layer* layer = const_cast<Layer*>(all[i]);      // In the order of debugworld::Category
             ImGui::TableNextColumn();
             ImGui::PushID(layer->label);
             auto rgba = layer->color.Get();
@@ -160,6 +300,15 @@ private:
             bool shown = layer->show;
             if (ImGui::Checkbox(layer->label, &shown)) layer->show.Set(shown);
             if (layer->tooltip[0]) ImGui::SetItemTooltip("%s", layer->tooltip);
+            // How many are drawn now, of how many known in this level
+            if (info_.remembered[i] > 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%zu/%zu", info_.drawn[i], info_.remembered[i]);
+                ImGui::SetItemTooltip("%zu drawn (in range and matching the filter) of %zu %s", info_.drawn[i],
+                                      info_.remembered[i],
+                                      i == static_cast<std::size_t>(debugworld::Category::Cylinder) ? "found nearby"
+                                                                                                    : "in this level");
+            }
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -220,6 +369,9 @@ private:
     }
 
     static inline bool confirmClear_ = false;
+    debugworld::Info info_;             // Render thread: this frame's copy
+    char filter_[64] = {};
+    std::string lastFilter_;            // Game thread: the filter the scene was built with
 
     // ---- controls (listed in the order they appear in the menu) --------------------------------------------------------
     ctl::Section showSection{this, "Show", true};
@@ -229,11 +381,22 @@ private:
     Layer checkpoints{this, "Checkpoints", "Checkpoints color", "Checkpoints", true, {0.20f, 0.85f, 0.35f, 1.f}};
     Layer blocking{this, "Blocking volumes", "Blocking color", "Blocking", true, {0.25f, 0.50f, 1.00f, 1.f}};
     Layer movement{this, "Movement volumes", "Movement color", "Movement", false, {0.65f, 0.35f, 0.95f, 1.f},
-                   "Ladders, ziplines, swing/balance/ledge volumes, water, gravity, fall height"};
+                   "Ladders, ziplines, swing/balance/ledge volumes, water, gravity, fall height, teleporters"};
     Layer otherVolumes{this, "Other volumes", "Other volumes color", "Other", false, {0.20f, 0.80f, 0.80f, 1.f},
                        "Every other kind of volume: post process, reverb, fog, streaming..."};
     Layer cylinders{this, "Cylinders", "Cylinders color", "Cylinders", true, {0.95f, 0.85f, 0.25f, 1.f},
                     "Cylinder collision of pawns and other moving actors (looked up live)"};
+    Layer spawns{this, "Spawn points", "Spawn points color", "Spawns", false, {0.95f, 0.95f, 0.95f, 1.f},
+                 "Player starts: level starts, time trial and tutorial starts"};
+    Layer pickups{this, "Pickups", "Pickups color", "Pickups", false, {0.95f, 0.45f, 0.75f, 1.f},
+                  "Weapon pickups and stash points (where they are placed, not dropped weapons)"};
+    Layer aiOnly{this, "AI volumes", "AI volumes color", "AI only", false, {0.55f, 0.60f, 0.35f, 1.f},
+                 "Volumes and areas only AI uses: AI blocking volumes (not walls for the player), path limits, cover "
+                 "groups, grenade target areas"};
+    Layer navigation{this, "Navigation points", "Navigation points color", "Navigation", false,
+                     {0.45f, 0.65f, 0.85f, 1.f},
+                     "The AI's path network: path nodes and move hints (vault, wallrun, jump, slide). Many per level"};
+    ctl::Custom filterBox{this, [this](float w) { DrawFilter(w); }};
 
     ctl::Section displaySection{this, "Display", true};
     ctl::Combo style{this, "Style", {"Solid", "Solid + outline", "Wireframe"}, 1};
@@ -243,7 +406,19 @@ private:
                      "them. Always on top: drawn over the finished frame, nothing hides them"};
     ctl::Slider maxDistance{this, "Max distance", 6000.f, 500.f, 40000.f, "%.0f", 500.f,
                             "Volumes farther away than this are not drawn"};
-    ctl::Checkbox labels{this, "Labels", false, "Class names of triggers, kill zones, checkpoints and volumes"};
+    ctl::Checkbox fade{this, "Fade with distance", true, "Volumes fade out over the last quarter of the max distance "
+                                                         "instead of popping out of view"};
+    ctl::Checkbox labels{this, "Labels", false, "Actor names of the triggers, volumes and other objects shown"};
+
+    ctl::Section inspectSection{this, "Inspect", true};
+    ctl::Checkbox lookAt{this, "Look-at info", true,
+                         "Under the crosshair: the name, kind, distance and size of the volume you are looking at"};
+    ctl::Checkbox highlight{this, "Highlight looked-at", true, "Outline the volume you are looking at in white"};
+    ctl::Checkbox insideList{this, "Inside list", true,
+                             "Top left: the triggers, kill zones, checkpoints and volumes the player is inside right now"};
+    ctl::Checkbox ownCylinder{this, "Own cylinder", false,
+                              "Your own collision cylinder, as an outline (needs Cylinders on): for checking clearance"};
+    ctl::Custom inspectInfo{this, [this](float w) { DrawInspectInfo(w); }};
 
     ctl::Section cacheSection{this, "Cache & baking", true};
     ctl::Custom cacheStatus{this, [](float w) { DrawCacheStatus(w); }};

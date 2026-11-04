@@ -35,6 +35,7 @@ double  g_realSecondsPerCycle = 0.0;
 
 FrameHandler g_frameHandler = nullptr;
 InputFilter g_inputFilter = nullptr;
+InputMonitor g_inputMonitor = nullptr;
 
 // Virtual clock (game thread)
 std::atomic<bool> g_virtual{false};   // read by every thread that asks for the time
@@ -138,6 +139,16 @@ int __fastcall InputKeyHook(void* self, void* /*edx*/, void* viewport, int contr
             in.controllerId = controllerId;
             if (g_inputFilter(in)) return 0;
         }
+        if (g_inputMonitor) {
+            RawInput in;
+            in.nameIndex = nameIndex;
+            in.nameNumber = nameNumber;
+            in.event = event;
+            in.value = amount;
+            in.gamepad = gamepad != 0;
+            in.controllerId = controllerId;
+            g_inputMonitor(in);
+        }
     }
     return oInputKey(self, viewport, controllerId, nameIndex, nameNumber, event, amount, gamepad);
 }
@@ -158,6 +169,17 @@ int __fastcall InputAxisHook(void* self, void* /*edx*/, void* viewport, int cont
             in.gamepad = gamepad != 0;
             in.controllerId = controllerId;
             if (g_inputFilter(in)) return 0;
+        }
+        if (g_inputMonitor) {
+            RawInput in;
+            in.nameIndex = nameIndex;
+            in.nameNumber = nameNumber;
+            in.axis = true;
+            in.value = delta;
+            in.value2 = deltaTime;
+            in.gamepad = gamepad != 0;
+            in.controllerId = controllerId;
+            g_inputMonitor(in);
         }
     }
     return oInputAxis(self, viewport, controllerId, nameIndex, nameNumber, delta, deltaTime, gamepad);
@@ -324,6 +346,7 @@ double RealSeconds()
 void SuspendVirtualClock(bool suspend) { g_suspended = suspend; }
 
 void SetInputFilter(InputFilter filter) { g_inputFilter = filter; }
+void SetInputMonitor(InputMonitor monitor) { g_inputMonitor = monitor; }
 
 bool Inject(const RawInput& in)
 {
@@ -331,6 +354,7 @@ bool Inject(const RawInput& in)
     void* viewport = nullptr;
     if (!InputTarget(client, viewport)) return false;
 
+    if (g_inputMonitor) g_inputMonitor(in);
     g_injecting = true;
     if (in.axis)
         oInputAxis(client, viewport, in.controllerId, in.nameIndex, in.nameNumber, in.value, in.value2, in.gamepad);

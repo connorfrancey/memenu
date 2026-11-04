@@ -547,7 +547,7 @@ def verbose_build(ctx: click.Context, config: str, first: str, last_stage: str, 
     if not no_unit_tests:
         console.rule("Unit tests")
         _enable_parts(ctx, config, ["tests"], verbose)
-        r = _build(ctx, config, ("memenu_tests",), verbose=verbose)
+        r = _build(ctx, config, ("memenu_tests", "installer_tests"), verbose=verbose)
         if r.returncode != 0:
             unit = (False, (r.log.read_text(encoding="utf-8", errors="replace") if r.log.exists() else "build failed"))
         else:
@@ -661,7 +661,7 @@ def test(ctx: click.Context, config: str, no_build: bool, name_filter: str | Non
     tc = _toolchain(ctx)
     if not no_build:
         _enable_parts(ctx, config, ["tests"], verbose)
-        if _build(ctx, config, ("memenu_tests",), verbose=verbose).returncode != 0:
+        if _build(ctx, config, ("memenu_tests", "installer_tests"), verbose=verbose).returncode != 0:
             ctx.exit(1)
     args = [tc.ctest, "--test-dir", str(b.build_dir(config)), "--output-on-failure"]
     if name_filter:
@@ -937,10 +937,14 @@ def dev_test(ctx: click.Context, config: str, stage: str | None, no_build: bool,
               help="Load the menu this much later than usual (after the game went fullscreen, like the launcher).")
 @click.option("--timeout", default=900.0, show_default=True, help="Kill the game after this many seconds.")
 @click.option("--keep-open", is_flag=True, help="Don't close the game when the test is done.")
+@click.option("--real-speed", is_flag=True,
+              help="Test the game as players run it: the 62 fps cap stays on and TAS playbacks are paced (slower).")
+@click.option("--retries", default=1, show_default=True,
+              help="Run again when the game itself didn't get going (Steam error, no frame drawn): not for failures.")
 @click.pass_context
 def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path | None, game_dir: Path | None,
               map_name: str, checkpoint: int, ticks: int, only: str, skip: str, late_s: float, timeout: float,
-              keep_open: bool) -> None:
+              keep_open: bool, real_speed: bool, retries: int) -> None:
     """Run the in-game self-test in Mirror's Edge and report every step (see tools/memenu_tools/gametest.py).
 
     \b
@@ -982,23 +986,33 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
         console.print("[yellow]memenu\\disabled exists: the loader would skip the menu. Removed it.[/]")
         (game_dir / "memenu" / "disabled").unlink()
 
-    gt.install(game_dir, dll, loader)
-    gt.write_options(game_dir, {"map": map_name, "checkpoint": str(checkpoint), "ticks": str(ticks), "only": only, "skip": skip,
-                                "quit": "0" if keep_open else "1"}, int(late_s * 1000))
-    console.print(f"Testing [cyan]{dll}[/] in [cyan]{game_dir}[/]" + (f", loaded {late_s:.0f} s late" if late_s else ""))
+    console.print(f"Testing [cyan]{dll}[/] in [cyan]{game_dir}[/]" + (f", loaded {late_s:.0f} s late" if late_s else "")
+                  + (", at real speed" if real_speed else ""))
 
     def progress(res: gt.Result) -> None:
         if res.current:
             console.print(f"  [dim]{res.current}...[/]")
 
-    try:
-        res = gt.run(game_dir, timeout, progress)
-    except gt.ElevationRequired:
-        console.print("[red]Windows wants administrator rights to start the game[/] (compatibility settings on "
-                      "MirrorsEdge.exe, see above): run this from an administrator terminal, or clear them.")
-        ctx.exit(1)
-    finally:
-        gt.cleanup(game_dir)
+    attempt = 0
+    while True:
+        gt.install(game_dir, dll, loader)
+        gt.write_options(game_dir, {"map": map_name, "checkpoint": str(checkpoint), "ticks": str(ticks), "only": only,
+                                    "skip": skip, "fast": "0" if real_speed else "1",
+                                    # The menu never closes the game itself: gt.run does, once the menu has unloaded
+                                    "quit": "0"}, int(late_s * 1000))
+        try:
+            res = gt.run(game_dir, timeout, progress, close=not keep_open)
+        except gt.ElevationRequired:
+            console.print("[red]Windows wants administrator rights to start the game[/] (compatibility settings on "
+                          "MirrorsEdge.exe, see above): run this from an administrator terminal, or clear them.")
+            ctx.exit(1)
+        finally:
+            gt.cleanup(game_dir)
+        if res.ok or not res.environment or attempt >= retries:
+            break
+        attempt += 1
+        console.print(f"[yellow]Not the menu: {escape(res.environment)}.[/] Trying again ({attempt} of {retries})...")
+        time.sleep(3.0)
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("Step")
@@ -1021,7 +1035,13 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
         console.print(f"[yellow]{len(res.log_errors)} error line(s) in the menu's log:[/]")
         for line in res.log_errors[:20]:
             console.print(f"  {escape(line)}")
-    ok = res.finished and res.passed and not res.crashes
+    ok = res.ok
+    if not ok and res.environment:
+        console.print(f"[yellow]The game itself didn't get going: {escape(res.environment)}[/] (not a menu failure; "
+                      "for a Steam error, restart Steam)")
+    slow = sorted(res.steps, key=lambda s: -s.get("seconds", 0.0))[:3]
+    if slow and ok:
+        console.print("[dim]Slowest: " + ", ".join(f"{escape(s['name'])} {s['seconds']:.1f}s" for s in slow) + "[/]")
     console.print("[bold green]Self-test passed.[/]" if ok else "[bold red]Self-test failed.[/]")
     ctx.exit(0 if ok else 1)
 

@@ -39,6 +39,10 @@ namespace install
     bool Install(const std::filesystem::path& gameDir, std::wstring& message);
     bool Uninstall(const std::filesystem::path& gameDir, bool removeSettings, std::wstring& message);
 
+    // Whether Install / Uninstall add and remove the "Mirror's Edge Menu" entry in Windows' installed apps (and
+    // memenu\uninstall.exe). On by default; the unit tests switch it off so they never touch a real install's entry.
+    void SetAppRegistration(bool on);
+
     // Starts the game the way the player would (through Steam for a Steam copy), as the user and not as the elevated
     // installer: a game started with admin rights behaves differently.
     void Launch(const std::filesystem::path& gameDir);

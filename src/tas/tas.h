@@ -25,7 +25,7 @@
 namespace tas {
 
 enum class Mode { Idle, Recording, Playing };
-enum class AtEnd { Stop = 0, Pause = 1, Record = 2 };   // what playback does after the last frame
+enum class AtEnd { Stop = 0, Pause = 1, Record = 2, Loop = 3 };   // what playback does after the last frame
 
 // What a recording does when the player dies (like Geometry Dash bots: practice mode keeps only the good attempt).
 //   Nothing   keep recording (the death and respawn become part of the run)
@@ -59,6 +59,11 @@ struct Options {
     float rewindSeconds = 2.f;        // how far Rewind (on death, or its key) goes back
     int keyPause = 0, keyAdvance = 0, keyTakeOver = 0, keyStop = 0, keyRewind = 0,   // virtual-key codes, polled while
         keyRestart = 0;                                                                // a session runs
+    // Polled while idle (and the menu is closed): start a recording with the start below, or play the macro
+    int keyRecord = 0, keyPlay = 0;
+    int keyBookmark = 0;              // while a session runs: a bookmark on the current frame
+    StartKind recordStart = StartKind::Checkpoint;
+    std::string recordCommand, recordMap, recordCheckpoint;
 };
 
 struct Status {
@@ -120,5 +125,11 @@ bool LoadFile(const std::filesystem::path& path, std::string* error);
 bool SaveFile(const std::filesystem::path& path, std::string* error);
 void Clear();                         // stop, and start over with an empty replay
 std::filesystem::path Folder();       // replays/ next to the DLL (Init() writes the example macros there once)
+// Every recording is also saved here when it stops, the newest kAutosaves kept: a take is never lost to a crash, a new
+// recording or a forgotten Save.
+std::filesystem::path AutosaveFolder();
+constexpr int kAutosaves = 10;
+// The macro in memory has inputs, camera keys or bookmarks that weren't saved or loaded as they are now.
+bool Unsaved();
 
 } // namespace tas

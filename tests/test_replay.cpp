@@ -302,3 +302,38 @@ TEST(Replay, ExamplesLoad)
     }
     EXPECT_GT(count, 0u) << "no examples in " << folder.string();
 }
+
+TEST(Replay, MarkersSaveAndFollowEdits)
+{
+    Replay r = RunAndJump();
+    r.SetMarker(30, "before the jump");
+    r.SetMarker(10, "");                       // unnamed: "Frame 10"
+    r.SetMarker(30, "jump");                   // the same frame: renamed
+    ASSERT_EQ(r.markers.size(), 2u);
+    EXPECT_EQ(r.markers[0].name, "Frame 10");  // sorted by frame
+    EXPECT_EQ(r.markers[1].name, "jump");
+
+    const auto merp = std::filesystem::temp_directory_path() / "memenu_markers.merp";
+    const auto json = std::filesystem::temp_directory_path() / "memenu_markers.json";
+    ASSERT_TRUE(r.Save(merp, nullptr));
+    ASSERT_TRUE(r.ExportJson(json, nullptr));
+    for (const auto& path : {merp, json}) {
+        Replay back;
+        ASSERT_TRUE(path.extension() == ".json" ? back.ImportJson(path, nullptr) : back.Load(path, nullptr));
+        ASSERT_EQ(back.markers.size(), 2u) << path;
+        EXPECT_EQ(back.markers[1].frame, 30u);
+        EXPECT_EQ(back.markers[1].name, "jump");
+        std::filesystem::remove(path);
+    }
+    EXPECT_EQ(r.InputHash(), RunAndJump().InputHash());   // Bookmarks don't change how it plays
+
+    r.InsertFrames(5, 3, 1.f / 60.f);          // Both move 3 later
+    EXPECT_EQ(r.markers[0].frame, 13u);
+    EXPECT_EQ(r.markers[1].frame, 33u);
+    r.EraseFrames(30, 5);                      // The jump's frame is cut: it moves to the cut
+    EXPECT_EQ(r.markers[1].frame, 30u);
+    r.Truncate(20);                            // Past the end: gone
+    ASSERT_EQ(r.markers.size(), 1u);
+    EXPECT_TRUE(r.EraseMarker(13));
+    EXPECT_FALSE(r.EraseMarker(13));
+}

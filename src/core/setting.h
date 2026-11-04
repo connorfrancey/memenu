@@ -47,7 +47,8 @@ namespace ctl {
 		void Show(float width);
 
 		// What `slot` 0 (key) and 1 (keyAlt) do for this control, or nullptr if it has no such binding.
-		virtual const char *BindLabel(int slot) const { (void)slot; return nullptr; }
+		// The labels the control was made with (Checkbox: "Toggle", Slider: "Increase" / "Decrease", ...).
+		virtual const char *BindLabel(int slot) const { return slot == 0 ? binds_.key : slot == 1 ? binds_.keyAlt : nullptr; }
 		bool Bindable() const { return BindLabel(0) || BindLabel(1); }
 		// A bound key was pressed. Shows a short on-screen message with the new value.
 		void Press(int slot);
@@ -101,6 +102,7 @@ namespace ctl {
 	extern template class Value<int>;
 	extern template class Value<float>;
 	extern template class Value<std::array<float, 4>>;
+	extern template class Value<std::string>;
 
 	// ---- Value Controls --------------------------------------------------------------------------------------------------
 	class Checkbox final : public Value<bool> {
@@ -177,6 +179,16 @@ namespace ctl {
 		std::array<float, 4> Clamp(std::array<float, 4> v) const override;
 		void Draw(float width) override;
 		std::string Fire(int slot) override;
+	};
+
+	// A line of text: a box to type it in, saved like the others. Also a way to
+	// remember a choice by name (a file picked from a list): hide it with VisibleIf and Set() it.
+	class Text final : public Value<std::string> {
+	public:
+		Text(Module* owner, std::string name, std::string value = {}, std::string tooltip = {});
+
+	protected:
+		void Draw(float width) override;
 	};
 
 	// ---- Input ------------------------------------------------------------------------------------------------------

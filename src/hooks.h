@@ -15,5 +15,8 @@ namespace hooks {
     // renderer has been idle for a few calls; true when it presented a frame.
     void CaptureFrames(bool on);
     bool DrawWhileStalled();
-    unsigned StalledFrames();   // frames DrawWhileStalled presented so far (the self-test checks pausing with it)
+    unsigned StalledFrames();
+// Vertices the menu's ImGui frame drew last time (the menu window, every module's overlay): the self-test's "does this
+// module draw" check.
+unsigned MenuVertices();   // frames DrawWhileStalled presented so far (the self-test checks pausing with it)
 }

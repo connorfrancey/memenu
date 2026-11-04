@@ -293,7 +293,12 @@ bool player_state::Load()
 
     const Snapshot& s = g_save;
 
+    // Back into the walking states first, like the trainer. Without naming them, SetInitialState sends the controller
+    // to its default state, which ignores movement and jump input: the player couldn't jump and kept the restored
+    // acceleration, as if the saved velocity were forced on them.
+    pawn->InitialState = game::Name("Walking");
     pawn->SetInitialState();
+    controller->InitialState = game::Name("PlayerWalking");
     controller->SetInitialState();
 
     if (auto* hud = static_cast<ATdHUD*>(controller->myHUD)) {
@@ -314,6 +319,17 @@ bool player_state::Load()
     s.pawn.Restore(pawn);
     s.controller.Restore(controller);
     for (std::size_t i = 0; i < pawn->Moves.Num() && i < s.moves.size(); ++i) s.moves[i].Restore(pawn->Moves[i]);
+
+    // What the trainer clears after its copy: a state saved in a cutscene or a scripted move (look constraint,
+    // cinematic input locks) would otherwise keep the player locked after the load. Jump input is the live keyboard's,
+    // not the saved one: a jump held while saving must not count as held now.
+    pawn->bConstrainLook = false;
+    controller->bIgnoreMovementFocus = false;
+    controller->bCinemaDisableInputMove = false;
+    controller->bCinemaDisableInputLook = false;
+    controller->bCinematicMode = false;
+    controller->bPressedJump = false;
+    controller->bReleasedJump = true;
 
     if (auto* cyl = pawn->CylinderComponent) {
         cyl->CollisionHeight = s.collisionHeight;

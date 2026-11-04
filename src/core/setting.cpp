@@ -141,6 +141,19 @@ template class Value<bool>;
 template class Value<int>;
 template class Value<float>;
 template class Value<std::array<float, 4>>;
+template class Value<std::string>;
+
+// ---- Text --------------------------------------------------------------------------------------------------------------
+Text::Text(Module* owner, std::string name, std::string value, std::string tooltip)
+    : Value(owner, std::move(name), std::move(value), std::move(tooltip)) {}
+
+void Text::Draw(float width)
+{
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "%s", value_.c_str());
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::InputTextWithHint(("##" + Name()).c_str(), Name().c_str(), buf, sizeof buf)) Set(buf);
+}
 
 // ---- Checkbox --------------------------------------------------------------------------------------------------------
 Checkbox::Checkbox(Module* owner, std::string name, bool value, std::string tooltip)

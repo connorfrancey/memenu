@@ -1,6 +1,7 @@
 #include "game.h"
 #include "game/uobject.h"
 #include "core/cache.h"
+#include "unload.h"
 
 #include <Windows.h>
 
@@ -12,10 +13,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
-
 
 namespace {
     std::atomic<bool> g_ready{false};
@@ -103,6 +105,73 @@ namespace {
         return nullptr;
     }
 
+    // ---- Script events (UObject::ProcessEvent) ----------------------------------------------------------------------
+    // ProcessEvent runs thousands of times a frame, so the hook only compares the called function against a few cached
+    // pointers. The watch list only grows: an entry is written in full before the count that covers it is published.
+    constexpr int kMaxWatches = 8;
+    struct Watch
+    {
+        std::string name;
+        game::ScriptEventCallback callback = nullptr;
+    };
+    Watch g_watches[kMaxWatches];
+    std::atomic<Classes::UFunction*> g_watchFn[kMaxWatches];
+    std::atomic<int> g_watchCount{0};
+    std::atomic<bool> g_watchLookup{false};     // Some function is still to be looked up (game thread, next tick)
+    bool g_processEventHooked = false;          // Under g_mutex
+    int (__thiscall *oProcessEvent)(Classes::UObject*, Classes::UFunction*, void*, void*) = nullptr;
+
+    int __fastcall ProcessEventHook(Classes::UObject* self, void* /*edx*/, Classes::UFunction* fn, void* params, void* result)
+    {
+        const int n = g_watchCount.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            if (fn != g_watchFn[i].load(std::memory_order_relaxed) || !fn) continue;
+            try { g_watches[i].callback(self, params); }
+            catch (const std::exception& e) { spdlog::error("Script event {}: {}", g_watches[i].name, e.what()); }
+            catch (...) { spdlog::error("Script event {}: unknown exception", g_watches[i].name); }
+        }
+        return oProcessEvent(self, fn, params, result);
+    }
+
+    // Game thread. A full object walk per function (SDK FindObject compares full names): only done when something new
+    // is watched, and after a level load for the ones that weren't found.
+    void LookUpWatches()
+    {
+        if (!g_watchLookup.exchange(false)) return;
+        const int n = g_watchCount.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            if (g_watchFn[i].load()) continue;
+            auto* fn = Classes::UObject::FindObject<Classes::UFunction>(g_watches[i].name);
+            g_watchFn[i].store(fn);
+            if (fn) spdlog::info("Script event: watching {}", g_watches[i].name);
+            else    spdlog::warn("Script event: {} not found (looked again after the next level load)", g_watches[i].name);
+        }
+    }
+
+    // Under g_mutex.
+    bool HookProcessEvent()
+    {
+        if (g_processEventHooked) return true;
+        // mmultiplayer's pattern for UObject::ProcessEvent; the SDK calls it as virtual function 61, the fallback.
+        void* target = FindPattern("\x56\x8B\xF1\x8B\x0D\x00\x00\x00\x00\x85\xC9\x74\x09", "xxxxx????xxxx");
+        void* fromVtable = nullptr;
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        for (std::size_t i = 0; i < objects.Num() && !fromVtable; ++i)
+            if (const auto* o = objects.GetByIndex(i)) fromVtable = (*reinterpret_cast<void* const* const*>(o))[61];
+        if (target && fromVtable && target != fromVtable)
+            spdlog::warn("ProcessEvent: the pattern ({}) and the vtable ({}) disagree, using the pattern", target, fromVtable);
+        if (!target) target = fromVtable;
+        if (!target) { spdlog::error("ProcessEvent not found: script events (speedrun auto splits) won't work"); return false; }
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&ProcessEventHook), reinterpret_cast<void**>(&oProcessEvent)) != MH_OK ||
+            MH_EnableHook(target) != MH_OK) {
+            spdlog::error("Could not hook ProcessEvent: script events (speedrun auto splits) won't work");
+            return false;
+        }
+        g_processEventHooked = true;
+        spdlog::info("ProcessEvent hooked");
+        return true;
+    }
+
     // ---- Hooks ------------------------------------------------------------------------------------------------------
     void DrainQueue()
     {
@@ -175,6 +244,7 @@ namespace {
 
             DrainQueue();
             ApplyInputBlock();
+            LookUpWatches();
 
             std::vector<game::TickCallback> callbacks;
             {
@@ -216,6 +286,8 @@ namespace {
         for (auto cb : callbacks) cb(false);
         const int ret = oLevelLoad(self, levelInfo, arg);
         g_loading = false;
+        for (int i = 0, n = g_watchCount.load(); i < n; ++i)
+            if (!g_watchFn[i].load()) g_watchLookup = true;     // Its package may have come with the level
         for (auto cb : callbacks) cb(true);
         return ret;
     }
@@ -227,6 +299,76 @@ namespace {
             return false;
         }
         return true;
+    }
+}
+
+// ---- Early injection ------------------------------------------------------------------------------------------------
+// Every SDK StaticClass() and function wrapper looks its object up once and keeps the answer in a static, a null one too.
+// A loader that injects the menu before the game has loaded its script packages (TinyModInjector on Linux/Proton does:
+// 1.6k names instead of ~43k) would make those lookups find nothing for the whole session: no player, no IsA, no SDK
+// calls. So game::Init waits for TdGame's classes before anything asks for one.
+namespace {
+    // Index of `name` in the engine's name table, -1 if it isn't there (yet). No allocation, no lock: it runs inside the
+    // guarded walk below.
+    int RawNameIndex(const wchar_t* name)
+    {
+        const auto& names = Classes::FName::GetGlobalNames();
+        for (std::size_t i = 0; i < names.Num(); ++i) {
+            const Classes::FNameEntry* e = names[i];
+            if (e && std::wcscmp(e->GetWideName(), name) == 0) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    // A UClass named TdPlayerPawn (an object of that name whose own class is "Class"). Reads the game's name and object
+    // lists while the game is still loading them (they can grow under us).
+    bool HasPawnClass()
+    {
+        const int pawn = RawNameIndex(L"TdPlayerPawn"), cls = RawNameIndex(L"Class");
+        if (pawn < 0 || cls < 0) return false;
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        for (std::size_t i = 0; i < objects.Num(); ++i) {
+            const Classes::UObject* o = objects.GetByIndex(i);
+            if (o && o->Name.Index == pawn && o->Class && o->Class->Name.Index == cls) return true;
+        }
+        return false;
+    }
+
+    // The MSVC build guards the walk: a list reallocated mid-read is a miss, tried again 100 ms later.
+    bool ScriptClassesLoaded()
+    {
+#ifdef _MSC_VER
+        __try { return HasPawnClass(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+        return HasPawnClass();
+#endif
+    }
+
+    // Returns false if the menu is asked to unload meanwhile, or the classes never turn up.
+    bool WaitForScriptClasses()
+    {
+        if (ScriptClassesLoaded()) return true;
+        spdlog::info("Game: the menu was loaded before the game's script classes ({} names so far): waiting for them",
+                     Classes::FName::GetGlobalNames().Num());
+        constexpr ULONGLONG kTimeoutMs = 180000;
+        const ULONGLONG start = GetTickCount64();
+        while (GetTickCount64() - start < kTimeoutMs) {
+            if (unload::Requested()) {
+                SetEvent(unload::Event());     // Requested() took the END press: the menu's main loop must still see it
+                return false;
+            }
+            Sleep(100);
+            if (ScriptClassesLoaded()) {
+                Sleep(500);     // Its package is still being linked: let the rest of its classes come in
+                spdlog::info("Game: script classes loaded after {} ms ({} names, {} objects)", GetTickCount64() - start,
+                             Classes::FName::GetGlobalNames().Num(), Classes::UObject::GetGlobalObjects().Num());
+                return true;
+            }
+        }
+        spdlog::error("Game: TdGame's classes did not load within {} s: game features will not work",
+                      kTimeoutMs / 1000);
+        return false;
     }
 }
 
@@ -280,6 +422,8 @@ bool game::Init()
 
     spdlog::info("SDK globals: GNames={} entries, GObjects={} objects",
                  Classes::FName::GetGlobalNames().Num(), Classes::UObject::GetGlobalObjects().Num());
+    // Before the first StaticClass() (CheckObjectLayout is one): see WaitForScriptClasses
+    if (!WaitForScriptClasses()) return false;
     CheckObjectLayout();   // Only logs: the menu and most features work without class reflection
 
     ptr = FindPattern(
@@ -345,6 +489,46 @@ void game::OnPlayerStateChange(StateChangeCallback callback)
     }
     std::lock_guard lock(g_mutex);
     g_stateChangeCallbacks.push_back(callback);
+}
+
+bool game::OnScriptEvent(const char* fullName, ScriptEventCallback callback)
+{
+    if (!g_ready || !fullName || !callback) return false;
+    std::lock_guard lock(g_mutex);
+    if (!HookProcessEvent()) return false;
+    const int n = g_watchCount.load();
+    if (n >= kMaxWatches) { spdlog::error("Script event {}: too many watched already", fullName); return false; }
+    g_watches[n] = {fullName, callback};
+    g_watchFn[n].store(nullptr);
+    g_watchCount.store(n + 1, std::memory_order_release);
+    g_watchLookup = true;
+    return true;
+}
+
+bool game::ScriptEventsReady()
+{
+    {
+        std::lock_guard lock(g_mutex);
+        if (!g_processEventHooked) return false;
+    }
+    const int n = g_watchCount.load();
+    for (int i = 0; i < n; ++i)
+        if (!g_watchFn[i].load()) return false;
+    return n > 0;
+}
+
+bool game::BlockingLoad()
+{
+    const auto* world = World();
+    return world && world->bRequestedBlockOnAsyncLoading;
+}
+
+std::string game::MapName()
+{
+    Classes::UObject* o = World();      // The persistent level's package: follow Outer up from the WorldInfo
+    if (!o) return {};
+    for (int guard = 0; o->Outer && guard < 16; ++guard) o = o->Outer;
+    return o->GetName();
 }
 
 void* game::FindPattern(const char* pattern, const char* mask)

@@ -1,5 +1,6 @@
 #include "tas/tas.h"
 #include "tas/engine.h"
+#include "tas/input_monitor.h"
 #include "tas/examples.h"
 #include "tas/timeline.h"
 
@@ -22,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -179,7 +181,7 @@ bool SameName(const std::string& a, const std::string& b)
 bool IsHotkey(const engine::RawInput& in)
 {
     const int hash = opt.keyPause * 31 + opt.keyAdvance * 37 + opt.keyTakeOver * 41 + opt.keyStop * 43 + opt.keyRewind * 47 +
-                     opt.keyRestart * 53;
+                     opt.keyRestart * 53 + opt.keyRecord * 59 + opt.keyPlay * 61 + opt.keyBookmark * 67;
     if (hash != s.hotkeyHash) {
         s.hotkeyNames.clear();
         s.hotkeyHash = hash;
@@ -189,8 +191,8 @@ bool IsHotkey(const engine::RawInput& in)
 
     const std::string name = EngineName(in.nameIndex, in.nameNumber);
     bool hit = false;
-    for (int vk : {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart, VK_INSERT,
-                   VK_END})
+    for (int vk : {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart, opt.keyRecord,
+                   opt.keyPlay, opt.keyBookmark, VK_INSERT, VK_END})
         if (vk && SameName(name, UnrealKeyName(vk))) hit = true;
     s.hotkeyNames[key] = hit;
     return hit;
@@ -211,18 +213,38 @@ void RewindNow(const char* why);
 void RestartNow();
 void PublishStatus();
 
+void RecordNow(StartKind start, const std::string& command, const std::string& map, const std::string& checkpoint,
+               float hz);
+void Begin(Mode mode);
+
 void PollHotkeys()
 {
-    constexpr int kKeys = 6;
+    constexpr int kKeys = 9;
     static bool was[kKeys]{};
-    const int keys[kKeys] = {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart};
+    const int keys[kKeys] = {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart,
+                             opt.keyRecord, opt.keyPlay, opt.keyBookmark};
     bool edge[kKeys]{};
     for (int i = 0; i < kKeys; ++i) {
         const bool down = keys[i] && (GetAsyncKeyState(keys[i]) & 0x8000);
         edge[i] = down && !was[i];
         was[i] = down;
     }
-    if (s.mode == Mode::Idle || !GameFocused()) return;
+    if (!GameFocused()) return;
+    if (s.mode == Mode::Idle) {
+        // Starting needs the menu closed: with it open, keys are typed into it
+        if (gui::visible) return;
+        if (edge[6]) RecordNow(opt.recordStart, opt.recordCommand, opt.recordMap, opt.recordCheckpoint, opt.recordHz);
+        if (edge[7]) {
+            bool empty;
+            {
+                std::lock_guard lock(g_mutex);
+                empty = g_replay.frames.empty();
+            }
+            if (empty) SetMessage("nothing to play", true);
+            else Begin(Mode::Playing);
+        }
+        return;
+    }
 
     if (edge[0]) g_paused = !g_paused;
     if (edge[1]) {
@@ -233,6 +255,12 @@ void PollHotkeys()
     if (edge[3]) StopNow("stopped");
     if (edge[4] && s.mode == Mode::Recording && !s.armed) RewindNow("rewound");
     if (edge[5]) RestartNow();
+    if (edge[8] && !s.armed) {
+        std::lock_guard lock(g_mutex);
+        const auto frame = static_cast<std::uint32_t>(std::min(s.frame, g_replay.frames.empty() ? 0 : g_replay.frames.size() - 1));
+        g_replay.SetMarker(frame, "Bookmark " + std::to_string(g_replay.markers.size() + 1));
+        notify::Push("TAS: bookmark at frame " + std::to_string(frame));
+    }
 }
 
 // ---- input --------------------------------------------------------------------------------------------------------------
@@ -660,16 +688,60 @@ void Begin(Mode mode)
     SetMessage("loading the start level");
 }
 
+// What Unsaved() compares: the inputs (and camera keys), and the bookmarks. Under g_mutex.
+std::uint64_t ContentHash(const Replay& r)
+{
+    std::uint64_t h = r.InputHash() ^ (static_cast<std::uint64_t>(r.frames.size()) << 1);
+    for (const Marker& m : r.markers) {
+        h = (h ^ m.frame) * 0x100000001B3ull;
+        for (char c : m.name) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001B3ull;
+    }
+    return h;
+}
+std::uint64_t g_savedHash = ContentHash(Replay{});      // Under g_mutex: the content as last saved / loaded
+
+// autosave/<date-time>.merp, and the oldest ones beyond kAutosaves deleted.
+void Autosave(Replay r)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dir = AutosaveFolder();
+    fs::create_directories(dir, ec);
+    char name[48];
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &now);
+    std::strftime(name, sizeof name, "%Y-%m-%d %H-%M-%S", &tm);
+    r.botName = "MirrorsEdgeMenu";
+    r.botVersion = "1.0";
+    if (r.description.empty()) r.description = std::string("autosave ") + name;
+    std::string error;
+    if (!r.Save(dir / (std::string(name) + kFileExtension), &error)) {
+        spdlog::warn("TAS: autosave failed: {}", error);
+        return;
+    }
+    std::vector<fs::directory_entry> saves;
+    for (const auto& e : fs::directory_iterator(dir, ec))
+        if (e.is_regular_file(ec) && e.path().extension() == kFileExtension) saves.push_back(e);
+    std::sort(saves.begin(), saves.end(), [](const auto& a, const auto& b) { return a.path().filename() > b.path().filename(); });
+    for (std::size_t i = kAutosaves; i < saves.size(); ++i) fs::remove(saves[i].path(), ec);   // Names sort by date
+}
+
 void StopNow(const char* why)
 {
     if (s.mode == Mode::Idle) return;
     ReleaseHeld();
     if (s.mode == Mode::Recording) {
         const Env env = s.recordEnv.valid ? s.recordEnv : ReadEnv();
-        std::lock_guard lock(g_mutex);
-        g_replay.syncValidUntil = static_cast<std::uint32_t>(g_replay.frames.size());
-        WriteEnv(g_replay, env, s.recordEnv.valid ? s.recordStreaming : s.blockStreaming,
-                 s.recordEnv.valid ? s.recordMods : opt.gameplayMods);
+        Replay copy;
+        {
+            std::lock_guard lock(g_mutex);
+            g_replay.syncValidUntil = static_cast<std::uint32_t>(g_replay.frames.size());
+            WriteEnv(g_replay, env, s.recordEnv.valid ? s.recordStreaming : s.blockStreaming,
+                     s.recordEnv.valid ? s.recordMods : opt.gameplayMods);
+            if (g_replay.frames.size() >= 30) copy = g_replay;     // Half a second or more: worth keeping
+        }
+        if (!copy.frames.empty()) Autosave(copy);
     }
     RestoreInput();
     s.recordEnv = {};
@@ -920,6 +992,10 @@ void PlaybackEnded()
         case AtEnd::Record: TakeOverNow(); break;
         case AtEnd::Pause:  g_paused = true; SetMessage("end of the replay (paused)"); break;
         case AtEnd::Stop:   StopNow("end of the replay"); break;
+        case AtEnd::Loop:
+            RestartNow();
+            SetMessage("looping");
+            break;
     }
 }
 
@@ -1134,6 +1210,7 @@ bool Init()
     if (!engine::Init()) return false;
     engine::SetFrameHandler(&OnFrame);
     engine::SetInputFilter(&FilterInput);
+    input::Install();               // What the engine gets, for the input display
     game::OnLevelLoad(&OnLevelLoad);
     std::lock_guard lock(g_mutex);
     g_status.available = true;
@@ -1359,6 +1436,7 @@ void Clear()
         StopNow("cleared");
         std::lock_guard lock(g_mutex);
         g_replay.Clear();
+        g_savedHash = ContentHash(g_replay);
         s.resolved.clear();
     });
 }
@@ -1382,6 +1460,7 @@ bool LoadFile(const std::filesystem::path& path, std::string* error)
         {
             std::lock_guard lock(g_mutex);
             g_replay = std::move(r);
+            g_savedHash = ContentHash(g_replay);
         }
         s.resolved.clear();
     });
@@ -1394,10 +1473,18 @@ bool SaveFile(const std::filesystem::path& path, std::string* error)
     g_replay.botName = "MirrorsEdgeMenu";
     g_replay.botVersion = "1.0";
     if (!g_replay.gameStamp) g_replay.gameStamp = engine::GameStamp();
-    if (path.extension() == ".json") return g_replay.ExportJson(path, error);
-    return g_replay.Save(path, error);
+    const bool ok = path.extension() == ".json" ? g_replay.ExportJson(path, error) : g_replay.Save(path, error);
+    if (ok) g_savedHash = ContentHash(g_replay);
+    return ok;
 }
 
 std::filesystem::path Folder() { return paths::Dir() / "replays"; }
+std::filesystem::path AutosaveFolder() { return Folder() / "autosave"; }
+
+bool Unsaved()
+{
+    std::lock_guard lock(g_mutex);
+    return !g_replay.frames.empty() && ContentHash(g_replay) != g_savedHash;
+}
 
 } // namespace tas

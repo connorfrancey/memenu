@@ -1,6 +1,7 @@
 #include "selftest.h"
 
 #include "core/module.h"
+#include "core/notify.h"
 #include "core/scheduler.h"
 #include "core/cache.h"
 #include "core/setting.h"
@@ -11,9 +12,18 @@
 #include "unload.h"
 #if MEMENU_GAME
 #include "game/game.h"
+#include "game/uobject.h"
 #include "game/levels.h"
 #include "game/player_state.h"
+#if MEMENU_FEATURE_SPEEDRUN_TIMER
+#include "speedrun/live.h"
+#endif
+#if MEMENU_FEATURE_COLLISION_VIEW
+#include "game/debug_world.h"
+#endif
 #if MEMENU_FEATURE_TAS
+#include "features/tas/timeline_view.h"
+#include "tas/input_monitor.h"
 #include "tas/macro.h"
 #include "tas/timeline.h"
 #include "tas/tas.h"
@@ -21,16 +31,19 @@
 
 #include <ME_SDK.hpp>
 #include <cmath>
+#include <cstdio>
 #endif
 
 #include <Windows.h>
 #include <nlohmann/json.hpp>
+#include "game/object_ref.h"
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -52,6 +65,9 @@ struct Options {
     unsigned ticks = 10;        // Engine ticks (and frames) each module stays on
     std::set<std::string> only, skip;
     bool quit = true;
+    // The engine's frame rate cap (62) off while testing, and TAS playbacks that don't depend on pacing as fast as they
+    // go: the waits count frames and ticks, so they pass as fast as the PC draws. Off: the game as players run it.
+    bool fast = true;
 };
 
 struct Step {
@@ -223,6 +239,33 @@ bool OnGameThread(std::function<void()> fn, double timeout = 5.0)
     return RunAndWait([](std::function<void()> f) { game::RunOnGameThread(std::move(f)); }, std::move(fn), timeout);
 }
 
+// Why the player can't be moved right now ("" when they can): no pawn, a cutscene, input held back by the level's
+// scripting, frozen. After a load the game holds the player for a moment; a count of ticks is no measure of that (with
+// the frame rate cap off, 30 ticks pass in a tenth of a second), this is.
+std::string PlayerNotReady()
+{
+    std::string why = "the game thread did not answer";
+    OnGameThread([&] {
+        auto* pawn = game::Pawn();
+        auto* pc = game::Controller();
+        if (!pawn || !pc) why = "no player";
+        else if (pawn->bCutsceneIsSkippable || pc->bCinematicMode) why = "in a cutscene";
+        else if (pc->bIgnoreMoveInput) why = "the level holds back the player's input";
+        else if (pc->bFrozen) why = "the player is frozen";
+        else why.clear();
+    }, 1.0);
+    return why;
+}
+
+// Waits until the player can be moved, then a quarter second more (the level's own scripts settle). The reason when not.
+std::string WaitPlayerReady(double timeout = 30.0)
+{
+    std::string why;
+    if (!WaitFor(timeout, [&] { why = PlayerNotReady(); return why.empty(); })) return why;
+    Wait(0.25);
+    return PlayerNotReady();
+}
+
 // Evaluates `check` on the game thread: "" when it holds, else what is wrong.
 std::string Verify(const std::function<std::string()>& check)
 {
@@ -298,16 +341,39 @@ Expectation ExpectationFor(Module& m)
                 [] { return Expect(player_state::HasSave(), "no state was saved"); }, {}};
     if (name == "Load State")
         return {[] { if (auto* p = game::Pawn()) { p->Location.X += 2000.f; p->Velocity = Classes::FVector{}; } },   // Move away
-                [] { return WithPlayer([](ATdPlayerPawn* p, ATdPlayerController*) {
+                [] { return WithPlayer([](ATdPlayerPawn* p, ATdPlayerController* c) {
                     const float d = Distance(p->Location, g_savedAt);
-                    return d < 150.f ? std::string() : "the player is " + std::to_string(static_cast<int>(d)) +
-                                                       " units from the saved position after loading it"; }); },
+                    if (d >= 150.f) return "the player is " + std::to_string(static_cast<int>(d)) +
+                                           " units from the saved position after loading it";
+                    // The controller left in its default state ignores movement and jump input after a load. (The SDK's
+                    // GetStateName() always answers None; IsInState works.)
+                    return c->IsInState(game::Name("PlayerWalking"), false)
+                               ? std::string()
+                               : std::string("the controller is not in PlayerWalking after loading (no move or jump input)"); }); },
                 {}};
     if (name == "Refill Reaction Time")
         return {[] { if (auto* c = game::Controller()) c->ReactionTimeEnergy = 0.f; },
                 [] { return WithPlayer([](ATdPlayerPawn*, ATdPlayerController* c) {
                     return Expect(c->ReactionTimeEnergy >= 99.f, "the reaction time meter was not refilled"); }); },
                 {}};
+    if (name == "Clear Frame") {
+        // The live engine (not its class default): one walk of the object list, it lives as long as the game
+        static Classes::UEngine* engine = nullptr;
+        static bool was = false;
+        return {[] {
+                    engine = nullptr;
+                    const auto& objects = Classes::UObject::GetGlobalObjects();
+                    for (std::size_t i = 0; i < objects.Num() && !engine; ++i) {
+                        auto* o = objects.GetByIndex(i);
+                        if (o && game::IsA(o, Classes::UGameEngine::StaticClass()) && o->GetName().rfind("Default__", 0) != 0)
+                            engine = static_cast<Classes::UEngine*>(o);
+                    }
+                    if (engine) was = engine->bEnableColorClear != 0;
+                },
+                [] { return Expect(engine && engine->bEnableColorClear, "the engine's bEnableColorClear is not set"); },
+                [] { return Expect(engine && (engine->bEnableColorClear != 0) == was,
+                                   "bEnableColorClear not put back after switching off"); }};
+    }
     if (name == "FOV") {
         auto* slider = dynamic_cast<ctl::Slider*>(m.FindSetting("Degrees"));
         return {[slider] { if (slider) slider->Set(110.f); },
@@ -466,20 +532,9 @@ bool TestLevel()
         p.Problem("the level did not finish loading within 120 s");
     else if (!WaitFor(60.0, [] { return game::GetStatus().hasPawn && !game::IsLoading(); }))
         p.Problem("no player pawn 60 s after the level loaded");
-    else {
-        WaitTicks(30);   // Let streaming settle
-        // A cutscene holds the player in place: nothing that moves them could be checked
-        bool inCutscene = true;
-        WaitFor(30.0, [&] {
-            OnGameThread([&] { auto* pawn = game::Pawn(); inCutscene = !pawn || pawn->bCutsceneIsSkippable; }, 1.0);
-            return !inCutscene;
-        });
-        if (inCutscene) {
-            bool cinematic = false;
-            OnGameThread([&] { if (auto* c = game::Controller()) cinematic = c->bCinematicMode != 0; });
-            p.Problem(std::string("the player is still in a cutscene 30 s after loading (pick another checkpoint); "
-                                  "controller cinematic mode: ") + (cinematic ? "on" : "off"));
-        }
+    else if (const std::string why = WaitPlayerReady(30.0); !why.empty()) {
+        // Nothing that moves the player could be checked
+        p.Problem("30 s after loading, the player can't be moved: " + why + " (pick another checkpoint)");
     }
     s.notes.push_back(levels::LastMessage());
     p.Check(1, true);
@@ -532,6 +587,34 @@ std::string KeyFor(ATdPlayerController* pc, const std::string& command, const ch
     return fallback;
 }
 
+// The TAS module's "As fast as possible" for the length of a test (its playbacks then run unpaced), put back after.
+class ScopedTasSpeed {
+public:
+    explicit ScopedTasSpeed(bool fast)
+    {
+        if (!fast) return;
+        modules::ForEach([&](modules::Tab&, Module& m) {
+            if (m.Name() == "TAS / Macro") box_ = dynamic_cast<ctl::Checkbox*>(m.FindSetting("As fast as possible"));
+        });
+        if (!box_) return;
+        was_ = box_->Get();
+        OnRenderThread([this] { box_->Set(true); });
+        WaitTicks(2);
+    }
+    ~ScopedTasSpeed()
+    {
+        if (!box_) return;
+        OnRenderThread([this] { box_->Set(was_); });
+        WaitTicks(2);
+    }
+    ScopedTasSpeed(const ScopedTasSpeed&) = delete;
+    ScopedTasSpeed& operator=(const ScopedTasSpeed&) = delete;
+
+private:
+    ctl::Checkbox* box_ = nullptr;
+    bool was_ = false;
+};
+
 // A macro played through the TAS: the player's forward key held for a second with a jump half way, written with
 // tas::Macro instead of recorded. Proves the whole playback path in the game: the replay's key names resolve, the
 // inputs reach the player through the engine, every frame runs, and the keys are let go at the end.
@@ -565,6 +648,12 @@ void TestTasMacro()
         return;
     }
     s.notes.push_back("keys: forward " + forward + ", jump " + jump);
+    if (const std::string why = WaitPlayerReady(10.0); !why.empty()) {
+        p.Problem("the player can't be moved: " + why);
+        p.Check(1, false);
+        End(s);
+        return;
+    }
 
     tas::Macro m(60.f);
     m.Describe("memenu self-test: run forward, jump").Wait(5).Press(forward).Wait(30).Hold(jump, 2).Wait(28)
@@ -591,12 +680,15 @@ void TestTasMacro()
             pausedOnce = true;
             gui::visible = true;
             const unsigned before = hooks::StalledFrames();
+            const ULONGLONG pausedAt = GetTickCount64();
             tas::TogglePause();
-            Sleep(1500);
+            // 20 menu frames drawn by the paused game thread (or 3 s without them: the problem below)
+            WaitFor(3.0, [before] { return hooks::StalledFrames() - before >= 20; });
             if (!tas::GetStatus().paused) p.Problem("pausing the playback didn't pause it");
             const unsigned drawn = hooks::StalledFrames() - before;
             if (drawn == 0) p.Problem("the menu was not drawn while paused");
-            s.notes.push_back("paused 1.5 s: " + std::to_string(drawn) + " menu frames drawn meanwhile");
+            s.notes.push_back("paused " + std::to_string(GetTickCount64() - pausedAt) + " ms: " + std::to_string(drawn) +
+                              " menu frames drawn meanwhile");
             tas::TogglePause();
             gui::visible = false;
             continue;
@@ -791,6 +883,219 @@ void TestTasGoto()
     End(s);
 }
 
+// The TAS's workflow helpers, with a "now" macro recorded on the spot:
+//   1. a recording is autosaved when it stops, and counts as not saved until it is
+//   2. bookmarks survive a save and a load (and count as changes)
+//   3. "At the end: Loop" plays it again from the start
+//   4. while a session runs, its keys don't reach module hotkeys (No Clip and TAS pause both on F5 by default)
+// The user's macro, settings and files are put back.
+void TestTasWorkflow()
+{
+    Step& s = Begin("TAS workflow");
+    Probe p(s);
+    const auto fail = [&](const std::string& why) {
+        p.Problem(why);
+        p.Check(1, false);
+        End(s);
+    };
+    if (!tas::Available()) return fail("the TAS engine hooks were not found");
+    Module* tasModule = nullptr;
+    Module* noClip = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& m) {
+        if (m.Name() == "TAS / Macro") tasModule = &m;
+        if (m.Name() == "No Clip") noClip = &m;
+    });
+    auto* atEnd = tasModule ? dynamic_cast<ctl::Combo*>(tasModule->FindSetting("At the end")) : nullptr;
+    auto* pauseKey = tasModule ? dynamic_cast<ctl::KeyHold*>(tasModule->FindSetting("Pause / resume")) : nullptr;
+    if (!atEnd || !pauseKey) return fail("the TAS module's At the end / Pause key controls were not found");
+    const int atEndWas = atEnd->Get();
+    tas::Replay saved;
+    tas::WithReplay([&](tas::Replay& r) { saved = r; });
+
+    namespace fs = std::filesystem;
+    const auto newestAutosave = [] {
+        fs::path newest;
+        fs::file_time_type at{};
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(tas::AutosaveFolder(), ec))
+            if (e.is_regular_file(ec) && e.last_write_time(ec) > at) { at = e.last_write_time(ec); newest = e.path(); }
+        return newest;
+    };
+    const fs::path autosaveBefore = newestAutosave();
+    const auto idle = [] { return tas::GetStatus().mode == tas::Mode::Idle; };
+
+    // 1. Record a second, stop
+    OnRenderThread([] { gui::visible = false; });
+    tas::Record(tas::StartKind::Now, "", "", "");
+    if (!WaitFor(10.0, [] { const auto st = tas::GetStatus(); return st.mode == tas::Mode::Recording && st.frame >= 60; }))
+        p.Problem("the recording didn't get going");
+    tas::Stop();
+    WaitFor(5.0, idle);
+    const fs::path autosave = newestAutosave();
+    if (autosave.empty() || autosave == autosaveBefore) p.Problem("the recording was not autosaved");
+    else s.notes.push_back("autosaved as " + autosave.filename().string());
+    if (!tas::Unsaved()) p.Problem("a new recording doesn't count as not saved");
+
+    // 2. Bookmarks through a save and a load
+    const fs::path file = tas::Folder() / "memenu self-test.merp";
+    tas::WithReplay([](tas::Replay& r) { r.SetMarker(10, "self-test mark"); });
+    std::string error;
+    if (!tas::SaveFile(file, &error)) p.Problem("saving failed: " + error);
+    else if (tas::Unsaved()) p.Problem("still not saved after saving");
+    tas::WithReplay([](tas::Replay& r) { r.EraseMarker(10); });
+    if (!tas::Unsaved()) p.Problem("deleting a bookmark doesn't count as a change");
+    if (!tas::LoadFile(file, &error)) p.Problem("loading failed: " + error);
+    bool marked = false;
+    WaitFor(5.0, [&] {
+        tas::WithReplay([&](tas::Replay& r) { const auto* m = r.MarkerAt(10); marked = m && m->name == "self-test mark"; });
+        return marked;
+    });
+    if (!marked) p.Problem("the bookmark was not in the saved file");
+    else if (tas::Unsaved()) p.Problem("a macro just loaded counts as not saved");
+    std::error_code ec;
+    fs::remove(file, ec);
+
+    // Undo through the editors' shared history, on the replay in the game
+    bool undone = false;
+    tas::WithReplay([&](tas::Replay& r) {
+        tasui::History().Watch(r);
+        tasui::History().Push(r, "self-test bookmark");
+        r.SetMarker(20, "undo me");
+        tasui::History().Watch(r);
+        undone = tasui::History().Undo(r) && !r.MarkerAt(20) && r.MarkerAt(10);
+    });
+    if (!undone) p.Problem("undo didn't take the edit back");
+
+    // 3. Loop, and 4. the session's keys while it plays. The timeline and the replay editor are open meanwhile (drawn
+    // with a macro running: they must not trip over it).
+    auto* timelineBox = dynamic_cast<ctl::Checkbox*>(tasModule->FindSetting("Timeline"));
+    auto* editorBox = dynamic_cast<ctl::Checkbox*>(tasModule->FindSetting("Replay editor"));
+    const bool timelineWas = timelineBox && timelineBox->Get(), editorWas = editorBox && editorBox->Get();
+    OnRenderThread([&] {
+        atEnd->Set(static_cast<int>(tas::AtEnd::Loop));
+        gui::visible = true;
+        if (timelineBox) timelineBox->Set(true);
+        if (editorBox) editorBox->Set(true);
+    });
+    WaitTicks(2);
+    tas::Play();
+    bool nearEnd = false, looped = false;
+    const ULONGLONG deadline = GetTickCount64() + 15000;
+    while (GetTickCount64() < deadline && !g_aborted && !looped) {
+        const auto st = tas::GetStatus();
+        if (st.mode == tas::Mode::Playing && !st.armed && st.frames > 0) {
+            if (st.frame + 5 >= st.frames) nearEnd = true;
+            else if (nearEnd && st.frame < 20) looped = true;
+        }
+        Sleep(5);
+    }
+    if (!looped) p.Problem(std::string("Loop didn't play it again (") + (nearEnd ? "reached the end" : "never reached the end") + ")");
+    else s.notes.push_back("looped back to the start");
+
+    if (noClip && tas::GetStatus().mode == tas::Mode::Playing) {
+        const int vk = pauseKey->Get(), keyWas = noClip->key;
+        const bool onWas = noClip->Enabled();
+        bool switched = false;
+        OnRenderThread([&] {
+            noClip->key = vk;               // The same key as the TAS's pause, like the defaults
+            modules::OnKey(vk);
+            switched = noClip->Enabled() != onWas;
+            if (switched) noClip->SetEnabled(onWas);
+            noClip->key = keyWas;
+        });
+        if (switched) p.Problem("the TAS's pause key also switched No Clip during a session");
+        else s.notes.push_back("the pause key didn't reach No Clip during the session");
+    }
+    tas::Stop();
+    WaitFor(5.0, idle);
+
+    // Back as it was
+    if (!autosave.empty() && autosave != autosaveBefore) fs::remove(autosave, ec);
+    tas::WithReplay([&](tas::Replay& r) { r = saved; });
+    OnRenderThread([&] {
+        atEnd->Set(atEndWas);
+        if (timelineBox) timelineBox->Set(timelineWas);
+        if (editorBox) editorBox->Set(editorWas);
+        gui::visible = true;
+    });
+    WaitTicks(3);
+    p.Check(1, true);
+    End(s);
+}
+
+#if MEMENU_FEATURE_INPUT_OVERLAY
+// The input overlay during a TAS playback: a macro holds the forward key for half a second; the input the engine gets
+// (what the overlay draws) must show it held while it plays and let go after. The overlay writes its layouts on first use.
+void TestInputOverlay()
+{
+    Step& s = Begin("Input overlay");
+    Probe p(s);
+    const auto fail = [&](const std::string& why) {
+        p.Problem(why);
+        p.Check(1, false);
+        End(s);
+    };
+    if (!tas::input::Installed()) return fail("the engine's input monitor isn't installed");
+    Module* overlay = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& m) { if (m.Name() == "Input Overlay") overlay = &m; });
+    if (!overlay) return fail("the Input Overlay module was not found");
+    const bool enabledWas = overlay->Enabled();
+    OnRenderThread([&] { overlay->SetEnabled(true); });
+
+    std::string forward;
+    OnGameThread([&] { forward = KeyFor(game::Controller(), "GBA_MoveForward", "W"); });
+    std::string key = forward;
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    tas::Macro m(60.f);
+    m.Describe("memenu self-test: input overlay").Wait(5).Press(forward).Wait(30).Release(forward).Wait(15);
+    tas::Replay saved;
+    tas::WithReplay([&](tas::Replay& r) { saved = r; r = m.Build(); });
+    OnRenderThread([] { gui::visible = false; });
+    const auto pressesOf = [&key](const tas::input::Snapshot& sn) {
+        const auto it = sn.keys.find(key);
+        return it == sn.keys.end() ? 0u : it->second.presses;
+    };
+    const unsigned pressesBefore = pressesOf(tas::input::Get());
+    tas::Play();
+
+    bool started = false, sawHeld = false;
+    const ULONGLONG deadline = GetTickCount64() + 15000;
+    while (GetTickCount64() < deadline && !g_aborted) {
+        const auto st = tas::GetStatus();
+        if (st.mode == tas::Mode::Playing) started = true;
+        if (started && (st.mode != tas::Mode::Playing || st.frame + 1 >= st.frames)) break;
+        const auto snap = tas::input::Get();
+        if (const auto it = snap.keys.find(key); it != snap.keys.end() && it->second.held) sawHeld = true;
+        Sleep(2);
+    }
+    tas::Stop();
+    WaitFor(5.0, [] { return tas::GetStatus().mode == tas::Mode::Idle; });
+    WaitTicks(5);
+    const auto after = tas::input::Get();
+    const auto it = after.keys.find(key);
+    const unsigned pressed = pressesOf(after) - pressesBefore;
+    if (!started) p.Problem("the macro didn't play");
+    else if (pressed != 1) p.Problem("the overlay counted " + std::to_string(pressed) + " presses of " + forward + ", not 1");
+    else if (it != after.keys.end() && it->second.held) p.Problem(forward + " still shows as held after the playback");
+    else s.notes.push_back(forward + " pressed once during the playback" + (sawHeld ? " (seen held)" : "") +
+                           ", let go after");
+
+    std::error_code ec;
+    if (!std::filesystem::exists(paths::Dir() / "input_layouts" / "Movement.json", ec))
+        p.Problem("the layout files were not written (input_layouts\\Movement.json)");
+
+    tas::WithReplay([&](tas::Replay& r) { r = saved; });
+    OnRenderThread([&] {
+        overlay->SetEnabled(enabledWas);
+        gui::visible = true;
+    });
+    WaitTicks(3);
+    p.Check(1, true);
+    End(s);
+}
+#endif
+
 // Desync prevention and fixing, with a macro that starts at the self-test's checkpoint (only those are checked):
 //   1. the first playback records the reference player states, with the macro's recorded mouse sensitivity set for it
 //      (and the player's own back afterwards)
@@ -932,6 +1237,208 @@ void TestTasDesync()
     End(s);
 }
 #endif
+
+#if MEMENU_FEATURE_COLLISION_VIEW
+// The collision view's inspector: with the panel open it lists the volumes near the player; facing one of them (the
+// Nearby list's click) must make the look-at report that same volume: as the one looked at, or on the line behind
+// another volume that hides it (the "behind" list). Volumes the player is inside can't be checked that way: up to five
+// are tried, and one has to match.
+void TestCollisionInspect()
+{
+    Step& s = Begin("Collision view inspect");
+    Probe p(s);
+    Module* view = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& m) { if (m.Name() == "Collision View") view = &m; });
+    auto* inspect = view ? dynamic_cast<ctl::Section*>(view->FindSetting("Inspect")) : nullptr;
+    if (!view || !inspect) {
+        p.Problem("the Collision View module or its Inspect section was not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+    const bool enabledWas = view->Enabled(), expandedWas = view->expanded, inspectWas = inspect->Get();
+    unsigned yawWas = 0, pitchWas = 0;
+    OnGameThread([&] { if (auto* pc = game::Controller()) { yawWas = pc->Rotation.Yaw; pitchWas = pc->Rotation.Pitch; } });
+    OnRenderThread([&] {
+        view->expanded = true;
+        inspect->Set(true);
+        if (!view->Enabled()) view->SetEnabled(true);
+    });
+
+    std::vector<debugworld::Info::Near> nearby;
+    WaitFor(10.0, [&] { nearby = debugworld::GetInfo().nearby; return !nearby.empty(); });
+    if (nearby.empty()) p.Problem("no volumes listed near the player");
+    int tried = 0, matched = 0;
+    for (const auto& n : nearby) {
+        if (tried >= 5 || g_aborted) break;
+        if (n.distance <= 0.f || n.name.empty()) continue;      // Inside it: the view ray starts in it
+        ++tried;
+        debugworld::FaceTowards(n.x, n.y, n.z);
+        WaitTicks(15);
+        const auto look = debugworld::GetInfo().look;
+        const bool front = look.valid && look.name == n.name;
+        const bool behindIt = look.valid && std::any_of(look.behind.begin(), look.behind.end(),
+                                                        [&](const auto& b) { return b.first == n.name; });
+        const bool ok = front || behindIt;
+        matched += ok ? 1 : 0;
+        const std::string what = front      ? "looked at it"
+                                 : behindIt ? "on the line behind " + look.name
+                                 : look.valid ? "looked at " + look.name : "looked at nothing";
+        char note[200];
+        std::snprintf(note, sizeof note, "faced %s (center %.0f away): %s, hit %.0f away", n.name.c_str(), n.distance,
+                      what.c_str(), look.distance);
+        s.notes.push_back(note);
+        std::string behind;
+        for (const auto& [name, at] : look.behind) behind += " " + name + "@" + std::to_string(static_cast<int>(at));
+        if (!behind.empty()) s.notes.push_back("  also on the line:" + behind);
+        if (ok) break;
+    }
+    s.notes.push_back(std::to_string(nearby.size()) + " volumes listed nearby");
+    if (!nearby.empty() && tried == 0) p.Problem("the player is inside every volume listed nearby: nothing to face");
+    if (tried > 0 && matched == 0) p.Problem("facing a nearby volume never made the look-at report it");
+
+    OnGameThread([&] { if (auto* pc = game::Controller()) { pc->Rotation.Yaw = yawWas; pc->Rotation.Pitch = pitchWas; } });
+    OnRenderThread([&] {
+        inspect->Set(inspectWas);
+        view->expanded = expandedWas;
+        view->SetEnabled(enabledWas);
+    });
+    WaitTicks(5);
+    p.Check(1, true);
+    End(s);
+}
+#endif
+
+#if MEMENU_FEATURE_SPEEDRUN_TIMER
+// The speedrun timer against the game:
+//   1. ProcessEvent is hooked and the game's level completed event (the auto split) was found
+//   2. reloading the level starts an individual level run (auto start)
+//   3. a second reload while it runs (auto reset off) is not counted: real time grows, load removed time doesn't
+//   4. a manual split finishes it (one segment) and sets a personal best; undo takes it back
+// The level's record file is put back the way it was.
+void TestSpeedrunTimer()
+{
+    Step& s = Begin("Speedrun timer");
+    Probe p(s);
+    const auto fail = [&](const std::string& why) {
+        p.Problem(why);
+        p.Check(1, false);
+        End(s);
+    };
+
+    Module* timer = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& m) { if (m.Name() == "Speedrun Timer") timer = &m; });
+    auto* category = timer ? dynamic_cast<ctl::Combo*>(timer->FindSetting("Category")) : nullptr;
+    auto* autoStart = timer ? dynamic_cast<ctl::Checkbox*>(timer->FindSetting("Auto start")) : nullptr;
+    auto* autoReset = timer ? dynamic_cast<ctl::Checkbox*>(timer->FindSetting("Auto reset")) : nullptr;
+    if (!category || !autoStart || !autoReset) return fail("the Speedrun Timer module or its controls were not found");
+
+    const auto maps = levels::Maps();
+    int index = -1;
+    for (int i = 0; i < static_cast<int>(maps.size()); ++i)
+        if (Lower(maps[i].label).find(Lower(g_options.map)) != std::string::npos) { index = i; break; }
+    if (index < 0) return fail("no level matching '" + g_options.map + "'");
+    const int cp = std::min(g_options.checkpoint, static_cast<int>(maps[index].checkpoints.size()));
+
+    const bool enabledWas = timer->Enabled();
+    const int categoryWas = category->Get();
+    const bool autoStartWas = autoStart->Get(), autoResetWas = autoReset->Get();
+    OnRenderThread([&] {
+        category->Set(static_cast<int>(speedrun::Category::IndividualLevel));
+        autoStart->Set(true);
+        autoReset->Set(true);
+        if (timer->Enabled()) timer->SetEnabled(false);     // A clean start: no run left from before
+        timer->SetEnabled(true);
+    });
+    WaitTicks(10);
+    speedrun::Reset();
+    WaitTicks(5);
+
+    if (!WaitFor(10.0, [] { return game::ScriptEventsReady(); }))
+        p.Problem("the level completed event is not watched (no auto splits): see the log for ProcessEvent");
+    else s.notes.push_back("ProcessEvent hooked, level completed event found");
+
+    // Its record file, kept to put back
+    const std::string map = speedrun::Snapshot().map;
+    const std::string title = speedrun::ChapterTitle(map);
+    const auto file = paths::Dir() / "speedrun" / (speedrun::FileName("IL - " + (title.empty() ? map : title)) + ".json");
+    std::string fileWas;
+    const bool hadFile = std::filesystem::exists(file);
+    if (hadFile) {
+        std::ifstream in(file, std::ios::binary);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        fileWas = ss.str();
+    }
+
+    const auto reload = [&]() -> bool {
+        const int before = g_loadsFinished.load();
+        OnRenderThread([&] { levels::Load(index, cp, levels::Method::Game, false); });
+        if (!WaitFor(120.0, [&] { return g_loadsFinished.load() > before; })) { p.Problem("the level did not reload"); return false; }
+        if (!WaitFor(60.0, [] { return game::GetStatus().hasPawn && !game::IsLoading(); })) { p.Problem("no player after reloading"); return false; }
+        WaitPlayerReady(30.0);
+        return true;
+    };
+
+    if (reload()) {
+        WaitFor(5.0, [] { const auto sv = speedrun::Snapshot(); return sv.timer.Running() && sv.timer.Lrt(sv.now) > 0.1; });
+        auto v = speedrun::Snapshot();
+        if (!v.timer.Running()) p.Problem("no run started when the level loaded (map '" + v.map + "', last: " + v.lastEvent + ")");
+        else {
+            s.notes.push_back("started: " + v.lastEvent);
+            OnRenderThread([&] { autoReset->Set(false); });
+            WaitTicks(3);
+            v = speedrun::Snapshot();
+            const double lrt0 = v.timer.Lrt(v.now), rta0 = v.timer.Rta(v.now);
+            if (reload()) {
+                v = speedrun::Snapshot();
+                const double lrt = v.timer.Lrt(v.now) - lrt0, rta = v.timer.Rta(v.now) - rta0;
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "across a reload: real time +%.2f s, load removed time +%.2f s", rta, lrt);
+                s.notes.push_back(buf);
+                if (!v.timer.Running()) p.Problem("the run stopped on a reload with auto reset off");
+                else if (rta - lrt < 0.3) p.Problem(std::string("the load was not removed: ") + buf);
+                else if (lrt <= 0.0) p.Problem(std::string("the load removed time did not move: ") + buf);
+
+                const int completedBefore = v.comparison.completed;
+                speedrun::StartOrSplit();               // The only segment: finishes the run
+                WaitTicks(5);
+                v = speedrun::Snapshot();
+                if (v.timer.GetPhase() != speedrun::Timer::Phase::Finished) p.Problem("a split on the only segment did not finish the run");
+                else if (v.comparison.completed != completedBefore + 1) p.Problem("the finished run was not counted");
+                else if (v.comparison.PbTime() < 0.0) p.Problem("the finished run left no personal best");
+                else s.notes.push_back("finished in " + speedrun::Format(v.timer.FinalLrt(), 3) + (v.newPb ? ", a personal best" : ""));
+
+                speedrun::Undo();
+                WaitTicks(5);
+                v = speedrun::Snapshot();
+                if (!v.timer.Running()) p.Problem("undoing the final split did not resume the run");
+                else if (v.comparison.completed != completedBefore) p.Problem("undoing the final split did not take back the finish");
+            }
+        }
+    }
+
+    // Back as it was: a different category first, so the restored file is read again when the old one comes back
+    speedrun::Reset();
+    WaitTicks(3);
+    OnRenderThread([&] { category->Set(static_cast<int>(speedrun::Category::AnyPercent)); });
+    WaitTicks(5);
+    std::error_code ec;
+    if (hadFile) {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << fileWas;
+    } else std::filesystem::remove(file, ec);
+    OnRenderThread([&] {
+        category->Set(categoryWas);
+        autoStart->Set(autoStartWas);
+        autoReset->Set(autoResetWas);
+        timer->SetEnabled(enabledWas);
+    });
+    WaitTicks(5);
+    p.Check(1, true);
+    End(s);
+}
+#endif
 #endif
 
 // Setting values of every module, to put back after the test
@@ -988,11 +1495,31 @@ const sched::EntryView* FindEntry(const std::vector<sched::EntryView>& entries, 
     return nullptr;
 }
 
+// Modules that draw on the screen every frame while on (a HUD, a counter): with the menu closed, the frame must have more
+// in it while they are on than before, and no more after they are switched off.
+const std::set<std::string> kDrawsHud = {"Crosshair", "Show FPS", "Watermark", "Speedometer", "Input Overlay",
+                                         "Speedrun Timer"};
+
+// What the menu draws with its window closed (the modules' HUDs), a few frames after a change.
+unsigned HudVertices()
+{
+    OnRenderThread([] { gui::visible = false; });
+    WaitTicks(3);
+    return hooks::MenuVertices();
+}
+
 void TestModule(Module& m)
 {
     Step& s = Begin("module " + m.Tab() + "/" + m.Name());
     const unsigned n = g_options.ticks;
     Probe p(s);
+    const bool drawsHud = kDrawsHud.count(m.Name()) != 0;
+    unsigned hudBefore = 0;
+    if (drawsHud) {
+        OnRenderThread([&m] { if (m.Enabled()) m.SetEnabled(false); });
+        hudBefore = HudVertices();
+        OnRenderThread([] { gui::visible = true; });
+    }
     const auto runsBefore = [&] { const auto e = sched::Snapshot(); const auto* v = FindEntry(e, m.Name()); return v ? v->runs : 0; }();
 #if MEMENU_GAME
     const Expectation expect = ExpectationFor(m);
@@ -1034,7 +1561,14 @@ void TestModule(Module& m)
     WaitTicks(std::max(2u, n / 2));
 
     OnRenderThread([] { gui::visible = false; });   // HUD-only drawing (some modules draw differently)
-    WaitTicks(std::max(2u, n / 2));
+    WaitTicks(std::max(3u, n / 2));
+    if (drawsHud) {
+        const unsigned hudOn = hooks::MenuVertices();
+        if (hudOn <= hudBefore)
+            p.Problem("draws nothing with the menu closed (" + std::to_string(hudOn) + " vertices, " +
+                      std::to_string(hudBefore) + " before it was on)");
+        else s.notes.push_back("draws " + std::to_string(hudOn - hudBefore) + " vertices with the menu closed");
+    }
     OnRenderThread([] { gui::visible = true; });
     WaitTicks(2);
 
@@ -1065,6 +1599,13 @@ void TestModule(Module& m)
     if (!m.IsAction()) {
         OnRenderThread([&m] { m.SetEnabled(false); });
         if (m.Enabled()) p.Problem("did not switch off");
+    }
+    if (drawsHud) {
+        const unsigned hudOff = HudVertices();
+        if (hudOff > hudBefore)
+            p.Problem("still draws after switching off (" + std::to_string(hudOff) + " vertices, " +
+                      std::to_string(hudBefore) + " before it was on)");
+        OnRenderThread([] { gui::visible = true; });
     }
     OnRenderThread([&m] { m.expanded = false; });
     WaitTicks(3);   // OnDisable hands its cleanup to the next tick
@@ -1133,6 +1674,7 @@ void ReadOptions(std::istream& in)
         else if (key == "only") g_options.only = SplitList(value);
         else if (key == "skip") g_options.skip = SplitList(value);
         else if (key == "quit") g_options.quit = value != "0";
+        else if (key == "fast") g_options.fast = value != "0";
         else spdlog::warn("Self-test: unknown option '{}'", key);
     }
 }
@@ -1165,6 +1707,35 @@ bool Requested()
     return true;
 }
 
+// The engine's frame rate cap (UGameEngine.bSmoothFrameRate, 62 fps): off while testing, so frame and tick counted waits
+// go as fast as the PC draws. Put back as it was.
+void SetFrameRateCap(bool on)
+{
+#if MEMENU_GAME
+    static bool was = true, changed = false;
+    if (on && !changed) return;
+    OnGameThread([&] {
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        for (std::size_t i = 0; i < objects.Num(); ++i) {
+            auto* o = objects.GetByIndex(i);
+            if (!o || !game::IsA(o, Classes::UGameEngine::StaticClass()) || o->GetName().rfind("Default__", 0) == 0) continue;
+            auto* engine = static_cast<Classes::UGameEngine*>(o);
+            if (on) engine->bSmoothFrameRate = was ? 1 : 0;
+            else {
+                was = engine->bSmoothFrameRate != 0;
+                engine->bSmoothFrameRate = 0;
+                changed = true;
+            }
+            spdlog::info("Self-test: frame rate cap {}", on ? "back on" : "off (fast mode)");
+            break;
+        }
+    });
+    if (on) changed = false;
+#else
+    (void)on;
+#endif
+}
+
 void Run()
 {
     if (!g_requested) return;
@@ -1172,25 +1743,43 @@ void Run()
     game::OnLevelLoad(&OnLevelLoad);
 #endif
     const auto saved = SaveAll();
+    notify::SetMuted(true);         // Nothing on screen but what the modules draw (the HUD checks measure it)
+    if (g_options.fast) SetFrameRateCap(false);
 
     if (TestFrames()) {
 #if MEMENU_GAME
         if (TestGame() && !g_aborted && TestLevel() && !g_aborted && Lower(g_options.map) != "none") {
             TestInputBlocking();
+            // The feature tests, by name (--only / --skip pick them like modules). `fastTas`: its playbacks don't
+            // depend on pacing, so in fast mode they run as fast as they go.
+            struct Named { const char* name; void (*run)(); bool fastTas; };
+            const Named tests[] = {
 #if MEMENU_FEATURE_TAS
-            const bool tasWanted = (g_options.only.empty() || g_options.only.count("TAS macro")) &&
-                                   !g_options.skip.count("TAS macro");
-            if (tasWanted && !g_aborted) TestTasMacro();
-            const bool camWanted = (g_options.only.empty() || g_options.only.count("TAS camera keys")) &&
-                                   !g_options.skip.count("TAS camera keys");
-            if (camWanted && !g_aborted) TestTasCamera();
-            const bool gotoWanted = (g_options.only.empty() || g_options.only.count("TAS go to and step")) &&
-                                    !g_options.skip.count("TAS go to and step");
-            if (gotoWanted && !g_aborted) TestTasGoto();
-            const bool desyncWanted = (g_options.only.empty() || g_options.only.count("TAS desync fixing")) &&
-                                      !g_options.skip.count("TAS desync fixing");
-            if (desyncWanted && !g_aborted) TestTasDesync();
+                {"TAS macro", &TestTasMacro, true},
+                {"TAS camera keys", &TestTasCamera, true},
+                {"TAS go to and step", &TestTasGoto, true},
+                {"TAS desync fixing", &TestTasDesync, true},
+                {"TAS workflow", &TestTasWorkflow, false},      // Records and loops in real time
+#if MEMENU_FEATURE_INPUT_OVERLAY
+                {"Input overlay", &TestInputOverlay, true},
 #endif
+#endif
+#if MEMENU_FEATURE_COLLISION_VIEW
+                {"Collision view inspect", &TestCollisionInspect, false},
+#endif
+#if MEMENU_FEATURE_SPEEDRUN_TIMER
+                {"Speedrun timer", &TestSpeedrunTimer, false},
+#endif
+                {nullptr, nullptr, false},
+            };
+            for (const Named* t = tests; t->name && !g_aborted; ++t) {
+                if (!g_options.only.empty() && !g_options.only.count(t->name)) continue;
+                if (g_options.skip.count(t->name)) continue;
+#if MEMENU_FEATURE_TAS
+                const ScopedTasSpeed speed(g_options.fast && t->fastTas);
+#endif
+                t->run();
+            }
         }
 #endif
         std::vector<Module*> mods;
@@ -1204,6 +1793,8 @@ void Run()
         if (!g_aborted && g_options.only.empty()) TestAllOn(mods);
     }
     if (!g_aborted) Performance();
+    if (g_options.fast) SetFrameRateCap(true);
+    notify::SetMuted(false);
     RestoreAll(saved);
     gui::visible = false;
     spdlog::info("Self-test: done, unloading");

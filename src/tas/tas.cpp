@@ -2,8 +2,10 @@
 #include "tas/engine.h"
 #include "tas/input_monitor.h"
 #include "tas/examples.h"
+#include "tas/splits.h"
 #include "tas/timeline.h"
 
+#include "core/keys.h"
 #include "core/notify.h"
 #include "game/game.h"
 #include "game/levels.h"
@@ -105,6 +107,11 @@ struct Session {
     Env recordEnv;                    // the settings when this recording started
     bool recordStreaming = true;
     std::string recordMods;
+
+    // Automatic splits (Options::autoSplits): levels completed this session, and the ones not on a frame yet (the
+    // event comes during the engine's tick; the bookmark goes on the next frame, the first one after the level ended)
+    std::set<std::string> splitsDone;
+    std::vector<std::string> pendingSplits;
 };
 Session s;
 Options opt;                          // copy for this frame
@@ -167,6 +174,9 @@ std::string UnrealKeyName(int vk)
         case VK_PRIOR:  return "PageUp";
         case VK_NEXT:   return "PageDown";
         case VK_PAUSE:  return "Pause";
+        case VK_MBUTTON:  return "MiddleMouseButton";
+        case VK_XBUTTON1: return "ThumbMouseButton";
+        case VK_XBUTTON2: return "ThumbMouseButton2";
         default:        return {};
     }
 }
@@ -181,7 +191,8 @@ bool SameName(const std::string& a, const std::string& b)
 bool IsHotkey(const engine::RawInput& in)
 {
     const int hash = opt.keyPause * 31 + opt.keyAdvance * 37 + opt.keyTakeOver * 41 + opt.keyStop * 43 + opt.keyRewind * 47 +
-                     opt.keyRestart * 53 + opt.keyRecord * 59 + opt.keyPlay * 61 + opt.keyBookmark * 67;
+                     opt.keyRestart * 53 + opt.keyRecord * 59 + opt.keyPlay * 61 + opt.keyBookmark * 67 +
+                     opt.keyFrameBack * 71 + opt.keyPrevBookmark * 73 + opt.keyNextBookmark * 79;
     if (hash != s.hotkeyHash) {
         s.hotkeyNames.clear();
         s.hotkeyHash = hash;
@@ -192,8 +203,9 @@ bool IsHotkey(const engine::RawInput& in)
     const std::string name = EngineName(in.nameIndex, in.nameNumber);
     bool hit = false;
     for (int vk : {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart, opt.keyRecord,
-                   opt.keyPlay, opt.keyBookmark, VK_INSERT, VK_END})
-        if (vk && SameName(name, UnrealKeyName(vk))) hit = true;
+                   opt.keyPlay, opt.keyBookmark, opt.keyFrameBack, opt.keyPrevBookmark, opt.keyNextBookmark, VK_INSERT,
+                   VK_END})
+        if (vk && SameName(name, UnrealKeyName(keys::Vk(vk)))) hit = true;    // The key of a combo (Ctrl+F5: F5)
     s.hotkeyNames[key] = hit;
     return hit;
 }
@@ -215,17 +227,19 @@ void PublishStatus();
 
 void RecordNow(StartKind start, const std::string& command, const std::string& map, const std::string& checkpoint,
                float hz);
-void Begin(Mode mode);
+void GotoNow(std::size_t frame);
+void GotoBookmarkNow(int step);
 
 void PollHotkeys()
 {
-    constexpr int kKeys = 9;
+    constexpr int kKeys = 12;
     static bool was[kKeys]{};
     const int keys[kKeys] = {opt.keyPause, opt.keyAdvance, opt.keyTakeOver, opt.keyStop, opt.keyRewind, opt.keyRestart,
-                             opt.keyRecord, opt.keyPlay, opt.keyBookmark};
+                             opt.keyRecord, opt.keyPlay, opt.keyBookmark, opt.keyFrameBack, opt.keyPrevBookmark,
+                             opt.keyNextBookmark};
     bool edge[kKeys]{};
     for (int i = 0; i < kKeys; ++i) {
-        const bool down = keys[i] && (GetAsyncKeyState(keys[i]) & 0x8000);
+        const bool down = keys::Down(keys[i]);      // With the modifiers of a combo
         edge[i] = down && !was[i];
         was[i] = down;
     }
@@ -243,6 +257,7 @@ void PollHotkeys()
             if (empty) SetMessage("nothing to play", true);
             else Begin(Mode::Playing);
         }
+        if (edge[11]) GotoBookmarkNow(+1);      // From the start: the first bookmark
         return;
     }
 
@@ -261,6 +276,9 @@ void PollHotkeys()
         g_replay.SetMarker(frame, "Bookmark " + std::to_string(g_replay.markers.size() + 1));
         notify::Push("TAS: bookmark at frame " + std::to_string(frame));
     }
+    if (edge[9] && !s.armed) GotoNow(s.frame > 0 ? s.frame - 1 : 0);
+    if (edge[10] && !s.armed) GotoBookmarkNow(-1);
+    if (edge[11] && !s.armed) GotoBookmarkNow(+1);
 }
 
 // ---- input --------------------------------------------------------------------------------------------------------------
@@ -641,6 +659,8 @@ void Begin(Mode mode)
     s.lastReal = engine::RealSeconds();
     s.corrections = 0;
     s.desyncInfo.clear();
+    s.splitsDone.clear();
+    s.pendingSplits.clear();
     s.blockStreaming = opt.blockStreaming;
     if (mode == Mode::Playing && opt.matchRecording) {
         std::lock_guard lock(g_mutex);
@@ -727,9 +747,54 @@ void Autosave(Replay r)
     for (std::size_t i = kAutosaves; i < saves.size(); ++i) fs::remove(saves[i].path(), ec);   // Names sort by date
 }
 
+// ---- automatic splits -------------------------------------------------------------------------------------------------------
+constexpr const char* kLevelCompleted = "Function TdGame.SeqAct_TdLevelCompleted.Activated";
+
+// "Flight" for edge_p's level select label "Flight (...)"; the package name if the level select doesn't know it.
+std::string LevelLabel(const std::string& map)
+{
+    for (const auto& m : levels::Maps()) {
+        if (!SameName(m.file, map)) continue;
+        std::string label = m.label;
+        if (const auto paren = label.find(" ("); paren != std::string::npos && paren > 0) label.resize(paren);
+        return label;
+    }
+    return map;
+}
+
+// Game thread, inside the engine's tick: the frame that is running is s.frame - 1. Its bookmark goes on s.frame, the
+// first frame after the level was completed (FlushSplits, at the next frame).
+void OnLevelCompleted(Classes::UObject* /*self*/, void* /*params*/)
+{
+    if (s.mode == Mode::Idle || s.armed || !opt.autoSplits) return;
+    const std::string map = game::MapName();
+    if (map.empty()) return;
+    const std::string name = splits::SplitName(LevelLabel(map));
+    if (!s.splitsDone.insert(name).second) return;          // The game may complete a level more than once
+    s.pendingSplits.push_back(name);
+}
+
+// With g_mutex held: puts the pending splits on the current frame (the last one, if the replay ends before it).
+void FlushSplits(Replay& r)
+{
+    if (s.pendingSplits.empty() || r.frames.empty()) return;
+    const auto frame = static_cast<std::uint32_t>(std::min(s.frame, r.frames.size() - 1));
+    for (const std::string& name : s.pendingSplits) {
+        if (splits::SetSplit(r, frame, name)) {
+            spdlog::info("TAS: {} at frame {} ({:.3f} s)", name, frame, splits::TimeAt(r, frame));
+            g_status.message = name + " at frame " + std::to_string(frame);
+        }
+    }
+    s.pendingSplits.clear();
+}
+
 void StopNow(const char* why)
 {
     if (s.mode == Mode::Idle) return;
+    {
+        std::lock_guard lock(g_mutex);
+        FlushSplits(g_replay);
+    }
     ReleaseHeld();
     if (s.mode == Mode::Recording) {
         const Env env = s.recordEnv.valid ? s.recordEnv : ReadEnv();
@@ -984,6 +1049,7 @@ void PlaybackEnded()
     const Replay& r = g_replay;
     {
         std::lock_guard lock(g_mutex);
+        FlushSplits(g_replay);
         const std::size_t checkable = std::min<std::size_t>(r.syncValidUntil, r.frames.size());
         g_status.verified = r.start != StartKind::Now && s.desyncFrame < 0 && s.corrections == 0 &&
                             checkable == r.frames.size() && s.syncChecked == checkable && checkable > 0;
@@ -1145,6 +1211,7 @@ bool OnFrame()
             }
             s.pending.clear();
         }
+        FlushSplits(r);
     }
     ++s.frame;
     PublishStatus();
@@ -1212,6 +1279,8 @@ bool Init()
     engine::SetInputFilter(&FilterInput);
     input::Install();               // What the engine gets, for the input display
     game::OnLevelLoad(&OnLevelLoad);
+    if (!game::OnScriptEvent(kLevelCompleted, &OnLevelCompleted))
+        spdlog::warn("TAS: level completed isn't watched: no automatic splits");
     std::lock_guard lock(g_mutex);
     g_status.available = true;
     return true;
@@ -1285,9 +1354,26 @@ void Advance(int frames)
 
 void TakeOver() { Post([] { TakeOverNow(); }); }
 
-void Goto(std::size_t frame)
+void Goto(std::size_t frame) { Post([frame] { GotoNow(frame); }); }
+
+void FrameBack(int frames)
 {
-    Post([frame]() mutable {
+    Post([frames] {
+        if (s.mode == Mode::Idle || s.armed) return;
+        const std::size_t back = static_cast<std::size_t>(std::max(frames, 1));
+        GotoNow(s.frame > back ? s.frame - back : 0);
+    });
+}
+
+void GotoBookmark(int step) { Post([step] { GotoBookmarkNow(step); }); }
+
+void Rewind() { Post([] { RewindNow("rewound"); }); }
+
+namespace {
+
+void GotoNow(std::size_t frame)
+{
+    {
         StartKind start;
         std::size_t count;
         {
@@ -1313,10 +1399,30 @@ void Goto(std::size_t frame)
         g_paused = false;
         g_advance = 0;
         if (opt.seekWithoutRendering) SetRendering(false);
-    });
+    }
 }
 
-void Rewind() { Post([] { RewindNow("rewound"); }); }
+// The bookmark before (-1) or after (+1) where the session is (idle: from the start).
+void GotoBookmarkNow(int step)
+{
+    const std::size_t here = s.mode == Mode::Idle ? 0 : s.frame;
+    long long target = -1;
+    {
+        std::lock_guard lock(g_mutex);
+        for (const Marker& m : g_replay.markers) {
+            if (step < 0 && m.frame < here) target = m.frame;                       // The last one before
+            if (step > 0 && (m.frame > here || (s.mode == Mode::Idle && m.frame == here)) && target < 0)
+                target = m.frame;                                                    // The first one after
+        }
+    }
+    if (target < 0) {
+        SetMessage(step < 0 ? "no bookmark before this frame" : "no bookmark after this frame", true);
+        return;
+    }
+    GotoNow(static_cast<std::size_t>(target));
+}
+
+} // namespace
 
 std::vector<Issue> Preflight()
 {

@@ -15,11 +15,23 @@
 #include "game/uobject.h"
 #include "game/levels.h"
 #include "game/player_state.h"
+#include "game/save_library.h"
 #if MEMENU_FEATURE_SPEEDRUN_TIMER
 #include "speedrun/live.h"
 #endif
 #if MEMENU_FEATURE_COLLISION_VIEW
 #include "game/debug_world.h"
+#include "game/static_world.h"
+#endif
+#if MEMENU_FEATURE_KICKGLITCH_HELPER
+#include "features/trainer/kickglitch_helper.h"
+#endif
+#if MEMENU_FEATURE_AUTO_KICKGLITCH
+#include "features/trainer/auto_kickglitch.h"
+#endif
+#if MEMENU_FEATURE_KEY_BINDINGS
+#include "features/misc/key_bindings.h"
+#include <shlobj.h>
 #endif
 #if MEMENU_FEATURE_TAS
 #include "features/tas/timeline_view.h"
@@ -85,7 +97,7 @@ ULONGLONG g_started = 0;
 bool g_aborted = false;         // Unload requested in the middle: stop testing
 
 // Buttons that would open windows on the desktop, delete files or run for minutes: never pressed
-const std::set<std::string> kNoPress = {"Open log file", "Open themes folder",
+const std::set<std::string> kNoPress = {"Open log file", "Open themes folder", "Open save states folder",
                                         "Clear saved state"};   // Load State is tested next and needs it
 
 std::string Lower(std::string s)
@@ -356,6 +368,38 @@ Expectation ExpectationFor(Module& m)
                 [] { return WithPlayer([](ATdPlayerPawn*, ATdPlayerController* c) {
                     return Expect(c->ReactionTimeEnergy >= 99.f, "the reaction time meter was not refilled"); }); },
                 {}};
+    if (name == "Save States") {
+        // In a folder of its own, never the player's states. The check reads the file back from disk and loads it
+        // after moving away: the stored format must bring the player back, in walking state.
+        static std::filesystem::path folder;
+        return {[] {
+                    folder = paths::Dir() / "selftest-savestates";
+                    std::error_code ec;
+                    std::filesystem::remove_all(folder, ec);
+                    save_library::SetFolder(folder);
+                    if (auto* p = game::Pawn()) g_savedAt = p->Location;
+                },
+                [] { return WithPlayer([](ATdPlayerPawn* p, ATdPlayerController* c) -> std::string {
+                    if (save_library::List(game::MapName()).size() != 1) return "running it did not add one state";
+                    if (!std::filesystem::exists(folder / (save_library::Map() + ".json"))) return "no file was written";
+                    save_library::SetFolder(folder);    // Forget it: read back from the file
+                    p->Location.X += 2000.f;
+                    p->Velocity = Classes::FVector{};
+                    std::string error;
+                    if (!save_library::Load(0, &error)) return "loading it back failed: " + error;
+                    const float d = Distance(p->Location, g_savedAt);
+                    if (d >= 150.f) return "the player is " + std::to_string(static_cast<int>(d)) +
+                                           " units from the stored position after loading it";
+                    return Expect(c->IsInState(game::Name("PlayerWalking"), false),
+                                  "the controller is not in PlayerWalking after loading");
+                }); },
+                [] {
+                    save_library::SetFolder({});
+                    std::error_code ec;
+                    std::filesystem::remove_all(folder, ec);
+                    return std::string();
+                }};
+    }
     if (name == "Clear Frame") {
         // The live engine (not its class default): one walk of the object list, it lives as long as the game
         static Classes::UEngine* engine = nullptr;
@@ -1243,6 +1287,591 @@ void TestTasDesync()
 // Nearby list's click) must make the look-at report that same volume: as the one looked at, or on the line behind
 // another volume that hides it (the "behind" list). Volumes the player is inside can't be checked that way: up to five
 // are tried, and one has to match.
+// Back on the ground and walking (or 10 s passed). The kick tests jump and fall: in fast mode a tick count is almost
+// no game time, so the next test would start with the player still in the air.
+void WaitGrounded()
+{
+    WaitFor(10.0, [] {
+        bool ok = false;
+        OnGameThread([&] {
+            auto* pawn = game::Pawn();
+            ok = pawn && pawn->Physics == Classes::EPhysics::PHYS_Walking &&
+                 pawn->MovementState != Classes::EMovement::MOVE_Jump;
+        }, 1.0);
+        return ok;
+    });
+    WaitTicks(5);
+}
+
+#if MEMENU_FEATURE_KICKGLITCH_HELPER
+// A kick is faked (the wallrun kick's move state on a player standing on the ground: "landed" the next tick), then the
+// game is told to jump like the Kickglitch tool does. The helper must count one attempt and time the jump.
+void TestKickglitchHelper()
+{
+    Step& s = Begin("Kickglitch helper");
+    Probe p(s);
+    Module* helper = modules::Find("Kickglitch Helper");
+    if (!helper) {
+        p.Problem("the Kickglitch Helper module was not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+    const bool enabledWas = helper->Enabled();
+    WaitGrounded();
+    OnRenderThread([&] { helper->SetEnabled(false); helper->SetEnabled(true); });
+    WaitTicks(3);
+
+    // The game's real kick move can't be started without a wall (in the open it never ends, and the game then ignores
+    // the jump), so only its state is shown, for a few ticks of a real fall. The Kickglitch tool is armed in the air (it
+    // does nothing while falling), so on the game's own landing it jumps on the first walking frame, as after a real
+    // kick: the helper must time that jump and take it as its calibration.
+    Module* tool = modules::Find("Kickglitch");
+    auto* frame = dynamic_cast<ctl::SliderInt*>(helper->FindSetting("Perfect frame"));
+    const int frameWas = frame ? frame->Get() : 1;
+    if (frame) OnRenderThread([&] { frame->Set(5); });   // Must be overwritten by the calibration
+    OnGameThread([tool] {
+        auto* pawn = game::Pawn();
+        if (!pawn) return;
+        pawn->Location.Z += 150.f;
+        pawn->Velocity = Classes::FVector{};
+        pawn->Physics = Classes::EPhysics::PHYS_Falling;
+        pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+        if (tool) tool->SetEnabled(true);
+    });
+    WaitTicks(1);
+    OnGameThread([] { if (auto* pawn = game::Pawn()) pawn->MovementState = Classes::EMovement::MOVE_MeleeWallrun; });
+    WaitTicks(2);
+    OnGameThread([] { if (auto* pawn = game::Pawn()) pawn->MovementState = Classes::EMovement::MOVE_Falling; });
+    WaitFor(5.0, [] { return kickglitch_helper::Get().attempts > 0; });
+
+    const auto last = kickglitch_helper::Get();
+    if (last.attempts != 1) p.Problem("it counted " + std::to_string(last.attempts) + " attempts, not 1");
+    else if (last.jumpFrame < 0) p.Problem("it saw the kick and the landing but not the jump");
+    else s.notes.push_back("jump timed " + std::to_string(last.jumpFrame) + " frame(s) after landing (the Kickglitch tool's jump)");
+    if (!tool) p.Problem("the Kickglitch tool was not found (no calibration)");
+    else if (last.jumpFrame >= 0 && !last.calibrated)
+        p.Problem("the attempt was not taken as the Kickglitch tool's (no calibration)");
+    else if (frame && last.jumpFrame >= 0 && frame->Get() != std::clamp(last.jumpFrame, 0, 5))
+        p.Problem("the tool's attempt did not calibrate the perfect frame (" + std::to_string(frame->Get()) + ")");
+
+    OnRenderThread([&] {
+        if (tool) tool->SetEnabled(false);
+        if (frame) frame->Set(frameWas);
+        helper->SetEnabled(enabledWas);
+    });
+    OnGameThread([] {
+        if (auto* pawn = game::Pawn(); pawn && game::Controller()) player_state::ResetMovement(pawn, game::Controller());
+    });
+    WaitGrounded();     // Before the next test
+    p.Check(1, false);
+    End(s);
+}
+#endif
+
+#if MEMENU_FEATURE_AUTO_KICKGLITCH
+// Same faked kick as the helper's test (the kick's state for a few ticks of a real fall): on the game's landing the
+// module must jump by itself, with nothing else armed.
+void TestAutoKickglitch()
+{
+    Step& s = Begin("Auto kickglitch");
+    Probe p(s);
+    Module* autoKg = modules::Find("Auto Kickglitch");
+    if (!autoKg) {
+        p.Problem("the Auto Kickglitch module was not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+    const bool enabledWas = autoKg->Enabled();
+    WaitGrounded();     // A test before may have left the player in the air
+    OnRenderThread([&] { autoKg->SetEnabled(true); });
+    OnGameThread([] {
+        auto* pawn = game::Pawn();
+        if (!pawn) return;
+        pawn->Location.Z += 150.f;
+        pawn->Velocity = Classes::FVector{};
+        pawn->Physics = Classes::EPhysics::PHYS_Falling;
+        pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+    });
+    WaitTicks(1);
+    OnGameThread([] { if (auto* pawn = game::Pawn()) pawn->MovementState = Classes::EMovement::MOVE_MeleeWallrun; });
+    WaitTicks(2);
+    OnGameThread([] { if (auto* pawn = game::Pawn()) pawn->MovementState = Classes::EMovement::MOVE_Falling; });
+
+    // Landed, then up again on its own: the jump
+    bool landed = false, jumped = false;
+    WaitFor(5.0, [&] {
+        OnGameThread([&] {
+            auto* pawn = game::Pawn();
+            if (!pawn) return;
+            if (pawn->Physics == Classes::EPhysics::PHYS_Walking) landed = true;
+            else if (landed && (pawn->MovementState == Classes::EMovement::MOVE_Jump || pawn->Velocity.Z > 100.f))
+                jumped = true;
+        }, 1.0);
+        return jumped;
+    });
+    if (!landed) p.Problem("the player never landed");
+    else if (!jumped) p.Problem("no jump after the kick's landing");
+
+    // The kick buffer: a kick pressed in the air (the console runs AttackPress the way a key binding does) is held
+    // back, then let go late when no wall comes within the window. The wall kick itself needs a real wall.
+    auto* buffer = dynamic_cast<ctl::Checkbox*>(autoKg->FindSetting("Kick buffer"));
+    auto* window = dynamic_cast<ctl::SliderInt*>(autoKg->FindSetting("Buffer window"));
+    auto* onMiss = dynamic_cast<ctl::Combo*>(autoKg->FindSetting("No wall in time"));
+    if (!buffer || !window || !onMiss) {
+        p.Problem("the kick buffer settings were not found");
+    } else {
+        const bool bufferWas = buffer->Get();
+        const int windowWas = window->Get(), onMissWas = onMiss->Get();
+        OnRenderThread([&] {
+            buffer->Set(true);
+            window->Set(100);
+            onMiss->Set(0);         // Kick anyway
+        });
+        WaitGrounded();
+        const auto before = auto_kickglitch::Stats();
+        OnGameThread([] {
+            auto* pawn = game::Pawn();
+            if (!pawn) return;
+            pawn->Location.Z += 400.f;
+            pawn->Velocity = Classes::FVector{};
+            pawn->Physics = Classes::EPhysics::PHYS_Falling;
+            pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+        });
+        WaitTicks(2);
+        bool airKick = false;
+        OnGameThread([&] {
+            game::ConsoleCommand("AttackPress");
+            game::ConsoleCommand("AttackRelease");
+            if (auto* pawn = game::Pawn()) airKick = pawn->MovementState == Classes::EMovement::MOVE_MeleeAir;
+        });
+        WaitTicks(1);
+        const auto held = auto_kickglitch::Stats();
+        WaitFor(3.0, [&] {
+            const auto st = auto_kickglitch::Stats();
+            return st.late + st.dropped > before.late + before.dropped;
+        });
+        const auto after = auto_kickglitch::Stats();
+        char note[160];
+        std::snprintf(note, sizeof note, "kick buffer: hooked %s, held %d, let go late %d, dropped %d",
+                      after.hooked ? "yes" : "no", after.held - before.held, after.late - before.late,
+                      after.dropped - before.dropped);
+        s.notes.push_back(note);
+        if (!after.hooked) p.Problem("the kick press can't be held back (AttackPress not watched)");
+        else if (held.held <= before.held) p.Problem("a kick pressed in the air was not held back");
+        else if (airKick) p.Problem("the held kick still kicked in the air at once");
+        else if (after.late <= before.late) p.Problem("the held kick was not let go when no wall came");
+        OnRenderThread([&] {
+            buffer->Set(bufferWas);
+            window->Set(windowWas);
+            onMiss->Set(onMissWas);
+        });
+    }
+
+    OnRenderThread([&] { autoKg->SetEnabled(enabledWas); });
+    OnGameThread([] {
+        if (auto* pawn = game::Pawn(); pawn && game::Controller()) player_state::ResetMovement(pawn, game::Controller());
+    });
+    WaitGrounded();     // Before the next test
+    p.Check(1, false);
+    End(s);
+}
+#endif
+
+#if MEMENU_FEATURE_KILL_BOTS
+// Only checks the kills where the level has enemies (start game-test with --map at one); elsewhere, that it runs.
+void TestKillBots()
+{
+    Step& s = Begin("Kill bots");
+    Probe p(s);
+    Module* kill = modules::Find("Kill Bots");
+    if (!kill) {
+        p.Problem("the Kill Bots module was not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+    const auto alive = [] {
+        int n = 0;
+        OnGameThread([&] {
+            auto* world = game::World();
+            for (Classes::APawn* pawn = world ? world->PawnList : nullptr; pawn; pawn = pawn->NextPawn)
+                if (pawn != game::Pawn() && game::IsA(pawn, Classes::ATdBotPawn::StaticClass()) && pawn->Health > 0 &&
+                    !pawn->bDeleteMe)
+                    ++n;
+        });
+        return n;
+    };
+    const int before = alive();
+    OnRenderThread([&] { kill->Toggle(); });
+    WaitTicks(10);
+    const int after = alive();
+    if (before == 0) s.notes.push_back("no enemies in this level: only checked that it runs");
+    else if (after > 0) p.Problem(std::to_string(after) + " of " + std::to_string(before) + " enemies still alive");
+    else s.notes.push_back("killed " + std::to_string(before) + (before == 1 ? " enemy" : " enemies"));
+    p.Check(1, false);
+    End(s);
+}
+#endif
+
+// ---- Engine hooks ---------------------------------------------------------------------------------------------------
+Step& BeginEngine(const char* name, Probe*& probe, std::unique_ptr<Probe>& holder)
+{
+    Step& s = Begin(name);
+    holder = std::make_unique<Probe>(s);
+    probe = holder.get();
+    return s;
+}
+
+// Strang is the state handler hook's user: armed, a new move (falling, here) must make it jump and disarm itself.
+void TestEngineStateHook()
+{
+    Probe* p;
+    std::unique_ptr<Probe> holder;
+    Step& s = BeginEngine("Engine state hook", p, holder);
+    Module* strang = modules::Find("Strang");
+    if (!game::PlayerStateHooked()) p->Problem("the player state handler is not hooked");
+    else if (!strang) p->Problem("the Strang module was not found");
+    else {
+        OnRenderThread([&] { strang->SetEnabled(true); });
+        WaitTicks(2);
+        OnGameThread([] {
+            auto* pawn = game::Pawn();
+            if (!pawn) return;
+            pawn->Location.Z += 150.f;
+            pawn->Velocity = Classes::FVector{};
+            pawn->Physics = Classes::EPhysics::PHYS_Falling;
+            pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+        });
+        if (!WaitFor(3.0, [&] { return !strang->Enabled(); })) p->Problem("Strang was still armed after a new move began");
+        else s.notes.push_back("Strang fired on the state change");
+        OnRenderThread([&] { strang->SetEnabled(false); });
+        WaitGrounded();     // Strang jumped
+    }
+    p->Check(1, false);
+    End(s);
+}
+
+std::atomic<int> g_tickBefore{0}, g_tickAfter{0};
+std::atomic<bool> g_blockTick{false};
+
+// Before, after and blocking watches on the controller's PlayerTick, an event the engine calls every tick.
+void TestEngineScriptEvents()
+{
+    Probe* p;
+    std::unique_ptr<Probe> holder;
+    Step& s = BeginEngine("Engine script events", p, holder);
+    static bool added = false;
+    if (!added) {
+        added = true;
+        for (const char* fn : {"Function TdGame.TdPlayerController.PlayerTick", "Function Engine.PlayerController.PlayerTick"}) {
+            game::OnScriptEvent(fn, [](Classes::UObject*, void*) { ++g_tickBefore; });
+            game::OnScriptEvent(fn, [](Classes::UObject*, void*) { ++g_tickAfter; }, true);
+            game::BlockScriptEvent(fn, [](Classes::UObject*, void*) { return g_blockTick.load(); });
+        }
+    }
+    WaitTicks(10);      // Looked up on the next tick
+    const int b0 = g_tickBefore, a0 = g_tickAfter;
+    WaitTicks(10);
+    const int b1 = g_tickBefore, a1 = g_tickAfter;
+    if (b1 <= b0) p->Problem("the before-watch on PlayerTick never ran");
+    else if (a1 <= a0) p->Problem("the after-watch on PlayerTick never ran");
+    else {
+        g_blockTick = true;
+        WaitTicks(2);
+        const int b2 = g_tickBefore, a2 = g_tickAfter;
+        WaitTicks(5);
+        const int b3 = g_tickBefore, a3 = g_tickAfter;
+        g_blockTick = false;
+        WaitTicks(5);
+        const int a4 = g_tickAfter;
+        if (b3 <= b2) p->Problem("while blocked, PlayerTick stopped being called at all");
+        else if (a3 != a2) p->Problem("blocked, PlayerTick still ran (its after-watch did)");
+        else if (a4 <= a3) p->Problem("PlayerTick did not run again after unblocking");
+        else s.notes.push_back("before/after/block all work (" + std::to_string(b1 - b0) + " calls in 10 ticks)");
+    }
+    p->Check(1, false);
+    End(s);
+}
+
+#if MEMENU_FEATURE_FRAME_RATE
+// Frame Rate Limit: on, the engine's cap is the module's; off, the engine has exactly what it had before (the game's 62,
+// or the test's own uncapped fast mode): normal play is never left at another frame rate.
+void TestFrameRate()
+{
+    Step& s = Begin("Frame rate limit");
+    Probe p(s);
+    Module* fps = modules::Find("Frame Rate Limit");
+    auto* cap = fps ? dynamic_cast<ctl::Slider*>(fps->FindSetting("Cap")) : nullptr;
+    auto* uncapped = fps ? dynamic_cast<ctl::Checkbox*>(fps->FindSetting("Uncapped")) : nullptr;
+    if (!fps || !cap || !uncapped) {
+        p.Problem("the Frame Rate Limit module or its settings were not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+    struct Cap { bool smooth = false; float max = 0.f; bool found = false; };
+    const auto read = [] {
+        Cap c;
+        OnGameThread([&] {
+            const auto& objects = Classes::UObject::GetGlobalObjects();
+            for (std::size_t i = 0; i < objects.Num(); ++i) {
+                auto* o = objects.GetByIndex(i);
+                if (!o || !game::IsA(o, Classes::UGameEngine::StaticClass()) || o->GetName().rfind("Default__", 0) == 0)
+                    continue;
+                auto* e = static_cast<Classes::UGameEngine*>(o);
+                c = {e->bSmoothFrameRate != 0, e->MaxSmoothedFrameRate, true};
+                break;
+            }
+        });
+        return c;
+    };
+    const bool enabledWas = fps->Enabled(), uncappedWas = uncapped->Get();
+    const float capWas = cap->Get();
+    if (enabledWas) {
+        OnRenderThread([&] { fps->SetEnabled(false); });
+        WaitTicks(3);
+    }
+    const Cap before = read();
+    if (!before.found) p.Problem("no game engine object");
+
+    OnRenderThread([&] {
+        cap->Set(30.f);
+        uncapped->Set(false);
+        fps->SetEnabled(true);
+    });
+    WaitTicks(5);
+    const Cap on = read();
+    OnRenderThread([&] { fps->SetEnabled(false); });
+    WaitTicks(5);
+    const Cap after = read();
+
+    char note[200];
+    std::snprintf(note, sizeof note, "before: cap %s %.0f; module at 30: %s %.0f; off again: %s %.0f",
+                  before.smooth ? "on" : "off", before.max, on.smooth ? "on" : "off", on.max,
+                  after.smooth ? "on" : "off", after.max);
+    s.notes.push_back(note);
+    if (!on.smooth || std::fabs(on.max - 30.f) > 0.01f) p.Problem("the module's 30 fps cap was not set on the engine");
+    if (after.smooth != before.smooth || std::fabs(after.max - before.max) > 0.01f)
+        p.Problem("switching the module off did not put the engine's cap back");
+
+    OnRenderThread([&] {
+        cap->Set(capWas);
+        uncapped->Set(uncappedWas);
+        fps->SetEnabled(enabledWas);
+    });
+    WaitTicks(3);
+    p.Check(1, false);
+    End(s);
+}
+#endif
+
+// "set" on the engine object, read back from the object itself.
+void TestEngineConsole()
+{
+    Probe* p;
+    std::unique_ptr<Probe> holder;
+    Step& s = BeginEngine("Engine console", p, holder);
+    Classes::UEngine* engine = nullptr;
+    bool was = false, now = false, ran = false;
+    OnGameThread([&] {
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        for (std::size_t i = 0; i < objects.Num() && !engine; ++i) {
+            auto* o = objects.GetByIndex(i);
+            if (o && game::IsA(o, Classes::UGameEngine::StaticClass()) && o->GetName().rfind("Default__", 0) != 0)
+                engine = static_cast<Classes::UEngine*>(o);
+        }
+        if (!engine) return;
+        was = engine->bEnableColorClear != 0;
+        ran = game::ConsoleCommand(std::string("set Engine bEnableColorClear ") + (was ? "false" : "true"));
+    });
+    WaitTicks(2);
+    if (engine) OnGameThread([&] { now = engine->bEnableColorClear != 0; });
+    if (!engine) p->Problem("no engine object");
+    else if (!ran) p->Problem("ConsoleCommand had no controller to run it");
+    else if (now == was) p->Problem("\"set Engine bEnableColorClear\" did not change the engine");
+    else s.notes.push_back("set changed bEnableColorClear");
+    if (engine) OnGameThread([&] { game::ConsoleCommand(std::string("set Engine bEnableColorClear ") + (was ? "true" : "false")); });
+    WaitTicks(2);
+    p->Check(1, false);
+    End(s);
+}
+
+std::atomic<int> g_deathBefore{0}, g_deathAfter{0};
+
+// Kills the player: the death hooks must see it, and the game must bring the player back (checkpoint restart).
+void TestEngineDeath()
+{
+    Probe* p;
+    std::unique_ptr<Probe> holder;
+    Step& s = BeginEngine("Engine death hook", p, holder);
+    static bool added = false;
+    if (!added) {
+        added = true;
+        game::OnPlayerDeath([](bool after) { ++(after ? g_deathAfter : g_deathBefore); });
+    }
+    if (!game::DeathHooked()) {
+        p->Problem("the death functions are not hooked");
+        p->Check(1, false);
+        End(s);
+        return;
+    }
+    if (Module* god = modules::Find("God Mode")) OnRenderThread([god] { god->SetEnabled(false); });
+    WaitTicks(2);
+    const int before = g_deathBefore, after = g_deathAfter;
+    const void* pawnBefore = nullptr;
+    OnGameThread([&] {
+        auto* pawn = game::Pawn();
+        auto* pc = game::Controller();
+        if (!pawn || !pc) return;
+        pawnBefore = pawn;
+        Classes::FTraceHitInfo hit{};
+        pawn->TakeDamage(pawn->Health + 10000, nullptr, pawn->Location, Classes::FVector{},
+                         Classes::UTdDmgType_Fell::StaticClass(), hit, nullptr);
+    });
+    if (!WaitFor(10.0, [&] { return g_deathBefore > before; })) p->Problem("no death seen by the hook within 10 s");
+    else {
+        if (!WaitFor(10.0, [&] { return g_deathAfter > after; })) p->Problem("the after-death call never came");
+        // Back in the game: a new pawn, alive and movable
+        const bool back = WaitFor(60.0, [&] {
+            bool ok = false;
+            OnGameThread([&] { auto* pw = game::Pawn(); ok = pw && pw != pawnBefore && pw->Health > 0; }, 1.0);
+            return ok;
+        });
+        // Walking again, with no cutscene or input hold. Not PlayerNotReady(): the engine leaves the controller's
+        // bFrozen (set while dead; it only gates "fire to respawn") after the game's own checkpoint restart.
+        bool walking = false, frozen = false;
+        if (back)
+            walking = WaitFor(30.0, [&] {
+                OnGameThread([&] {
+                    auto* pc = game::Controller();
+                    walking = pc && game::Pawn() && pc->IsInState(game::Name("PlayerWalking"), false) &&
+                              !pc->bCinematicMode && !pc->bIgnoreMoveInput;
+                    frozen = pc && pc->bFrozen;
+                }, 1.0);
+                return walking;
+            });
+        if (!back) p->Problem("the player did not respawn within 60 s");
+        else if (!walking) p->Problem("after respawning, the player is not back in PlayerWalking");
+        else s.notes.push_back(std::string("death seen before and after, player respawned and walking") +
+                               (frozen ? " (bFrozen left set by the engine)" : ""));
+    }
+    p->Check(1, false);
+    End(s);
+}
+
+#if MEMENU_FEATURE_KEY_BINDINGS
+// The game's TdInput.ini (SetBind saves it): kept as it was before the test and written back after.
+std::filesystem::path TdInputIni()
+{
+    wchar_t docs[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, docs))) return {};
+    return std::filesystem::path(docs) / L"EA Games" / L"Mirror's Edge" / L"TdGame" / L"Config" / L"TdInput.ini";
+}
+
+// A kept alternate key the game doesn't have (as after a restart) must be put back at the next reset moment (the
+// module switched on), on a key nothing else uses. Uses a file of its own, and the game's ini is written back after.
+void TestKeepKeyBindings()
+{
+    Step& s = Begin("Keep key bindings");
+    Probe p(s);
+    Module* keep = modules::Find("Keep Key Bindings");
+    const auto ini = TdInputIni();
+    std::string iniWas;
+    const bool hadIni = !ini.empty() && std::filesystem::exists(ini);
+    if (hadIni) {
+        std::ifstream in(ini, std::ios::binary);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        iniWas = ss.str();
+    }
+    if (!keep) {
+        p.Problem("the Keep Key Bindings module was not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+    const bool enabledWas = keep->Enabled();
+    OnRenderThread([&] { keep->SetEnabled(false); });
+
+    // A key nothing is bound to, and the bindings the game has now
+    std::string freeKey;
+    nlohmann::json list = nlohmann::json::array();
+    OnGameThread([&] {
+        auto* pc = game::Controller();
+        if (!pc || !pc->PlayerInput) return;
+        std::set<std::string> used;
+        auto& binds = pc->PlayerInput->Bindings;
+        for (std::size_t i = 0; i < binds.Num(); ++i) {
+            const auto& b = binds[i];
+            used.insert(b.Name.GetName());
+            if (b.Control || b.Shift || b.Alt || !b.Command.IsValid()) continue;
+            const std::string key = b.Name.GetName(), cmd = b.Command.ToString();
+            if (cmd.rfind("GBA_", 0) == 0 && key.rfind("GBA_", 0) != 0 && key.rfind("XboxTypeS_", 0) != 0)
+                list.push_back({{"key", key}, {"command", cmd}});
+        }
+        for (const char* k : {"NumPadNine", "NumPadEight", "NumPadSeven", "Home", "End", "PageUp"})
+            if (!used.count(k)) { freeKey = k; break; }
+    });
+    const auto file = paths::Dir() / "selftest-keybindings.json";
+    if (freeKey.empty()) p.Problem("no free key to test with");
+    else {
+        list.push_back({{"key", freeKey}, {"command", "GBA_Jump"}});
+        {
+            std::ofstream out(file, std::ios::trunc);
+            out << nlohmann::json{{"bindings", list}}.dump(1);
+        }
+        keep_bindings::SetFile(file);
+        OnRenderThread([&] { keep->SetEnabled(true); });     // A reset moment: what is missing comes back
+        const auto bound = [&] {
+            bool found = false;
+            OnGameThread([&] {
+                auto* pc = game::Controller();
+                if (!pc || !pc->PlayerInput) return;
+                auto& binds = pc->PlayerInput->Bindings;
+                for (std::size_t i = 0; i < binds.Num() && !found; ++i)
+                    found = binds[i].Name.GetName() == freeKey && binds[i].Command.IsValid() &&
+                            binds[i].Command.ToString() == "GBA_Jump";
+            }, 1.0);
+            return found;
+        };
+        if (!WaitFor(5.0, bound)) p.Problem("the kept binding " + freeKey + " = GBA_Jump was not put back");
+        else s.notes.push_back("put back " + freeKey + " = GBA_Jump");
+
+        // Undo: the module off first (it would put it back), then the binding gone and the game's ini as it was
+        OnRenderThread([&] { keep->SetEnabled(false); });
+        keep_bindings::SetFile({});
+        // Taken out of the list, not blanked: the game saves TdInput.ini from memory later (on a level load), and a
+        // blanked entry ("NumPadNine", Command=) would end up in the player's file. Removing needs no allocation: the
+        // entries after it move down one and the count drops (its command string is left to leak, a few bytes).
+        OnGameThread([&] {
+            auto* pc = game::Controller();
+            if (!pc || !pc->PlayerInput) return;
+            auto& binds = pc->PlayerInput->Bindings;
+            struct RawArray { Classes::FKeyBind* data; int count; int max; };
+            static_assert(sizeof(RawArray) == sizeof(binds), "TArray layout");
+            auto* raw = reinterpret_cast<RawArray*>(&binds);
+            for (int i = raw->count - 1; i >= 0; --i) {
+                if (raw->data[i].Name.GetName() != freeKey) continue;
+                std::memmove(&raw->data[i], &raw->data[i + 1], sizeof(Classes::FKeyBind) * (raw->count - i - 1));
+                --raw->count;
+            }
+        });
+        if (bound()) p.Problem("could not remove the test binding again");
+    }
+    if (hadIni) {
+        std::ofstream out(ini, std::ios::binary | std::ios::trunc);
+        out << iniWas;
+    }
+    std::error_code ec;
+    std::filesystem::remove(file, ec);
+    OnRenderThread([&] { keep->SetEnabled(enabledWas); });
+    p.Check(1, false);
+    End(s);
+}
+#endif
+
 void TestCollisionInspect()
 {
     Step& s = Begin("Collision view inspect");
@@ -1256,12 +1885,15 @@ void TestCollisionInspect()
         End(s);
         return;
     }
+    auto* labels = dynamic_cast<ctl::Checkbox*>(view->FindSetting("Labels"));     // Drawn meanwhile (on screen)
+    const bool labelsWas = labels && labels->Get();
     const bool enabledWas = view->Enabled(), expandedWas = view->expanded, inspectWas = inspect->Get();
     unsigned yawWas = 0, pitchWas = 0;
     OnGameThread([&] { if (auto* pc = game::Controller()) { yawWas = pc->Rotation.Yaw; pitchWas = pc->Rotation.Pitch; } });
     OnRenderThread([&] {
         view->expanded = true;
         inspect->Set(true);
+        if (labels) labels->Set(true);
         if (!view->Enabled()) view->SetEnabled(true);
     });
 
@@ -1299,8 +1931,71 @@ void TestCollisionInspect()
 
     OnGameThread([&] { if (auto* pc = game::Controller()) { pc->Rotation.Yaw = yawWas; pc->Rotation.Pitch = pitchWas; } });
     OnRenderThread([&] {
+        if (labels) labels->Set(labelsWas);
         inspect->Set(inspectWas);
         view->expanded = expandedWas;
+        view->SetEnabled(enabledWas);
+    });
+    WaitTicks(5);
+    p.Check(1, true);
+    End(s);
+}
+
+// Static geometry in the collision view: the level is read (a slice per tick), real collision comes out of it (not only
+// bounding boxes: the mesh and body setup pointers check out), something is drawn near the player, and the game thread
+// never pays for it in one go (its worst tick stays small; the build runs on the worker).
+void TestCollisionStatic()
+{
+    Step& s = Begin("Collision view static geometry");
+    Probe p(s);
+    Module* view = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& m) { if (m.Name() == "Collision View") view = &m; });
+    auto* on = view ? dynamic_cast<ctl::Checkbox*>(view->FindSetting("Show static geometry")) : nullptr;
+    auto* other = view ? dynamic_cast<ctl::Checkbox*>(view->FindSetting("Static: other")) : nullptr;
+    if (!view || !on || !other) {
+        p.Problem("the Collision View module or its static geometry settings were not found");
+        p.Check(1, false);
+        End(s);
+        return;
+    }
+    const bool enabledWas = view->Enabled(), onWas = on->Get(), otherWas = other->Get();
+    OnRenderThread([&] {
+        on->Set(true);
+        other->Set(true);
+        if (!view->Enabled()) view->SetEnabled(true);
+    });
+
+    staticworld::Info info;
+    const bool read = WaitFor(30.0, [&] { info = staticworld::GetInfo(); return !info.map.empty() && !info.scanning && info.meshes > 0; });
+    WaitFor(5.0, [&] { info = staticworld::GetInfo(); return info.vertices > 0; });
+    WaitTicks(120);                 // The steady state: the level read, the drawing kept up to date
+    info = staticworld::GetInfo();
+    std::size_t found = 0, drawn = 0;
+    std::string per;
+    for (int c = 0; c < rstatic::kCategoryCount; ++c) {
+        found += info.found[static_cast<std::size_t>(c)];
+        drawn += info.drawn[static_cast<std::size_t>(c)];
+        per += std::string(per.empty() ? "" : ", ") + std::to_string(info.drawn[static_cast<std::size_t>(c)]) + "/" +
+               std::to_string(info.found[static_cast<std::size_t>(c)]) + " " + rstatic::CategoryName(static_cast<rstatic::Category>(c));
+    }
+    char note[240];
+    std::snprintf(note, sizeof note, "%s: %zu meshes with simple collision, %zu placed; drawn/found: %s", info.map.c_str(),
+                  info.meshes, found, per.c_str());
+    s.notes.push_back(note);
+    std::snprintf(note, sizeof note, "%zu k vertices built in %.1f ms (worker); game thread %.3f ms a tick on average, "
+                  "slowest %.1f ms%s", info.vertices / 1000, info.buildMs, info.tickAvgMs, info.tickMaxMs,
+                  info.budgetHit ? "; vertex limit hit" : "");
+    s.notes.push_back(note);
+    if (!read) p.Problem("the level was never read (scanning " + std::string(info.scanning ? "still" : "not") + " going)");
+    else if (info.meshes == 0) p.Problem("no mesh had simple collision we could read (only bounding boxes): check the "
+                                         "StaticMesh / RB_BodySetup offsets");
+    if (read && drawn == 0) p.Problem("nothing drawn near the player");
+    if (info.tickMaxMs > 4.0) p.Problem("a game thread tick took " + std::to_string(info.tickMaxMs) + " ms");
+    if (info.tickAvgMs > 0.5) p.Problem("the game thread spends " + std::to_string(info.tickAvgMs) + " ms a tick on it");
+
+    OnRenderThread([&] {
+        on->Set(onWas);
+        other->Set(otherWas);
         view->SetEnabled(enabledWas);
     });
     WaitTicks(5);
@@ -1497,7 +2192,7 @@ const sched::EntryView* FindEntry(const std::vector<sched::EntryView>& entries, 
 
 // Modules that draw on the screen every frame while on (a HUD, a counter): with the menu closed, the frame must have more
 // in it while they are on than before, and no more after they are switched off.
-const std::set<std::string> kDrawsHud = {"Crosshair", "Show FPS", "Watermark", "Speedometer", "Input Overlay",
+const std::set<std::string> kDrawsHud = {"Crosshair", "Show FPS", "Watermark", "Speedometer", "Input Overlay", "Kickglitch Helper",
                                          "Speedrun Timer"};
 
 // What the menu draws with its window closed (the modules' HUDs), a few frames after a change.
@@ -1764,12 +2459,34 @@ void Run()
                 {"Input overlay", &TestInputOverlay, true},
 #endif
 #endif
+#if MEMENU_FEATURE_KICKGLITCH_HELPER
+                {"Kickglitch helper", &TestKickglitchHelper, false},
+#endif
+#if MEMENU_FEATURE_AUTO_KICKGLITCH
+                {"Auto kickglitch", &TestAutoKickglitch, false},
+#endif
+#if MEMENU_FEATURE_KILL_BOTS
+                {"Kill bots", &TestKillBots, false},
+#endif
+#if MEMENU_FEATURE_KEY_BINDINGS
+                {"Keep key bindings", &TestKeepKeyBindings, false},
+#endif
 #if MEMENU_FEATURE_COLLISION_VIEW
                 {"Collision view inspect", &TestCollisionInspect, false},
+                {"Collision view static geometry", &TestCollisionStatic, false},
 #endif
 #if MEMENU_FEATURE_SPEEDRUN_TIMER
                 {"Speedrun timer", &TestSpeedrunTimer, false},
 #endif
+#if MEMENU_FEATURE_STRANG
+                {"Engine state hook", &TestEngineStateHook, false},
+#endif
+                {"Engine script events", &TestEngineScriptEvents, false},
+#if MEMENU_FEATURE_FRAME_RATE
+                {"Frame rate limit", &TestFrameRate, false},
+#endif
+                {"Engine console", &TestEngineConsole, false},
+                {"Engine death hook", &TestEngineDeath, false},     // Last: it restarts the checkpoint
                 {nullptr, nullptr, false},
             };
             for (const Named* t = tests; t->name && !g_aborted; ++t) {

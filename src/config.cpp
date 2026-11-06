@@ -4,7 +4,10 @@
 #include "paths.h"
 #include "theme.h"
 
+#include <Windows.h>
+
 #include <fstream>
+#include <string>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -19,6 +22,62 @@ static int ReadKey(const json& obj, const char* name, int fallback)
 {
     const auto it = obj.find(name);
     return it != obj.end() && it->is_number_integer() ? it->get<int>() : fallback;
+}
+
+namespace {
+    bool g_autoSave = true;
+    std::string g_written;          // What the file holds (as far as this session knows): autosave skips equal configs
+    unsigned long long g_lastCheck = 0;
+
+    // The whole config as text. Render thread (or with the menu not drawing): the controls change there.
+    std::string Build()
+    {
+        json mods = json::object();
+        modules::ForEach([&](modules::Tab& t, Module& m)
+        {
+            json settings = json::object();
+            json keys = json::object();
+            for (const ctl::Setting* s : m.Settings())
+            {
+                if (s->Persistent()) s->Save(settings[s->Name()]);
+                if (s->key || s->keyAlt) keys[s->Name()] = {{"key", s->key}, {"keyAlt", s->keyAlt}};
+            }
+
+            json mt = json::object();
+            if (!m.IsAction()) mt["enabled"] = m.Enabled();
+            mt["key"] = m.key;                           // Windows virtual-key code, 0 = unbound
+            if (!settings.empty()) mt["settings"] = std::move(settings);
+            if (!keys.empty()) mt["keys"] = std::move(keys);
+            mods[ModuleKey(t, m)] = std::move(mt);
+        });
+
+        json root = json::object();
+        root["theme"]   = theme::Current();
+        root["modules"] = std::move(mods);
+        return root.dump(2) + '\n';
+    }
+
+    // A temporary file swapped in: a crash or the game closing mid-write never leaves half a config.
+    bool Write(const std::string& text)
+    {
+        auto tmp = ConfigPath();
+        tmp += ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                spdlog::error("Cannot write config to {}", tmp.string());
+                return false;
+            }
+            out << text;
+            if (!out.good()) return false;
+        }
+        if (!MoveFileExW(tmp.c_str(), ConfigPath().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            spdlog::error("Cannot replace {} (error {})", ConfigPath().string(), GetLastError());
+            return false;
+        }
+        g_written = text;
+        return true;
+    }
 }
 
 bool config::Load()
@@ -69,6 +128,7 @@ bool config::Load()
         });
 
         spdlog::info("Config loaded");
+        g_written = Build();    // As loaded: autosave writes only what changes after this
         return true;
     }
     catch (const std::exception& e)
@@ -80,36 +140,21 @@ bool config::Load()
 
 bool config::Save()
 {
-    json mods = json::object();
-    modules::ForEach([&](modules::Tab& t, Module& m)
-    {
-        json settings = json::object();
-        json keys = json::object();
-        for (const ctl::Setting* s : m.Settings())
-        {
-            if (s->Persistent()) s->Save(settings[s->Name()]);
-            if (s->key || s->keyAlt) keys[s->Name()] = {{"key", s->key}, {"keyAlt", s->keyAlt}};
-        }
-
-        json mt = json::object();
-        if (!m.IsAction()) mt["enabled"] = m.Enabled();
-        mt["key"] = m.key;                           // Windows virtual-key code, 0 = unbound
-        if (!settings.empty()) mt["settings"] = std::move(settings);
-        if (!keys.empty()) mt["keys"] = std::move(keys);
-        mods[ModuleKey(t, m)] = std::move(mt);
-    });
-
-    json root = json::object();
-    root["theme"]   = theme::Current();
-    root["modules"] = std::move(mods);
-
-    std::ofstream out(ConfigPath());
-    if (!out)
-    {
-        spdlog::error("Cannot write config to {}", ConfigPath().string());
-        return false;
-    }
-    out << root.dump(2) << '\n';
-    spdlog::info("Config saved");
-    return out.good();
+    if (!g_autoSave) return false;      // Self-test: the player's config is never written
+    const bool ok = Write(Build());
+    if (ok) spdlog::info("Config saved");
+    return ok;
 }
+
+void config::AutoSave()
+{
+    if (!g_autoSave) return;
+    const unsigned long long now = GetTickCount64();
+    if (now - g_lastCheck < 1000) return;
+    g_lastCheck = now;
+    std::string text = Build();
+    if (text == g_written) return;
+    if (Write(text)) spdlog::debug("Config autosaved");
+}
+
+void config::SetAutoSave(bool on) { g_autoSave = on; }

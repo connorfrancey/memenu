@@ -63,7 +63,8 @@ bool Contains(const std::string& text, const std::string& lowerPart)
     return lowerPart.empty() || Lower(text).find(lowerPart) != std::string::npos;
 }
 
-// The levels in story order with their checkpoints: click a level to open it, then "Start" or a checkpoint to load it.
+// The levels in story order with their checkpoints: click a level to open it, then a checkpoint to load it (A is the
+// level start; a level without checkpoints has "Start").
 // The level you are in is marked and open. Maps and checkpoints come from the game's own level-select data; loads use
 // the same StartGame() the game's menu does.
 class LevelLoader final : public ActionModule {
@@ -127,7 +128,8 @@ private:
             }
             if (open) {
                 const float rowW = width - ImGui::GetStyle().IndentSpacing;   // The tree indents its children
-                if ((levelMatch || find.empty()) && ImGui::Selectable("Start", false, 0, {rowW, 0}))
+                // Checkpoint A is the level start: "Start" only for a level without checkpoints
+                if (map.checkpoints.empty() && (levelMatch || find.empty()) && ImGui::Selectable("Start", false, 0, {rowW, 0}))
                     levels::Load(i, 0, method, save);
                 for (int j = 0; j < static_cast<int>(map.checkpoints.size()); ++j) {
                     const std::string& label = map.checkpoints[static_cast<std::size_t>(j)];
@@ -166,7 +168,7 @@ private:
     ctl::Section optionsSection{this, "Load options", false};
     ctl::Checkbox consoleLoad{this, "Console load", false,
                               "Use the console command 'open <map>' instead of the game's StartGame. Ignores checkpoints"};
-    ctl::Checkbox saveProgress{this, "Save progress", false, "Let loads made here overwrite your saved checkpoint progress"};
+    ctl::Checkbox saveProgress{this, "Save progress", true, "Let loads made here overwrite your saved checkpoint progress"};
 };
 MEM_MODULE(LevelLoader)
 

@@ -32,12 +32,25 @@ public:
         dl->AddText({11.f, 31.f}, IM_COL32(0, 0, 0, 200), line);
         dl->AddText({10.f, 30.f}, st.ready ? IM_COL32(120, 230, 120, 255) : IM_COL32(255, 110, 100, 255), line);
 
+        float y = 46.f;
+        if (st.ready && showHooks) {    // The optional hooks: a feature built on a missing one does nothing
+            std::snprintf(line, sizeof line, "hooks: state handler %s | death %s (%u) | script events %llu",
+                          game::PlayerStateHooked() ? "on" : "OFF", game::DeathHooked() ? "on" : "OFF", st.deaths,
+                          st.scriptEvents);
+            const bool all = game::PlayerStateHooked() && game::DeathHooked();
+            dl->AddText({11.f, y + 1.f}, IM_COL32(0, 0, 0, 200), line);
+            dl->AddText({10.f, y}, all ? IM_COL32(170, 200, 170, 255) : IM_COL32(255, 190, 90, 255), line);
+            y += 16.f;
+        }
         const std::string msg = levels::LastMessage();     // result of the last level/sublevel action
         if (!msg.empty()) {
-            dl->AddText({11.f, 47.f}, IM_COL32(0, 0, 0, 200), msg.c_str());
-            dl->AddText({10.f, 46.f}, IM_COL32(230, 230, 230, 255), msg.c_str());
+            dl->AddText({11.f, y + 1.f}, IM_COL32(0, 0, 0, 200), msg.c_str());
+            dl->AddText({10.f, y}, IM_COL32(230, 230, 230, 255), msg.c_str());
         }
     }
+
+private:
+    ctl::Checkbox showHooks{this, "Show hooks", true, "Which optional engine hooks are on, deaths and script events seen"};
 };
 MEM_MODULE(GameStatus)
 

@@ -62,6 +62,13 @@ struct Options {
     // Polled while idle (and the menu is closed): start a recording with the start below, or play the macro
     int keyRecord = 0, keyPlay = 0;
     int keyBookmark = 0;              // while a session runs: a bookmark on the current frame
+    // Navigation (also idle with the menu closed): one frame back (replays up to the frame before, paused there; while
+    // recording, the take is kept and plays back to there: take over to redo the frame), and the previous / next
+    // bookmark.
+    int keyFrameBack = 0, keyPrevBookmark = 0, keyNextBookmark = 0;
+    // A bookmark "Split: <level>" on the frame a level is completed, recording and playing (a playback moves it to where
+    // the level is completed now). See tas/splits.h.
+    bool autoSplits = true;
     StartKind recordStart = StartKind::Checkpoint;
     std::string recordCommand, recordMap, recordCheckpoint;
 };
@@ -113,6 +120,9 @@ void TogglePause();
 void Advance(int frames = 1);         // run this many frames, then pause
 void TakeOver();                      // while playing: drop the rest and continue recording from this frame
 void Goto(std::size_t frame);         // play (from the start if needed, as fast as possible) up to `frame`, then pause
+void FrameBack(int frames = 1);       // Goto the frame `frames` before the current one
+// Goto the bookmark before (step -1) or after (+1) the current frame.
+void GotoBookmark(int step);
 void Rewind();                        // while recording: go back Options::rewindSeconds and pause there (practice mode)
 // A camera key on `frame` with the player camera's look direction right now (replacing a key there).
 void KeyCameraFromView(std::uint32_t frame);

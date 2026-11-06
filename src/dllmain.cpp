@@ -48,6 +48,7 @@ static void Run(HMODULE module)
     });
     unload::Requested();   // Creates the unload event before anything can go wrong
     const bool selfTest = selftest::Requested();   // `selftest` file next to the DLL: see selftest.h
+    if (selfTest) config::SetAutoSave(false);      // The test changes settings: never into the player's config
 
     STARTUP_STEP(clk::Init());                // Before anything measures time (scheduler, caches)
     STARTUP_STEP(theme::Init());              // themes/ folder + built-in theme files

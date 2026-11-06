@@ -9,6 +9,7 @@
 #include "features/tas/macro_library.h"
 #include "features/tas/replay_editor.h"
 #include "features/tas/timeline_view.h"
+#include "tas/splits.h"
 #include "tas/tas.h"
 
 #include <Windows.h>
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,35 @@ std::string FormatTime(double seconds)
     const int m = static_cast<int>(seconds / 60.0);
     std::snprintf(buf, sizeof buf, "%d:%06.3f", m, seconds - m * 60.0);
     return buf;
+}
+
+// A difference to the reference: "-0.250", "+1:02.017". Ahead is negative.
+std::string FormatDelta(double seconds)
+{
+    const char sign = seconds < 0.0 ? '-' : '+';
+    seconds = std::fabs(seconds);
+    char buf[32];
+    if (seconds >= 60.0) {
+        const int m = static_cast<int>(seconds / 60.0);
+        std::snprintf(buf, sizeof buf, "%c%d:%06.3f", sign, m, seconds - m * 60.0);
+    } else {
+        std::snprintf(buf, sizeof buf, "%c%.3f", sign, seconds);
+    }
+    return buf;
+}
+
+ImVec4 DeltaColor(double delta)
+{
+    if (delta < -1e-9) return {0.4f, 1.f, 0.5f, 1.f};       // Ahead: faster than the reference
+    if (delta > 1e-9) return {1.f, 0.45f, 0.4f, 1.f};
+    return ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+}
+
+// "Flight" for "Split: Flight"; other bookmarks as they are.
+const char* SplitLabel(const std::string& name)
+{
+    const std::size_t prefix = std::char_traits<char>::length(tas::splits::kSplitPrefix);
+    return name.rfind(tas::splits::kSplitPrefix, 0) == 0 ? name.c_str() + prefix : name.c_str();
 }
 
 const float kRates[] = {0.f, 30.f, 50.f, 60.f, 62.f, 100.f, 120.f, 144.f, 240.f};
@@ -56,12 +87,13 @@ public:
 
         in(playSection, {&maxSpeed, &atEnd, &gotoFrame});
         speed.VisibleIf([this] { return playSection && !maxSpeed.Get(); });
-        in(bookmarkSection, {&bookmarks});
+        in(bookmarkSection, {&autoSplits, &bookmarks});
+        in(splitsSection, {&splitsOnly, &splitTable});
         in(desyncSection, {&desyncChecks, &onDesync, &matchRecording});
         correctMax.VisibleIf([this] { return desyncSection && onDesync.Get() == 1; });
         in(filesSection, {&files});
-        in(keysSection, {&recordKey, &playKey, &pauseKey, &advanceKey, &restartKey, &rewindKey, &takeOverKey, &stopKey,
-                         &bookmarkKey});
+        in(keysSection, {&recordKey, &playKey, &pauseKey, &advanceKey, &frameBackKey, &restartKey, &rewindKey,
+                         &takeOverKey, &stopKey, &bookmarkKey, &prevBookmarkKey, &nextBookmarkKey});
         in(moreSection, {&blockStreaming, &seekNoRender, &showOverlay, &showInputDisplay, &showTimeline, &showEditor,
                          &details, &translator});
     }
@@ -118,6 +150,10 @@ private:
         o.keyRecord = recordKey;
         o.keyPlay = playKey;
         o.keyBookmark = bookmarkKey;
+        o.keyFrameBack = frameBackKey;
+        o.keyPrevBookmark = prevBookmarkKey;
+        o.keyNextBookmark = nextBookmarkKey;
+        o.autoSplits = autoSplits;
         const RecordStart rs = Start();
         o.recordStart = rs.kind;
         o.recordCommand = rs.command;
@@ -131,8 +167,9 @@ private:
     void ReserveKeys()
     {
         std::vector<int> keys;
-        if (status_.mode == tas::Mode::Idle) keys = {recordKey, playKey};
-        else keys = {pauseKey, advanceKey, restartKey, rewindKey, takeOverKey, stopKey, bookmarkKey, recordKey, playKey};
+        if (status_.mode == tas::Mode::Idle) keys = {recordKey, playKey, nextBookmarkKey};
+        else keys = {pauseKey, advanceKey, restartKey, rewindKey, takeOverKey, stopKey, bookmarkKey, recordKey, playKey,
+                     frameBackKey, prevBookmarkKey, nextBookmarkKey};
         keys.erase(std::remove(keys.begin(), keys.end(), 0), keys.end());
         if (keys != reserved_) {
             reserved_ = keys;
@@ -183,14 +220,15 @@ private:
         ImGui::SetNextItemWidth(width);
         if (ImGui::BeginCombo("##map", maps[map_].label.c_str())) {
             for (int i = static_cast<int>(maps.size()) - 1; i >= 0; --i)   // last to first, like the Levels tab
-                if (ImGui::Selectable(maps[i].label.c_str(), i == map_)) { map_ = i; checkpoint_ = 0; }
+                if (ImGui::Selectable(maps[i].label.c_str(), i == map_)) { map_ = i; checkpoint_ = 1; }
             ImGui::EndCombo();
         }
+        // Checkpoint A is the level start: the level start is only a choice of its own without checkpoints
         const auto& cps = maps[map_].checkpoints;
-        checkpoint_ = std::clamp(checkpoint_, 0, static_cast<int>(cps.size()));
+        checkpoint_ = std::clamp(checkpoint_, cps.empty() ? 0 : 1, static_cast<int>(cps.size()));
         ImGui::SetNextItemWidth(width);
         if (ImGui::BeginCombo("##cp", checkpoint_ == 0 ? "Level start" : cps[checkpoint_ - 1].c_str())) {
-            if (ImGui::Selectable("Level start", checkpoint_ == 0)) checkpoint_ = 0;
+            if (cps.empty() && ImGui::Selectable("Level start", true)) checkpoint_ = 0;
             for (int i = 0; i < static_cast<int>(cps.size()); ++i)
                 if (ImGui::Selectable(cps[i].c_str(), checkpoint_ == i + 1)) checkpoint_ = i + 1;
             ImGui::EndCombo();
@@ -457,6 +495,19 @@ private:
         gotoFrame_ = std::max(gotoFrame_, 0);
         ImGui::SameLine();
         if (ImGui::Button("Go to frame", {half, 0})) tas::Goto(static_cast<std::size_t>(gotoFrame_));
+
+        const float third = (width - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.f;
+        if (ImGui::Button("|< Bookmark", {third, 0})) tas::GotoBookmark(-1);
+        ImGui::SetItemTooltip("Go to the bookmark before this frame (%s)", keys::Name(prevBookmarkKey).c_str());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(status_.mode == tas::Mode::Idle);
+        if (ImGui::Button("< Frame", {third, 0})) tas::FrameBack();
+        ImGui::SetItemTooltip("One frame back: plays up to the frame before and pauses there. While recording, the take "
+                              "is kept: take over there to redo that frame (%s)", keys::Name(frameBackKey).c_str());
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Bookmark >|", {third, 0})) tas::GotoBookmark(+1);
+        ImGui::SetItemTooltip("Go to the next bookmark (%s)", keys::Name(nextBookmarkKey).c_str());
     }
 
     // Named frames: add one where the session is (or at the Go to frame), click to go there, rename, delete.
@@ -598,6 +649,141 @@ private:
         ImGui::SetItemTooltip("Rewrites the replay for other key bindings, e.g. LeftMouseButton -> RightMouseButton");
     }
 
+    // ---- splits -------------------------------------------------------------------------------------------------------------
+    // The current macro's split table (refreshed a few times a second: it walks every frame).
+    const tas::splits::Table& Splits()
+    {
+        const double now = ImGui::GetTime();
+        if (now - splitsTime_ > 0.25) {
+            splitsTime_ = now;
+            tas::WithReplay([&](tas::Replay& r) {
+                splits_ = tas::splits::Build(r, hasReference_ ? &reference_ : nullptr, splitsOnly);
+            });
+        }
+        return splits_;
+    }
+
+    void SetReference(tas::Replay r, std::string name)
+    {
+        reference_ = std::move(r);
+        referenceName_ = std::move(name);
+        hasReference_ = true;
+        splitsTime_ = -1.0;
+    }
+
+    void DrawReferencePicker(float width)
+    {
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const float button = (width - spacing) * 0.35f;
+        ImGui::SetNextItemWidth(width - button - spacing);
+        const std::string preview = hasReference_ ? referenceName_ : std::string("Compare with...");
+        if (ImGui::BeginCombo("##reference", preview.c_str())) {
+            if (ImGui::Selectable("Nothing", !hasReference_)) {
+                hasReference_ = false;
+                referenceName_.clear();
+                splitsTime_ = -1.0;
+            }
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            std::vector<fs::path> found;
+            for (const auto& e : fs::directory_iterator(tas::Folder(), ec))
+                if (e.is_regular_file(ec) && (e.path().extension() == tas::kFileExtension || e.path().extension() == ".json"))
+                    found.push_back(e.path());
+            std::sort(found.begin(), found.end());
+            for (const fs::path& f : found) {
+                const std::string name = f.stem().string();
+                if (!ImGui::Selectable(name.c_str(), hasReference_ && name == referenceName_)) continue;
+                tas::Replay r;
+                std::string error;
+                const bool ok = f.extension() == ".json" ? r.ImportJson(f, &error) : r.Load(f, &error);
+                if (ok) SetReference(std::move(r), name);
+                else notify::Push("TAS: can't compare with " + name + ": " + error);
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip("A saved macro (replays\\) to compare the splits with. Splits are matched by name");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(status_.frames == 0);
+        if (ImGui::Button("This one", {button, 0})) {
+            tas::Replay r;
+            tas::WithReplay([&](tas::Replay& cur) { r = cur; });
+            const std::string name = "snapshot " + FormatTime(r.Duration());
+            SetReference(std::move(r), name);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Compare with the macro as it is now: optimise it, then see what each split gained");
+    }
+
+    // Split | time | segment | vs the reference, for every split (or bookmark), then the end of the run.
+    void DrawSplitTable(float width)
+    {
+        DrawReferencePicker(width);
+        const tas::splits::Table& t = Splits();
+        if (t.rows.empty()) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
+            ImGui::TextDisabled("%s", splitsOnly.Get()
+                                          ? "No splits yet: record or play a run that completes a level (with automatic "
+                                            "splits on), or turn off Only automatic splits to use your bookmarks"
+                                          : "No bookmarks yet");
+            ImGui::PopTextWrapPos();
+        }
+        const bool ref = hasReference_;
+        const int current = status_.mode == tas::Mode::Idle ? -1 : t.RowAt(status_.frame);
+        if (ImGui::BeginTable("##splits", ref ? 4 : 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg,
+                              {width, 0})) {
+            ImGui::TableSetupColumn("Split", ImGuiTableColumnFlags_WidthStretch, 2.f);
+            ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("Segment", ImGuiTableColumnFlags_WidthStretch, 1.f);
+            if (ref) ImGui::TableSetupColumn("+/-", ImGuiTableColumnFlags_WidthStretch, 1.f);
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0; i < t.rows.size(); ++i) {
+                const tas::splits::Row& row = t.rows[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TableNextRow();
+                if (static_cast<int>(i) == current)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, ImGui::GetColorU32(ImGuiCol_HeaderActive, 0.5f));
+                ImGui::TableNextColumn();
+                if (ImGui::Selectable(SplitLabel(row.name), false, ImGuiSelectableFlags_SpanAllColumns)) tas::Goto(row.frame);
+                ImGui::SetItemTooltip("Frame %u: click to go there", row.frame);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(FormatTime(row.time).c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(FormatTime(row.segment).c_str());
+                if (ref) {
+                    ImGui::TableNextColumn();
+                    if (!row.HasRef()) {
+                        ImGui::TextDisabled("-");
+                    } else {
+                        ImGui::TextColored(DeltaColor(row.Delta()), "%s", FormatDelta(row.Delta()).c_str());
+                        ImGui::SetItemTooltip("Reference: %s\nThis segment: %s (reference %s)",
+                                              FormatTime(row.refTime).c_str(), FormatDelta(row.SegmentDelta()).c_str(),
+                                              FormatTime(row.refSegment).c_str());
+                    }
+                }
+                ImGui::PopID();
+            }
+            // The whole run
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("End");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(FormatTime(t.end).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(FormatTime(t.end - (t.rows.empty() ? 0.0 : t.rows.back().time)).c_str());
+            if (ref) {
+                ImGui::TableNextColumn();
+                ImGui::TextColored(DeltaColor(t.end - t.refEnd), "%s", FormatDelta(t.end - t.refEnd).c_str());
+                ImGui::SetItemTooltip("Reference: %s", FormatTime(t.refEnd).c_str());
+            }
+            ImGui::EndTable();
+        }
+        if (ref) {
+            const double sob = t.SumOfBest();
+            if (sob >= 0.0)
+                ImGui::TextDisabled("Best of both, segment by segment: %s (to the last split)", FormatTime(sob).c_str());
+        }
+    }
+
     // ---- overlay ----------------------------------------------------------------------------------------------------------
     void DrawOverlay()
     {
@@ -608,6 +794,17 @@ private:
         if (st.mode == tas::Mode::Recording) color = IM_COL32(255, 90, 80, 255);
         if (st.desyncFrame >= 0) text += "  desync @" + std::to_string(st.desyncFrame);
         else if (st.verified) text += "  verified";
+        // The last split passed, against the reference
+        std::string deltaText;
+        double delta = 0.0;
+        if (hasReference_ && st.mode != tas::Mode::Idle) {
+            const tas::splits::Table& t = Splits();
+            if (const int row = t.RowAt(st.frame); row >= 0 && t.rows[row].HasRef()) {
+                delta = t.rows[row].Delta();
+                deltaText = " " + FormatDelta(delta);
+                text += std::string("  ") + SplitLabel(t.rows[row].name);
+            }
+        }
         if (st.paused) text += "   [" + keys::Name(advanceKey) + "] step  [" + keys::Name(pauseKey) + "] resume";
         if (!maxSpeed && std::fabs(speed.Get() - 1.f) > 1e-3f && st.mode != tas::Mode::Idle) {
             char s[24];
@@ -617,8 +814,11 @@ private:
 
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         const ImVec2 ts = ImGui::CalcTextSize(text.c_str());
-        dl->AddRectFilled({8.f, 8.f}, {16.f + ts.x, 12.f + ts.y}, IM_COL32(0, 0, 0, 150));
+        const float dw = deltaText.empty() ? 0.f : ImGui::CalcTextSize(deltaText.c_str()).x;
+        dl->AddRectFilled({8.f, 8.f}, {16.f + ts.x + dw, 12.f + ts.y}, IM_COL32(0, 0, 0, 150));
         dl->AddText({12.f, 10.f}, color, text.c_str());
+        if (!deltaText.empty())
+            dl->AddText({12.f + ts.x, 10.f}, ImGui::ColorConvertFloat4ToU32(DeltaColor(delta)), deltaText.c_str());
     }
 
     // ---- state ------------------------------------------------------------------------------------------------------------
@@ -631,9 +831,14 @@ private:
     bool confirmResync_ = false;
     char commandBuf_[128] = "open edge_p";
     char fromBuf_[48] = "", toBuf_[48] = "";
-    int map_ = 0, checkpoint_ = 0;
+    int map_ = 0, checkpoint_ = 1;     // Checkpoint A (the level start)
     int gotoFrame_ = 0;
     std::vector<int> reserved_;
+    tas::Replay reference_;               // What the splits are compared with
+    bool hasReference_ = false;
+    std::string referenceName_;
+    tas::splits::Table splits_;
+    double splitsTime_ = -1.0;
 
     // ---- controls (drawn in this order) -----------------------------------------------------------------------------------------
     ctl::Custom controls{this, [this](float w) { DrawControls(w); }};
@@ -661,7 +866,15 @@ private:
     ctl::Custom gotoFrame{this, [this](float w) { DrawGoto(w); }};
 
     ctl::Section bookmarkSection{this, "Bookmarks", false};
+    ctl::Checkbox autoSplits{this, "Automatic splits", true,
+                             "Recording and playing: a bookmark \"Split: <level>\" on the frame each level is completed. "
+                             "A playback of an edited run moves them to where it completes the level now"};
     ctl::Custom bookmarks{this, [this](float w) { DrawBookmarks(w); }};
+
+    ctl::Section splitsSection{this, "Splits", false};
+    ctl::Checkbox splitsOnly{this, "Only automatic splits", true,
+                             "Off: every bookmark is a split (for your own segments inside a level)"};
+    ctl::Custom splitTable{this, [this](float w) { DrawSplitTable(w); }};
 
     ctl::Section desyncSection{this, "Desync", false};
     ctl::Custom desyncChecks{this, [this](float w) { DrawDesyncChecks(w); }};
@@ -683,11 +896,14 @@ private:
     ctl::KeyHold playKey{this, "Play", VK_F3};
     ctl::KeyHold pauseKey{this, "Pause / resume", VK_F5};
     ctl::KeyHold advanceKey{this, "Frame advance", VK_F6};
+    ctl::KeyHold frameBackKey{this, "Frame back", 0, "Replays up to the frame before this one and pauses there"};
     ctl::KeyHold restartKey{this, "Restart", VK_F4};
     ctl::KeyHold rewindKey{this, "Rewind", VK_F9};
     ctl::KeyHold takeOverKey{this, "Take over", VK_F7};
     ctl::KeyHold stopKey{this, "Stop", VK_F8};
     ctl::KeyHold bookmarkKey{this, "Bookmark", VK_F1};
+    ctl::KeyHold prevBookmarkKey{this, "Previous bookmark", 0};
+    ctl::KeyHold nextBookmarkKey{this, "Next bookmark", 0, "Idle with the menu closed: plays to the first bookmark"};
 
     ctl::Section moreSection{this, "Advanced", false};
     ctl::Checkbox blockStreaming{this, "Deterministic streaming", true,

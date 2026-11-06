@@ -119,3 +119,22 @@ TEST(Settings, FoundByName)
     EXPECT_EQ(m.FindSetting("Nope"), nullptr);
     EXPECT_EQ(m.Settings().size(), 8u);
 }
+
+TEST(Settings, ResetToDefault)
+{
+    Sample m;
+    EXPECT_TRUE(m.speed.Resettable());
+    EXPECT_TRUE(m.speed.IsDefault());
+    m.speed.Set(7.f);
+    m.mode.Set(2);
+    m.name.Set("second");
+    EXPECT_FALSE(m.speed.IsDefault());
+    for (ctl::Setting* s : m.Settings())
+        if (s->Resettable()) s->ResetToDefault();
+    EXPECT_FLOAT_EQ(m.speed, 1.f);
+    EXPECT_EQ(m.mode.Get(), 1);
+    EXPECT_EQ(m.name.Get(), "first");
+    EXPECT_TRUE(m.speed.IsDefault());
+    EXPECT_FALSE(m.button.Resettable());     // No value
+    EXPECT_FALSE(m.label.Resettable());
+}

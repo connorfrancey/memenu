@@ -262,7 +262,8 @@ namespace
 
         ImGui_ImplWin32_WndProcHandler(msg->hwnd, msg->message, msg->wParam, msg->lParam);
 
-        if (msg->message == WM_KEYDOWN && !(msg->lParam & (1 << 30)))
+        // Fresh presses; WM_SYSKEYDOWN: with Alt held, and F10
+        if ((msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN) && !(msg->lParam & (1 << 30)))
         {
             OnKeyDown(msg->wParam);
         }
@@ -294,8 +295,8 @@ namespace
     LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         // Messages that did not come through PeekMessage (or arrive while the menu is closed) end up here.
-        // Fresh key presses only (bit 30 = auto-repeat)
-        if (msg == WM_KEYDOWN && !(lp & (1 << 30)))
+        // Fresh key presses only (bit 30 = auto-repeat). WM_SYSKEYDOWN: with Alt held, and F10
+        if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !(lp & (1 << 30)))
         {
             if (OnKeyDown(wp)) return 0;
         }

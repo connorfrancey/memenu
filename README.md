@@ -87,6 +87,21 @@ The menu is a row of columns (tabs). Every row in a column is a **module**:
   Checkpoint, ...): they have a **Run** button there instead, which runs them once.
 - Every module has a **Toggle key** / **Hotkey** button at the bottom of its settings. Click it, then press the key
   you want (Escape cancels). The key works while the menu is closed.
+- Keys can be **combos**: hold Ctrl, Shift and/or Alt, then press the key (`Ctrl+F5`). Middle mouse, Mouse 4 and
+  Mouse 5 can be bound too, and a modifier pressed and released on its own is bound by itself. A plain key still works
+  while a modifier is held (F5 while sliding with Shift), but when both `F5` and `Ctrl+F5` are bound, `Ctrl+F5` only
+  does its own thing. Right click a key button to clear it.
+- A key button drawn **orange** is bound to something else too; hover it to see what.
+- **Misc → Hotkey List** opens a window with every key the menu uses (module keys, control keys, TAS and other
+  module key settings): search by module, action or key, rebind or clear in place, and show only the clashes.
+- A row shows a small arrow (settings open or closed) and, when it has one, its key.
+- **Search** (the last column, or **Ctrl+F**): type part of a module's or setting's name or description. Matching
+  modules are listed by tab and lit up in their columns; a result's switch works right there, and clicking its name
+  opens its settings in its own column. Esc clears the search.
+- **Right click a setting** to give it keys or **Reset to default**.
+- A column never runs past the bottom of the screen: a long one (TAS with its sections open) scrolls with the mouse
+  wheel, with a thin bar on its right edge. A column dragged off screen, or left there by a resolution change, comes
+  back far enough to grab its title.
 - Hover over a module or a setting for a description.
 
 While the menu is open the game doesn't get your mouse and keyboard, so you can click around without the camera
@@ -106,6 +121,18 @@ Default keys are in brackets. All of them can be changed.
 
 **Trainer**: tools from the mmultiplayer trainer
 - **Save State** [4] / **Load State** [5]: remember position, speed, rotation and current move, and go back to it.
+- **Save States**: a list of named states for each level, kept in `memenu\savestates` between sessions. Save new,
+  load (double-click), overwrite, rename, reorder and delete; keys can be bound to save, load and step through them.
+  Loading one makes it the Save State, so Load State [5] keeps going back to it.
+- **Kickglitch Helper**: times your kickglitches. It sees each wallrun kick by itself and shows how many frames from
+  the perfect jump you were (early/late), a bar of your recent attempts, your hit rate and streak, and flashes on the
+  landing frame. Arm the Kickglitch tool and do one kick to calibrate the perfect frame.
+- **Auto Kickglitch**: stays on and jumps on the landing frame after every wallrun kick you do. Optional "Kick key":
+  held while wallrunning, it kicks for you too. **Kick buffer** (on): a kick pressed in the air just before you reach
+  the wall doesn't air kick; it waits and kicks off the wall on the first frame you are on it. *Buffer window* (200 ms of
+  game time, so TAS playbacks do the same) is how long it waits; if no wall comes in time it kicks anyway, late, or
+  is dropped (*No wall in time*). Landing or grabbing a ledge first drops it, and with a gun in hand kicks are never
+  held (the button shoots).
 - **Speedometer**: position, speed, angles and more in a small window. Its checkpoint key [3] marks a split.
 - **Speedrun Timer**: a load removed timer with splits, after softsoundd's Softimer (Mirror's Edge Tweaks). It
   starts with a new game, splits when the game completes a chapter, stops when the Shard is done, and stands still
@@ -121,8 +148,11 @@ Default keys are in brackets. All of them can be changed.
 **World**
 - **Game Speed**: slow motion or faster.
 - **Freeze Timer**: stops the time trial clock.
+- **Kill Bots**: kills every enemy in the level, or only those within a range of you.
 
-**Visual**: **Crosshair**, **FOV**, **Show FPS**, **Input Overlay**.
+**Visual**: **Crosshair**, **FOV**, **Show FPS**, **Input Overlay**, **Frame Rate Limit** (the game's 62 fps cap set
+to another value, or uncapped; switched off, the engine gets back exactly what it had. Speedruns are at 62: the game
+moves differently at other frame rates. The self-test may run uncapped to go faster and puts the cap back after).
 - **Input Overlay**: the keyboard and mouse on screen, like NohBoard: keys light up while held and fade out, the mouse
   pad shows which way and how fast the mouse moves, and KPS counts presses per second. It shows what the game gets:
   your own input while you play, and a macro's while the TAS records or plays it back (**Show** can limit it to one
@@ -137,19 +167,39 @@ scheduler, caches), **Log Viewer** (the menu's log, filterable).
 - **Collision View** draws triggers, kill zones, checkpoints, blocking and movement volumes and pawn cylinders, and
   (off by default) spawn points, pickups, AI-only volumes and areas, and the AI's navigation points, hidden
   by the world like real geometry and locked to the game's own camera. Each layer shows how many are drawn of how many
-  the level has; a name filter (e.g. `kill`) shows only matching ones, and far volumes fade out.
+  the level has; a name filter (e.g. `kill`) shows only matching ones, and far volumes fade out. *Labels* name the
+  nearest volumes within *Label range*: a small plate in the layer's color over each one, never overlapping (the
+  nearer one wins), shrinking and fading with distance; the one under the crosshair always has its label. **Other volumes**
+  switches a group on and off; under it each kind has its own switch and color: **Post process** (post process, color,
+  light and reflection volumes), **Audio** (reverb), **Fog**, **Streaming** (level streaming, cull distance, portals)
+  and **Misc** (the rest). Levels cached or baked before the split keep working: their other volumes are sorted by name.
   *Inspect*: aim at a volume to see its name, kind, distance and size under the crosshair (outlined in white, with what
   is behind it), see the volumes you are standing in (top left), and list the nearby ones in the panel; click one to
   turn toward it. *Own cylinder* shows your collision cylinder as an outline, for checking clearance.
+  *Static geometry* (off by default): the simple collision of the level's static meshes, in layers you switch and
+  color separately: **Architecture** (walls, floors, rails), **Movers** (doors, elevators, platforms, drawn where they
+  are now), **Props** (physics objects), **Invisible** (hidden meshes that still block you: invisible walls),
+  **Other**, and **Bounds** (meshes that collide per polygon, which can't be read: their bounding box). Only what blocks
+  the player is shown unless *Include non-colliding* is on; a name filter (e.g. `rail`, `glass`) narrows it down.
+  Style (outline by default), opacity, range and a vertex limit keep it readable and cheap: the level is read a little
+  each frame, the geometry is built on a worker thread (nearest first) only when you have moved or changed a setting,
+  and the panel shows what it costs the game thread (about 0.03 ms a tick). Level BSP isn't drawn: the game's
+  layout of it isn't known.
 
 **Levels**
 - **Levels**: every chapter, listed last to first (the final chapter at the top, the Prologue at the bottom). Click a chapter to open it, then
   **Start of level** or a checkpoint to load it. *Console load* uses `open <map>` instead of the game's menu.
-  *Save progress* lets those loads overwrite your saved progress (off by default).
+  *Save progress* lets those loads overwrite your saved progress (on by default).
 - **Restart Checkpoint**, **Main Menu**, **Sublevels** (load / show / hide the level's streaming parts).
 
 **Misc**: **Themes** (pick a color theme, or reload the theme files), **Save Config** / **Load Config**,
-**Watermark**, **Game Status** (checks the game integration, useful in bug reports).
+**Watermark**, **Game Status** (checks the game integration, useful in bug reports; its second line shows the optional
+engine hooks: the player state handler, used by Strang, and death), **Console** (runs a command in the game's console,
+as if typed there: `stat fps`, `slomo 0.5`, `set Engine bEnableColorClear true`; recent commands run again with a click).
+**Keep Key Bindings** (on by default): the game keeps only one key per action when it starts or loads a level, so an
+alternate key set in its controls menu is gone the next time. This remembers every key you bind to one of the game's
+actions (in `memenu\keybindings.json`) and puts back the ones the game dropped. The menu's own settings and keys are
+saved as you change them (they used to be saved only when unloading the menu with END).
 
 ### Macros and TAS
 
@@ -209,6 +259,22 @@ They show as flags on the progress bar and the timeline's ruler; click one to go
 Double click the timeline's ruler to add one, right click its flag to delete it. Bookmarks are saved with the macro
 and move with the frames when you insert or delete some.
 
+**Playback → |< Bookmark / Bookmark >|** jump to the previous / next bookmark, **< Frame** goes one frame back (it
+replays up to the frame before and pauses; while recording, the take is kept: **Take over** there to redo the frame).
+
+#### Splits (for speedrunners)
+
+With **Bookmarks → Automatic splits** on (the default), recording or playing a run adds a bookmark
+`Split: <level>` on the first frame after each level is completed. A playback of an edited run moves them to where
+the level is completed now, so the splits always match the inputs.
+
+**Splits** shows every split with its game time, its segment and, once you pick something under **Compare with...**,
+how far ahead (green, negative) or behind (red) of the reference it is. The reference is any saved macro in
+`replays\` (matched by split name), or **This one**: the macro as it is now. Take a snapshot, optimise a segment,
+and the table shows what each split gained; the line under it is the best of both runs segment by segment. Turn off
+**Only automatic splits** to use your own bookmarks as splits (segments inside a level). While a session runs, the
+status overlay shows the last split passed and its difference to the reference.
+
 #### Practice mode (rewind on death)
 
 With a level start, **On death** decides what happens when you die while recording:
@@ -242,6 +308,10 @@ While a macro runs:
 | **F9** | Rewind (practice) |
 | **F4** | Restart |
 | **F1** | Bookmark the current frame |
+| *(unset)* | Frame back, previous bookmark, next bookmark (set them under **Keys**; next bookmark also works idle) |
+
+Any of these can be a combo (`Ctrl+F5`) or a mouse button. With a combo only the key itself is kept from the game: the
+modifier still reaches it (and is recorded).
 
 These keys never reach the game while a macro runs, so they are never recorded. INSERT and END aren't either. They
 don't reach the menu's module hotkeys either: F5 pauses the TAS without also switching No Clip (its default key) on.

@@ -146,8 +146,11 @@ memenu_feature(teleport_to_spawn player GAME STAGE 9  FILES features/player/tele
 # Trainer
 memenu_feature(beamer            trainer GAME STAGE 10 FILES features/trainer/beamer.cpp)
 memenu_feature(kickglitch        trainer GAME STAGE 10 FILES features/trainer/kickglitch.cpp)
+memenu_feature(kickglitch_helper trainer GAME STAGE 10 FILES features/trainer/kickglitch_helper.cpp)
+memenu_feature(auto_kickglitch   trainer GAME STAGE 10 FILES features/trainer/auto_kickglitch.cpp)
 memenu_feature(strang            trainer GAME STAGE 10 FILES features/trainer/strang.cpp)
 memenu_feature(save_state        trainer GAME STAGE 9  FILES features/trainer/save_state.cpp)
+memenu_feature(save_states       trainer GAME STAGE 9  FILES features/trainer/save_states.cpp)
 memenu_feature(speedometer       trainer GAME STAGE 7  FILES features/trainer/speedometer.cpp)
 memenu_feature(speedrun_timer    trainer GAME STAGE 7  FILES features/trainer/speedrun_timer.cpp speedrun/live.cpp speedrun/timer.cpp)
 memenu_feature(tool_overlay      trainer      STAGE 5  FILES features/trainer/tool_overlay.cpp)
@@ -155,17 +158,19 @@ memenu_feature(tool_overlay      trainer      STAGE 5  FILES features/trainer/to
 # TAS / replay
 memenu_feature(tas               tas GAME STAGE 12 FILES features/tas/tas_module.cpp features/tas/timeline_view.cpp features/tas/replay_editor.cpp features/tas/macro_library.cpp
                   tas/engine.cpp tas/replay.cpp tas/tas.cpp
-                  tas/timeline.cpp tas/history.cpp tas/input_monitor.cpp)
+                  tas/timeline.cpp tas/history.cpp tas/input_monitor.cpp tas/splits.cpp)
 
 # World
 memenu_feature(game_speed        world GAME STAGE 9 FILES features/world/game_speed.cpp)
 memenu_feature(freeze_timer      world GAME STAGE 9 FILES features/world/freeze_timer.cpp)
+memenu_feature(kill_bots         world GAME STAGE 9 FILES features/world/kill_bots.cpp)
 
 # Visual
 memenu_feature(crosshair         visual STAGE 5 FILES features/visual/crosshair.cpp)
 memenu_feature(input_overlay     visual STAGE 5 FILES features/visual/input_overlay.cpp features/visual/input_layout.cpp)
 memenu_feature(fov               visual GAME STAGE 9 FILES features/visual/fov.cpp)
 memenu_feature(show_fps          visual STAGE 5 FILES features/visual/show_fps.cpp)
+memenu_feature(frame_rate        visual GAME STAGE 9 FILES features/visual/frame_rate.cpp)
 memenu_feature(clear_frame       visual GAME STAGE 9 FILES features/visual/clear_frame.cpp)
 
 # Debug
@@ -181,6 +186,9 @@ memenu_feature(sublevels         levels GAME STAGE 8 FILES features/levels/suble
 # Misc
 memenu_feature(config_actions    misc      STAGE 4 FILES features/misc/config_actions.cpp)
 memenu_feature(game_status       misc GAME STAGE 6 FILES features/misc/game_status.cpp)
+memenu_feature(console           misc GAME STAGE 6 FILES features/misc/console.cpp)
+memenu_feature(key_bindings      misc GAME STAGE 6 FILES features/misc/key_bindings.cpp)
+memenu_feature(hotkeys           misc      STAGE 4 FILES features/misc/hotkeys.cpp)
 memenu_feature(themes            misc      STAGE 4 FILES features/misc/themes.cpp)
 memenu_feature(watermark         misc      STAGE 5 FILES features/misc/watermark.cpp)
 

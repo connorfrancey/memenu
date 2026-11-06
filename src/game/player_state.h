@@ -1,4 +1,5 @@
 #pragma once
+#include <nlohmann/json_fwd.hpp>
 
 // Save states for the local player, like mmultiplayer's trainer: a snapshot of every plain value (bool, byte, int,
 // float, vector, rotator) of the pawn, its controller and each of the pawn's moves, put back on load. Object pointers,
@@ -24,6 +25,11 @@ namespace player_state
 	bool HasSave();
 	void Clear();
 	unsigned LoadCount();	// Bumped by every successful Load (the checkpoint timer restarts on it)
+
+	// The saved state as data, to keep or write to a file (null if nothing is saved), and back. Import replaces the
+	// saved state; Load still checks it fits this level and this player (classes and value layout) before using it.
+	nlohmann::json Export();
+	bool Import(const nlohmann::json& state);
 	
 	// Puts the player back into plain walking: clears a death fall, a slide, a stuck animation and blocked input. What the
 	// trainer does before God/Fly take over from a "falling uncontrolled" state.

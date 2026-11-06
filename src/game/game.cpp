@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 #include <ME_SDK.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -32,12 +33,13 @@ namespace {
     std::atomic<unsigned long long> g_ticks{0};
     std::atomic<bool> g_hasPawn{false};
     std::atomic<int> g_health{0}, g_maxHealth{0};
+    std::atomic<void*> g_playerPawn{nullptr};   // For hooks that run for every pawn: is this the player?
 
     std::mutex g_mutex;                         // Guards the two vectors below
     std::vector<game::TickCallback> g_tickCallbacks;
     std::vector<std::function<void()>> g_queue;
     std::vector<game::LevelLoadCallback> g_levelLoadCallbacks;
-    std::vector<game::StateChangeCallback> g_stateChangeCallbacks;   // Not called yet: no hook for it
+    std::vector<game::StateChangeCallback> g_stateChangeCallbacks;   // Run by the state handler hook
 
     // The local player's world and controller, game thread only. Kept between ticks while their slots in the object
     // list still hold them (checked once per tick, without touching the objects: see ValidateCache), dropped when a
@@ -76,15 +78,16 @@ namespace {
 
     // ---- Pattern scan over the main executable's image --------------------------------------------------------------
     // Pattern/mask as used by mmultiplayer: 'x' = byte must match, '?' = wildcard.
-    void* FindPattern(const char* pattern, const char* mask)
+    // Within [from, to) of the image (offsets from its base), clamped to the image.
+    void* FindPatternRange(std::size_t from, std::size_t to, const char* pattern, const char* mask)
     {
         const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
         const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
         const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-        const std::size_t imageSize = nt->OptionalHeader.SizeOfImage;
+        const std::size_t imageSize = std::min<std::size_t>(nt->OptionalHeader.SizeOfImage, to);
         const std::size_t len = std::strlen(mask);
 
-        for (std::size_t off = 0; off + len <= imageSize;) {
+        for (std::size_t off = from; off + len <= imageSize;) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(base + off, &mbi, sizeof mbi)) break;
 
@@ -93,7 +96,8 @@ namespace {
             const bool readable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
 
             if (readable) {
-                for (std::size_t i = off; i + len <= regionEnd; ++i) {
+                const std::size_t end = std::min(regionEnd, imageSize);
+                for (std::size_t i = off; i + len <= end; ++i) {
                     bool match = true;
                     for (std::size_t j = 0; j < len && match; ++j)
                         match = mask[j] != 'x' || base[i + j] == static_cast<std::uint8_t>(pattern[j]);
@@ -105,32 +109,66 @@ namespace {
         return nullptr;
     }
 
+    void* FindPattern(const char* pattern, const char* mask)
+    {
+        return FindPatternRange(0, ~std::size_t{0}, pattern, mask);
+    }
+
     // ---- Script events (UObject::ProcessEvent) ----------------------------------------------------------------------
     // ProcessEvent runs thousands of times a frame, so the hook only compares the called function against a few cached
     // pointers. The watch list only grows: an entry is written in full before the count that covers it is published.
-    constexpr int kMaxWatches = 8;
+    constexpr int kMaxWatches = 64;
+    enum class WatchKind { Before, After, Block };
     struct Watch
     {
         std::string name;
+        WatchKind kind = WatchKind::Before;
         game::ScriptEventCallback callback = nullptr;
+        game::ScriptEventFilter filter = nullptr;
     };
     Watch g_watches[kMaxWatches];
     std::atomic<Classes::UFunction*> g_watchFn[kMaxWatches];
     std::atomic<int> g_watchCount{0};
     std::atomic<bool> g_watchLookup{false};     // Some function is still to be looked up (game thread, next tick)
+    std::atomic<unsigned long long> g_scriptEvents{0};
     bool g_processEventHooked = false;          // Under g_mutex
     int (__thiscall *oProcessEvent)(Classes::UObject*, Classes::UFunction*, void*, void*) = nullptr;
+
+    // A watch's callback, kept from throwing into the engine. Returns the filter's answer (false for the others).
+    bool RunWatch(const Watch& w, Classes::UObject* self, void* params)
+    {
+        try {
+            if (w.kind == WatchKind::Block) return w.filter(self, params);
+            w.callback(self, params);
+        } catch (const std::exception& e) {
+            spdlog::error("Script event {}: {}", w.name, e.what());
+        } catch (...) {
+            spdlog::error("Script event {}: unknown exception", w.name);
+        }
+        return false;
+    }
 
     int __fastcall ProcessEventHook(Classes::UObject* self, void* /*edx*/, Classes::UFunction* fn, void* params, void* result)
     {
         const int n = g_watchCount.load(std::memory_order_acquire);
+        bool watched = false, skip = false, hasAfter = false;
         for (int i = 0; i < n; ++i) {
-            if (fn != g_watchFn[i].load(std::memory_order_relaxed) || !fn) continue;
-            try { g_watches[i].callback(self, params); }
-            catch (const std::exception& e) { spdlog::error("Script event {}: {}", g_watches[i].name, e.what()); }
-            catch (...) { spdlog::error("Script event {}: unknown exception", g_watches[i].name); }
+            if (!fn || fn != g_watchFn[i].load(std::memory_order_relaxed)) continue;
+            watched = true;
+            const Watch& w = g_watches[i];
+            if (w.kind == WatchKind::After) { hasAfter = true; continue; }
+            if (RunWatch(w, self, params)) skip = true;
         }
-        return oProcessEvent(self, fn, params, result);
+        if (!watched) return oProcessEvent(self, fn, params, result);
+        g_scriptEvents.fetch_add(1, std::memory_order_relaxed);
+        if (skip) return 0;     // A filter took the call: the engine never sees it
+
+        const int ret = oProcessEvent(self, fn, params, result);
+        if (hasAfter)
+            for (int i = 0; i < n; ++i)
+                if (fn == g_watchFn[i].load(std::memory_order_relaxed) && g_watches[i].kind == WatchKind::After)
+                    RunWatch(g_watches[i], self, params);
+        return ret;
     }
 
     // Game thread. A full object walk per function (SDK FindObject compares full names): only done when something new
@@ -141,7 +179,12 @@ namespace {
         const int n = g_watchCount.load(std::memory_order_acquire);
         for (int i = 0; i < n; ++i) {
             if (g_watchFn[i].load()) continue;
-            auto* fn = Classes::UObject::FindObject<Classes::UFunction>(g_watches[i].name);
+            // Another watch on the same function already found it: no second object walk
+            Classes::UFunction* fn = nullptr;
+            for (int j = 0; j < n && !fn; ++j)
+                if (j != i && g_watches[j].name == g_watches[i].name) fn = g_watchFn[j].load();
+            if (fn) { g_watchFn[i].store(fn); continue; }
+            fn = Classes::UObject::FindObject<Classes::UFunction>(g_watches[i].name);
             g_watchFn[i].store(fn);
             if (fn) spdlog::info("Script event: watching {}", g_watches[i].name);
             else    spdlog::warn("Script event: {} not found (looked again after the next level load)", g_watches[i].name);
@@ -253,6 +296,7 @@ namespace {
             }
             for (auto cb : callbacks) cb(delta);
 
+            g_playerPawn.store(game::Pawn(), std::memory_order_relaxed);
             if (g_ticks % 15 == 0) UpdateStatus();
         }
         oTick(scales, arg, delta);
@@ -275,6 +319,7 @@ namespace {
     int __fastcall LevelLoadHook(void* self, void* /*edx*/, void** levelInfo, unsigned long long arg)
     {
         g_loading = true;
+        g_playerPawn = nullptr;
         DropCache();
         cache::NextLevel();
 
@@ -290,6 +335,106 @@ namespace {
             if (!g_watchFn[i].load()) g_watchLookup = true;     // Its package may have come with the level
         for (auto cb : callbacks) cb(true);
         return ret;
+    }
+
+    // ---- The player's move state handler (mmultiplayer trainer's "StateHandler") ---------------------------------------
+    // A pawn's per-tick movement state function: (delta, changedState), changedState non-zero on the tick a new state
+    // begins. It runs for every pawn, so the hook only compares the pawn against the player's, kept by the tick hook.
+    std::atomic<bool> g_stateHooked{false}, g_deathHooked{false};
+    std::atomic<unsigned> g_deaths{0};
+    std::vector<game::DeathCallback> g_deathCallbacks;      // Under g_mutex
+    void (__thiscall *oStateHandler)(void*, float, int) = nullptr;
+    int (*oPreDeath)() = nullptr;
+    int (*oPostDeath)() = nullptr;
+
+    void __fastcall StateHandlerHook(void* pawn, void* /*edx*/, float delta, int changedState)
+    {
+        if (changedState && pawn && pawn == g_playerPawn.load(std::memory_order_relaxed)) {
+            std::vector<game::StateChangeCallback> callbacks;
+            {
+                std::lock_guard lock(g_mutex);
+                callbacks = g_stateChangeCallbacks;
+            }
+            bool skip = false;
+            for (auto cb : callbacks) {
+                try { skip |= cb(); }
+                catch (...) { spdlog::error("Player state change callback threw"); }
+            }
+            if (skip) return;
+        }
+        oStateHandler(pawn, delta, changedState);
+    }
+
+    void RunDeathCallbacks(bool after)
+    {
+        std::vector<game::DeathCallback> callbacks;
+        {
+            std::lock_guard lock(g_mutex);
+            callbacks = g_deathCallbacks;
+        }
+        for (auto cb : callbacks) {
+            try { cb(after); }
+            catch (...) { spdlog::error("Death callback threw"); }
+        }
+    }
+
+    int PreDeathHook()
+    {
+        ++g_deaths;
+        spdlog::info("Player died");
+        RunDeathCallbacks(false);
+        return oPreDeath();
+    }
+
+    int PostDeathHook()
+    {
+        const int ret = oPostDeath();
+        RunDeathCallbacks(true);
+        return ret;
+    }
+
+    bool HookAt(void* target, void* detour, void** original, const char* what);
+
+    // Optional hooks: without them the menu works, only the features built on them don't (they say so in the log).
+    void HookExtras()
+    {
+        // mmultiplayer trainer's pattern. `movzx edx, byte [ecx+68h]` in it reads Actor.Physics: ecx is the pawn.
+        if (void* p = FindPattern("\xF3\x0F\x10\x05\x00\x00\x00\x00\x83\xEC\x0C\x0F\x2F\x44\x24\x00\x56"
+                                  "\x0F\x87\x00\x00\x00\x00\x8B\x44\x24\x18\x83\xF8\x07\x0F\x8F\x00\x00"
+                                  "\x00\x00\x0F\xB6\x51\x68\x81\xA1\x00\x00\x00\x00\x00\x00\x00\x00",
+                                  "xxxx????xxxxxxx?xxx????xxxxxxxxx????xxxxxx????????")) {
+            g_stateHooked = HookAt(p, reinterpret_cast<void*>(&StateHandlerHook), reinterpret_cast<void**>(&oStateHandler),
+                                   "the player state handler");
+        } else {
+            spdlog::warn("Player state handler not found: Strang will not work");
+        }
+
+        // mmultiplayer's death hooks: an anchor, then the two small functions within 4 KB after it
+        void* anchor = FindPattern("\x8D\x4C\x24\x10\xE8\x00\x00\x00\x00\x8B\x4C\x24\x14\x85\xC9\x7C"
+                                   "\x1E\x3B\xCF\x0F\x8D\x00\x00\x00\x00\x8B\x04\x8E\x8B\x40\x08\x25"
+                                   "\x00\x00\x00\x00\x33\xD2\x0B\xC2\x75\xD6\xE9\x00\x00\x00\x00",
+                                   "xxxxx????xxxxxxxxxxxx????xxxxxxx????xxxxxxx????");
+        void* pre = anchor ? game::FindPatternIn(anchor, 0x1000,
+                                                 "\xC7\x05\x00\x00\x00\x00\x00\x00\x00\x00\xB8\x00\x00\x00\x00\xC3"
+                                                 "\xB8\x00\x00\x00\x00\xC3",
+                                                 "xx????????x????xx????x")
+                           : nullptr;
+        void* post = pre ? game::FindPatternIn(pre, 0x1000,
+                                               "\x8B\x0D\x00\x00\x00\x00\xC7\x05\x00\x00\x00\x00\x00\x00\x00\x00"
+                                               "\x8B\x01\x8B\x90\x00\x00\x00\x00\xFF\xD2\xB8\x00\x00\x00\x00\xC3"
+                                               "\x8B\xC1\xC7\x00\x00\x00\x00\x00\xC3",
+                                               "??????xx????????xxxx????xxx????xxxxx????x")
+                         : nullptr;
+        if (pre && post) {
+            g_deathHooked = HookAt(pre, reinterpret_cast<void*>(&PreDeathHook), reinterpret_cast<void**>(&oPreDeath),
+                                   "PreDeath") &&
+                            HookAt(post, reinterpret_cast<void*>(&PostDeathHook), reinterpret_cast<void**>(&oPostDeath),
+                                   "PostDeath");
+        } else {
+            spdlog::warn("Death functions not found (anchor {}, pre {}, post {}): no death events", anchor, pre, post);
+        }
+        spdlog::info("Extra hooks: player state handler {}, death {}", g_stateHooked ? "on" : "off",
+                     g_deathHooked ? "on" : "off");
     }
 
     bool HookAt(void* target, void* detour, void** original, const char* what)
@@ -442,7 +587,15 @@ bool game::Init()
     if (!ptr) { spdlog::error("Tick pattern not found"); return false; }
     if (!HookAt(ptr, reinterpret_cast<void*>(&TickHook), reinterpret_cast<void**>(&oTick), "Tick")) return false;
 
+    HookExtras();
     g_ready = true;
+    {
+        // Hooked now, while the menu loads: finding ProcessEvent scans the game's code (~150 ms in a debug build), which
+        // the first module to watch a script event otherwise paid in the middle of play. The TAS and the speedrun timer
+        // watch events from startup anyway.
+        std::lock_guard lock(g_mutex);
+        HookProcessEvent();
+    }
     spdlog::info("Game integration ready");
     return true;
 }
@@ -481,28 +634,73 @@ void game::OnLevelLoad(LevelLoadCallback callback)
 
 void game::OnPlayerStateChange(StateChangeCallback callback)
 {
-    // TODO: hook the player's move state handler (mmultiplayer's trainer has the pattern). Until then nothing calls these.
-    static bool warned = false;
-    if (!warned) {
-        warned = true;
-        spdlog::warn("Player state change hook is not implemented: tools that rely on it (Strang) do nothing");
-    }
-    std::lock_guard lock(g_mutex);
+    std::lock_guard lock(g_mutex);      // Kept even before Init: the hook is installed there (HookExtras)
     g_stateChangeCallbacks.push_back(callback);
 }
 
-bool game::OnScriptEvent(const char* fullName, ScriptEventCallback callback)
+bool game::PlayerStateHooked() { return g_stateHooked; }
+
+void game::OnPlayerDeath(DeathCallback callback)
 {
-    if (!g_ready || !fullName || !callback) return false;
     std::lock_guard lock(g_mutex);
-    if (!HookProcessEvent()) return false;
-    const int n = g_watchCount.load();
-    if (n >= kMaxWatches) { spdlog::error("Script event {}: too many watched already", fullName); return false; }
-    g_watches[n] = {fullName, callback};
-    g_watchFn[n].store(nullptr);
-    g_watchCount.store(n + 1, std::memory_order_release);
-    g_watchLookup = true;
+    g_deathCallbacks.push_back(callback);
+}
+
+bool game::DeathHooked() { return g_deathHooked; }
+
+bool game::ConsoleCommand(const std::string& command)
+{
+    auto* pc = Controller();
+    if (!pc || command.empty()) return false;
+    const std::wstring wide(command.begin(), command.end());    // Console commands are ASCII
+    // The FString only borrows the buffer; the engine copies what it keeps. The returned string is the engine's (and
+    // usually empty): left alone, freeing it would need the engine's allocator.
+    pc->ConsoleCommand(Classes::FString(wide.c_str()), false);
+    spdlog::info("Console: {}", command);
     return true;
+}
+
+void* game::FindPatternIn(const void* start, std::size_t size, const char* pattern, const char* mask)
+{
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const auto from = reinterpret_cast<std::uintptr_t>(start);
+    if (from < base) return nullptr;
+    return FindPatternRange(from - base, from - base + size, pattern, mask);
+}
+
+namespace {
+    bool AddWatch(const char* fullName, Watch w)
+    {
+        if (!g_ready || !fullName) return false;
+        std::lock_guard lock(g_mutex);
+        if (!HookProcessEvent()) return false;
+        const int n = g_watchCount.load();
+        if (n >= kMaxWatches) { spdlog::error("Script event {}: too many watched already", fullName); return false; }
+        w.name = fullName;
+        g_watches[n] = std::move(w);
+        g_watchFn[n].store(nullptr);
+        g_watchCount.store(n + 1, std::memory_order_release);   // Published last: the hook only reads complete entries
+        g_watchLookup = true;
+        return true;
+    }
+}
+
+bool game::OnScriptEvent(const char* fullName, ScriptEventCallback callback, bool after)
+{
+    if (!callback) return false;
+    Watch w;
+    w.kind = after ? WatchKind::After : WatchKind::Before;
+    w.callback = callback;
+    return AddWatch(fullName, std::move(w));
+}
+
+bool game::BlockScriptEvent(const char* fullName, ScriptEventFilter filter)
+{
+    if (!filter) return false;
+    Watch w;
+    w.kind = WatchKind::Block;
+    w.filter = filter;
+    return AddWatch(fullName, std::move(w));
 }
 
 bool game::ScriptEventsReady()
@@ -559,6 +757,8 @@ game::Status game::GetStatus()
     s.maxHealth = g_maxHealth;
     s.ticks = g_ticks;
     s.objectScans = g_scans;
+    s.deaths = g_deaths;
+    s.scriptEvents = g_scriptEvents;
     return s;
 }
 

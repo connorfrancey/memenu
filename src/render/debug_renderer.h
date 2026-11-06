@@ -31,6 +31,7 @@ namespace debugrender {
         float fovOffset = 0.f;          // Degrees added to the camera FOV
         float aspect = 0.f;             // 0 = from the viewport
         float nearPlane = 10.f;         // Used when the engine's near plane is unknown
+        float staticOpacity = 0.25f;    // Faces of the static geometry layer (SetStatic)
     };
 
     struct Scene {
@@ -47,6 +48,7 @@ namespace debugrender {
         bool viewFromDevice = false;    // The engine's own matrix (shader constants or device transform)
         float nearUsed = 0.f;
         std::size_t triangles = 0, lines = 0, shapes = 0, labels = 0;
+        std::size_t staticTriangles = 0, staticLines = 0;
         double buildMs = 0.0;
         bool sceneHookSeen = false;
         bool overlayFallback = false;
@@ -60,7 +62,11 @@ namespace debugrender {
     void SetScene(std::shared_ptr<const Scene> scene);  // nullptr clears
     // Small geometry that moves (pawn cylinders), replaced every tick and drawn with the scene. Empty clears.
     void SetDynamic(rmesh::MeshData mesh);
+    // World geometry (static meshes), built off the game thread and replaced now and then. Drawn with the scene, its
+    // faces at Style::staticOpacity. nullptr clears.
+    void SetStatic(std::shared_ptr<const rmesh::MeshData> mesh);
     std::shared_ptr<const Scene> CurrentScene();
+    rmath::Camera CurrentCamera();                  // The camera last set with SetCamera
 
     // ---- Render thread ----------------------------------------------------------------------------------------------
     void OnStretchRect(IDirect3DDevice9* dev, IDirect3DSurface9* src, IDirect3DSurface9* dst);  // Before the real call

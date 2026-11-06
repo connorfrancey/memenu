@@ -95,21 +95,31 @@ void Setting::Show(float width)
             if (!tip.empty()) tip += '\n';
             tip += std::string(BindLabel(slot)) + ": " + keys::Name(k);
         }
-        if (Bindable()) {
+        if (Bindable() || Resettable()) {
             if (!tip.empty()) tip += '\n';
-            tip += "Right click: set keys";
+            tip += Bindable() && Resettable() ? "Right click: keys, reset" : Bindable() ? "Right click: set keys"
+                                                                                     : "Right click: reset";
         }
         if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
     }
 
-    if (Bindable()) {
+    if (Bindable() || Resettable()) {
         PopupStyle style;
         if (ImGui::BeginPopupContextItem("##keys", ImGuiPopupFlags_MouseButtonRight)) {
             ImGui::TextDisabled("%s", name_.c_str());
             for (int slot = 0; slot < 2; ++slot)
                 if (const char* label = BindLabel(slot))
                     keybinds::Button(std::string(label) + " key", slot == 0 ? key : keyAlt, 200.f);
-            ImGui::TextDisabled("Right click a key to clear it");
+            if (Bindable()) ImGui::TextDisabled("Right click a key to clear it");
+            if (Resettable()) {
+                ImGui::BeginDisabled(IsDefault());
+                if (ImGui::Button("Reset to default", {200.f, 0.f})) {
+                    ResetToDefault();
+                    owner_->MarkDirty();
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndDisabled();
+            }
             ImGui::EndPopup();
         }
     }

@@ -55,6 +55,10 @@ namespace ctl {
 
 		// Controls with a value are saved in the config
 		virtual bool Persistent() const { return false; }
+		// ... and can go back to the value they were made with (right click: Reset to default)
+		virtual bool Resettable() const { return false; }
+		virtual bool IsDefault() const { return true; }
+		virtual void ResetToDefault() {}
 		virtual void Save(nlohmann::ordered_json &out) const { (void)out; }
 		virtual void Load(const nlohmann::ordered_json &in) { (void)in; }
 
@@ -85,16 +89,20 @@ namespace ctl {
 		void Set(T v) { value_ = Clamp(std::move(v)); }
 
 		bool Persistent() const override { return true; }
+		bool Resettable() const override { return true; }
+		bool IsDefault() const override { return value_ == Clamp(default_); }
+		void ResetToDefault() override { Set(default_); }
 		void Save(nlohmann::ordered_json& out) const override;
 		void Load(const nlohmann::ordered_json& in) override;
 
 	protected:
 		Value(Module* owner, std::string name, T value, std::string tooltip, Binds binds = {})
-			: Setting(owner, std::move(name), std::move(tooltip), binds), value_(std::move(value)) {}
+			: Setting(owner, std::move(name), std::move(tooltip), binds), value_(value), default_(std::move(value)) {}
 
 		virtual T Clamp(T v) const { return v; }    // Not called by this constructor: derived ones clamp their default
 
 		T value_;
+		T default_;     // As made (clamped when compared / reset)
 	};
 
 	// Save/Load live in setting.cpp, for these types only.
@@ -198,7 +206,9 @@ namespace ctl {
 	public:
 		KeyHold(Module* owner, std::string name, int vk = 0, std::string tooltip = {});
 
-		bool Down() const;                    // Currently held?
+		bool Down() const;                    // Currently held? (with the modifiers it was bound with)
+		int& Binding() { return value_; }     // For the bind buttons (core/bindings.h)
+		bool Resettable() const override { return false; }   // Its button clears it with a right click already
 
 	protected:
 		void Draw(float width) override;
@@ -238,6 +248,7 @@ namespace ctl {
 	class Section final : public Value<bool> {
 	public:
 		Section(Module* owner, std::string title, bool open = true);
+		bool Resettable() const override { return false; }   // Open or closed is layout, not a setting
 
 	protected:
 		void Draw(float width) override;

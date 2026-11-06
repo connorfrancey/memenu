@@ -31,6 +31,8 @@ namespace debugrender
         std::uint64_t g_nextVersion = 1;
         std::shared_ptr<const rmesh::MeshData> g_dynamic;
         std::uint64_t g_dynamicVersion = 0;
+        std::shared_ptr<const rmesh::MeshData> g_static;
+        std::uint64_t g_staticVersion = 0;
         std::atomic<bool> g_watchConstants{false};      // = g_active: the shader constant hook looks at nothing otherwise
 
         // ---- Render thread only ------------------------------------------------------------------------------------
@@ -56,6 +58,9 @@ namespace debugrender
         DynBuffer g_lines{nullptr, 0, 0, "line"};
         DynBuffer g_dynTris{nullptr, 0, 0, "moving triangle"};
         DynBuffer g_dynLines{nullptr, 0, 0, "moving line"};
+        DynBuffer g_statTris{nullptr, 0, 0, "static triangle"};
+        DynBuffer g_statLines{nullptr, 0, 0, "static line"};
+        std::uint64_t g_uploadedStatic = ~0ull;
         std::uint64_t g_uploadedVersion = 0;
         std::uint64_t g_uploadedDynamic = ~0ull;
 
@@ -412,7 +417,22 @@ namespace debugrender
                 const rmesh::MeshData& d = dynamic ? *dynamic : kEmpty;
                 if (Upload(dev, g_dynTris, d.tris) && Upload(dev, g_dynLines, d.lines)) g_uploadedDynamic = dynamicVersion;
             }
-            if (g_tris.count == 0 && g_lines.count == 0 && g_dynTris.count == 0 && g_dynLines.count == 0) return false;
+            std::shared_ptr<const rmesh::MeshData> statics;
+            std::uint64_t staticVersion;
+            {
+                std::lock_guard lock(g_mutex);
+                statics = g_static;
+                staticVersion = g_staticVersion;
+            }
+            if (staticVersion != g_uploadedStatic)
+            {
+                static const rmesh::MeshData kEmpty;
+                const rmesh::MeshData& d = statics ? *statics : kEmpty;
+                if (Upload(dev, g_statTris, d.tris) && Upload(dev, g_statLines, d.lines)) g_uploadedStatic = staticVersion;
+            }
+            if (g_tris.count == 0 && g_lines.count == 0 && g_dynTris.count == 0 && g_dynLines.count == 0 &&
+                g_statTris.count == 0 && g_statLines.count == 0)
+                return false;
 
             if (!g_stateBlock)
             {
@@ -473,6 +493,12 @@ namespace debugrender
             dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
             dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
+            // 0. Static geometry faces, at their own (lower) opacity: drawn first, the volumes go over them.
+            const DWORD staticAlpha = static_cast<DWORD>(std::clamp(style.staticOpacity, 0.f, 1.f) * 255.f + 0.5f);
+            dev->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_ARGB(staticAlpha, 255, 255, 255));
+            dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+            if (staticAlpha > 0) DrawRange(dev, g_statTris, D3DPT_TRIANGLELIST, 3, 0, g_statTris.count);
+
             // 1. Faces, at the requested opacity.
             const DWORD faceAlpha = static_cast<DWORD>(std::clamp(style.opacity, 0.f, 1.f) * 255.f + 0.5f);
             dev->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_ARGB(faceAlpha, 255, 255, 255));
@@ -484,6 +510,7 @@ namespace debugrender
             dev->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_ARGB(255, 255, 255, 255));
             dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);     // Only faded ones are translucent
             dev->SetRenderState(D3DRS_DEPTHBIAS, FloatBits(setup.inverted ? 1.5e-5f : -1.5e-5f));
+            DrawRange(dev, g_statLines, D3DPT_LINELIST, 2, 0, g_statLines.count);
             DrawRange(dev, g_lines, D3DPT_LINELIST, 2, 0, g_lines.count);
             DrawRange(dev, g_dynLines, D3DPT_LINELIST, 2, 0, g_dynLines.count);
 
@@ -519,6 +546,8 @@ namespace debugrender
             g_stats.nearUsed = nearUsed;
             g_stats.triangles = g_tris.count / 3;
             g_stats.lines = g_lines.count / 2;
+            g_stats.staticTriangles = g_statTris.count / 3;
+            g_stats.staticLines = g_statLines.count / 2;
             g_stats.shapes = scene.shapes;
             g_stats.labels = scene.labels.size();
             g_stats.buildMs = scene.buildMs;
@@ -607,6 +636,21 @@ namespace debugrender
         if (!shared && !g_dynamic) return;      // Still empty: nothing to upload
         g_dynamic = std::move(shared);
         ++g_dynamicVersion;
+    }
+
+    void SetStatic(std::shared_ptr<const rmesh::MeshData> mesh)
+    {
+        if (mesh && mesh->tris.empty() && mesh->lines.empty()) mesh.reset();
+        std::lock_guard lock(g_mutex);
+        if (!mesh && !g_static) return;         // Still empty: nothing to upload
+        g_static = std::move(mesh);
+        ++g_staticVersion;
+    }
+
+    rmath::Camera CurrentCamera()
+    {
+        std::lock_guard lock(g_mutex);
+        return g_camera;
     }
 
     std::shared_ptr<const Scene> CurrentScene()
@@ -846,8 +890,11 @@ namespace debugrender
         ReleaseBuffer(g_lines);
         ReleaseBuffer(g_dynTris);
         ReleaseBuffer(g_dynLines);
+        ReleaseBuffer(g_statTris);
+        ReleaseBuffer(g_statLines);
         g_uploadedVersion = 0;
         g_uploadedDynamic = ~0ull;
+        g_uploadedStatic = ~0ull;
         g_frameVPValid = false;
         Release(g_stateBlock);
         g_loggedFailure = false;
@@ -867,5 +914,6 @@ namespace debugrender
         g_watchConstants = false;
         g_scene.reset();
         g_dynamic.reset();
+        g_static.reset();
     }
 }

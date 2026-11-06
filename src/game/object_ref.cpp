@@ -33,17 +33,8 @@ namespace game
 		// Walk the engine's name table once (outside the lock: it can take a while).
 		g_nameStats.misses.fetch_add(1, std::memory_order_relaxed);
 		const clk::Ticks t0 = clk::Now();
-		int found = -1;
-		auto& names = Classes::FName::GetGlobalNames();
-		for (std::size_t i = 0; i < names.Num(); ++i)
-		{
-			const Classes::FNameEntry* entry = names[i];
-			if (entry && entry->GetName() == name)
-			{
-				found = static_cast<int>(i);
-				break;
-			}
-		}
+		// Compared in place (no string built per entry: that made a miss cost ~15 ms)
+		const int found = Classes::UObject::FindNameIndex(name);
 		g_nameStats.computeTicks.fetch_add(clk::Now() - t0, std::memory_order_relaxed);
 
 		// Only remember hits: a name may be added to the table later (when its package loads).

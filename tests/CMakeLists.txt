@@ -8,20 +8,26 @@ add_executable(memenu_tests
         test_timeline.cpp
         test_speedrun.cpp
         test_geometry.cpp
+        test_static_scene.cpp
         test_history.cpp
+        test_splits.cpp
         test_input_layout.cpp
         test_settings.cpp
+        test_keys.cpp
         ${CMAKE_SOURCE_DIR}/src/render/mesh.cpp
+        ${CMAKE_SOURCE_DIR}/src/render/static_scene.cpp
         ${CMAKE_SOURCE_DIR}/src/tas/replay.cpp
         ${CMAKE_SOURCE_DIR}/src/tas/timeline.cpp
         ${CMAKE_SOURCE_DIR}/src/speedrun/timer.cpp
         ${CMAKE_SOURCE_DIR}/src/tas/history.cpp
+        ${CMAKE_SOURCE_DIR}/src/tas/splits.cpp
         ${CMAKE_SOURCE_DIR}/src/features/visual/input_layout.cpp
         # The settings framework and what it needs (test_settings.cpp): no game, no window
         ${CMAKE_SOURCE_DIR}/src/core/setting.cpp
         ${CMAKE_SOURCE_DIR}/src/core/module.cpp
         ${CMAKE_SOURCE_DIR}/src/core/notify.cpp
         ${CMAKE_SOURCE_DIR}/src/core/keybinds.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/bindings.cpp
         ${CMAKE_SOURCE_DIR}/src/core/keys.cpp
         ${CMAKE_SOURCE_DIR}/src/core/scheduler.cpp
         ${CMAKE_SOURCE_DIR}/src/core/clock.cpp

@@ -15,9 +15,17 @@
 // the engine's object list does not have to be walked for them. Static meshes are not collected at all.
 namespace debugworld {
     // The order is stored in the cache files: new categories go at the end.
+    // Volume is what is left of the "other volumes" once these are taken out: PostProcess (post process, color, light
+    // and reflection volumes), Audio (reverb), Fog, Streaming (level streaming, cull distance, portals).
     enum class Category { Trigger, Kill, Checkpoint, Blocking, Movement, Volume, Cylinder, Spawn, Pickup, AI, Navigation,
-                          Count };
+                          PostProcess, Audio, Fog, Streaming, Count };
     constexpr int kCategoryCount = static_cast<int>(Category::Count);
+    // The "other volumes" group: Volume and its sub-categories.
+    constexpr bool IsOtherVolume(int category)
+    {
+        return category == static_cast<int>(Category::Volume) ||
+               (category >= static_cast<int>(Category::PostProcess) && category <= static_cast<int>(Category::Streaming));
+    }
 
     enum class DrawStyle { Solid, SolidOutline, Wireframe };
 
@@ -26,6 +34,7 @@ namespace debugworld {
         float maxDistance = 6000.f;                 // World units from the camera
         float updateHz = 3.f;                       // How often the scene is rebuilt from the remembered shapes
         bool labels = false;                        // Class names of triggers/volumes
+        float labelDistance = 3000.f;               // Labels only for volumes this close (the nearest first)
         bool textures = true;                       // Tiled icon on the face (skull for kill zones, flag for checkpoints, ...)
         float tileSize = 160.f;                     // World units covered by one icon
         bool useCache = true;                       // Read and write the per-level cache on disk
@@ -49,7 +58,7 @@ namespace debugworld {
         std::size_t scans = 0;
         bool baking = false;                        // A bake is running
         std::string bakeStatus;                     // The checkpoint being baked, or the result of the last bake
-        std::size_t bakeDone = 0, bakeTotal = 0;    // Checkpoints (level starts included)
+        std::size_t bakeDone = 0, bakeTotal = 0;    // Checkpoints (a level without any: its start)
         std::size_t bakeFailed = 0;                 // Ones that never finished loading (skipped)
 
         // Volumes (components) per category: drawn now, and remembered for this level (cylinders: found live)
@@ -89,7 +98,7 @@ namespace debugworld {
     void RescanNow();                               // Walk the object list for volumes on the next Update
     void ClearCache();                              // Forget the remembered volumes of this level, delete its file, rescan
 
-    // Loads every level start and checkpoint in story order, waits for each to load and for its volumes to stop turning
+    // Loads every checkpoint (A is the level start) in story order, waits for each to load and for its volumes to stop turning
     // up, and writes them to the cache. A level whose checkpoints all worked gets cache/<map>.baked; `onlyMissing`
     // skips those. Afterwards (or when cancelled) the player is taken back to the level they were in. Needs the
     // collision view to be on (it drives the scan).

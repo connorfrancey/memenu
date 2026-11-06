@@ -43,7 +43,7 @@ namespace debugworld
         constexpr int kNoCategory = -1;      // Not something this view shows (static meshes, world geometry, ...)
         const char* const kCategoryNames[kCategoryCount] = {
             "triggers", "kill zones", "checkpoints", "blocking", "movement", "volumes", "cylinders",
-            "spawns", "pickups", "AI", "navigation"
+            "spawns", "pickups", "AI", "navigation", "post process", "audio", "fog", "streaming"
         };
 
         // A volume, remembered in world space: everything needed to draw it without touching the game again.
@@ -109,8 +109,11 @@ namespace debugworld
 
         constexpr std::uint32_t kCacheMagic = 0x4356454Du; // "MEVC"
         // 2: AI-only volumes have their own category (were blocking/movement); spawns, pickups, navigation points and
-        // box/sphere components are remembered. Older files are ignored and the level is read again.
-        constexpr std::uint32_t kCacheVersion = 2;
+        // box/sphere components are remembered.
+        // 3: the other volumes are split into post process, audio, fog, streaming and the rest. Version 2 files are still
+        // read: their other volumes are sorted by actor name (OtherVolumeKind). Older ones are ignored, the level read again.
+        constexpr std::uint32_t kCacheVersion = 3;
+        constexpr std::uint32_t kOldestCacheVersion = 2;
         constexpr double kSlowMs = 50.0;
 
         bool Has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
@@ -133,6 +136,22 @@ namespace debugworld
             return false;
         }
 
+        // Which of the other volumes (or navigation, for path nodes named like volumes), from a class name ("TdReverbVolume") or an actor's ("PostProcessVolume_3": level
+        // actors are named after their class).
+        int OtherVolumeKind(const std::string& name)
+        {
+            // Path nodes of the AI's network that have "Volume" in their name (TdConfinedVolumePathNode, VolumePathNode)
+            if (Has(name, "PathNode")) return static_cast<int>(Category::Navigation);
+            if (Has(name, "Fog")) return static_cast<int>(Category::Fog);
+            if (Has(name, "Reverb") || Has(name, "AudioVolume") || Has(name, "AmbientSound")) return static_cast<int>(Category::Audio);
+            if (Has(name, "PostProcess") || Has(name, "ColorScale") || Has(name, "LightVolume") || Has(name, "Reflection") ||
+                Has(name, "Lighting"))
+                return static_cast<int>(Category::PostProcess);
+            if (Has(name, "LevelStreaming") || Has(name, "CullDistance") || Has(name, "Portal") || Has(name, "Visibility"))
+                return static_cast<int>(Category::Streaming);
+            return static_cast<int>(Category::Volume);
+        }
+
         int Classify(const std::string& name)
         {
             if (Has(name, "KillVolume") || Has(name, "KillZone")) return static_cast<int>(Category::Kill);
@@ -147,7 +166,7 @@ namespace debugworld
                     "BarbedWire", "FallHeight", "PhysicsVolume", "WaterVolume", "GravityVolume"
                 };
                 for (const char* m : movement) if (Has(name, m)) return static_cast<int>(Category::Movement);
-                return static_cast<int>(Category::Volume);
+                return OtherVolumeKind(name);
             }
             return kNoCategory;
         }
@@ -492,7 +511,8 @@ namespace debugworld
             if (!f) return false;
 
             std::uint32_t magic = 0, version = 0, count = 0;
-            if (!Get(f, magic) || !Get(f, version) || !Get(f, count) || magic != kCacheMagic || version != kCacheVersion ||
+            if (!Get(f, magic) || !Get(f, version) || !Get(f, count) || magic != kCacheMagic || version > kCacheVersion ||
+                version < kOldestCacheVersion ||
                 count > 2000000)
             {
                 spdlog::warn("Debug world: ignoring the cache file {} (unknown format)", path.string());
@@ -533,9 +553,22 @@ namespace debugworld
                 keys.insert(std::move(k));
             }
 
+            if (version < 3)
+            {
+                // Before the other volumes had sub-categories: sort them by their actor's name (names are on the first
+                // shape of a component; the rest of its shapes follow it)
+                std::string current;
+                for (Shape& s : shapes)
+                {
+                    if (!s.name.empty()) current = s.name;
+                    if (s.category == static_cast<std::uint8_t>(Category::Volume))
+                        s.category = static_cast<std::uint8_t>(OtherVolumeKind(current));
+                }
+            }
             g_shapes = std::move(shapes);
             g_keys = std::move(keys);
-            spdlog::info("Debug world: loaded {} volumes of '{}' from the cache ({})", g_shapes.size(), map, path.string());
+            spdlog::info("Debug world: loaded {} volumes of '{}' from the cache ({}, version {})", g_shapes.size(), map,
+                         path.string(), version);
             return true;
         }
 
@@ -553,21 +586,46 @@ namespace debugworld
         // ---- Scanning --------------------------------------------------------------------------------------------------
         // Component-first: walk every object once and pick out the components we know how to draw, then use their Owner
         // for classification. Volumes already remembered are skipped by key. Static meshes are not looked at.
-        void ScanStatic()
+        // A scan is spread over ticks, about kScanSliceMs of work each: walking ~100k objects at once was a 30-40 ms
+        // hitch every time something streamed in.
+        constexpr double kScanSliceMs = 1.0;
+        constexpr std::size_t kNotScanning = ~std::size_t{0};
+        struct Scan
         {
+            std::size_t at = kNotScanning;      // Next object
+            std::size_t components = 0, added = 0, addedShapes = 0;
+            double ms = 0.0;                    // Work so far (not the wall time across ticks)
+        };
+        Scan g_scan;
+
+        void StartScan()
+        {
+            if (g_scan.at != kNotScanning) return;      // One is going: it will see what is new too
+            g_scan = Scan{};
+            g_scan.at = 0;
+        }
+
+        bool Scanning() { return g_scan.at != kNotScanning; }
+
+        void ScanSlice()
+        {
+            if (!Scanning()) return;
             const auto started = Clock::now();
             const auto& objects = Classes::UObject::GetGlobalObjects();
-            std::size_t components = 0, added = 0, addedShapes = 0;
             std::vector<Shape> found;
 
-            for (std::size_t i = 0; i < objects.Num(); ++i)
+            std::size_t i = g_scan.at;
+            for (; i < objects.Num(); ++i)
             {
+                if ((i & 255) == 0 && i != g_scan.at &&
+                    std::chrono::duration<double, std::milli>(Clock::now() - started).count() > kScanSliceMs)
+                    break;
                 Classes::UObject* o = objects.GetByIndex(i);
                 if (!o || !o->Class) continue;
 
                 const ClassInfo& compInfo = ClassOf(o);
                 if (compInfo.kind == Kind::None) continue;
-                ++components;
+                ++g_scan.components;
 
                 auto* pc = static_cast<Classes::UPrimitiveComponent*>(o);
                 Classes::AActor* owner = pc->Owner;
@@ -584,23 +642,23 @@ namespace debugworld
                 const std::size_t n = Extract(pc, compInfo.kind, ownerInfo.category, ownerName, ToVec3(owner->Location), found);
                 g_keys.insert(std::move(key)); // Also when nothing came out: it would not next time either
                 if (n == 0) continue;
-                ++added;
-                addedShapes += n;
+                ++g_scan.added;
+                g_scan.addedShapes += n;
                 for (Shape& s : found) g_shapes.push_back(std::move(s));
-            }
-
-            ++g_scanCount;
-            g_lastScanMs = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
-            if (addedShapes > 0)
-            {
-                g_cacheDirty = true;
+                g_cacheDirty = true;                // Shown as they come (a big level takes a few ticks)
                 g_dirtySince = Clock::now();
                 g_dirty = true;
             }
-            spdlog::debug("Debug world: scan #{} of '{}': {} components, {} new ({} shapes), {} remembered, {:.2f} ms",
-                          g_scanCount, g_map, components, added, addedShapes, g_shapes.size(), g_lastScanMs);
-            if (g_lastScanMs > kSlowMs)
-                spdlog::warn("Debug world: slow scan took {:.1f} ms ({} objects)", g_lastScanMs, objects.Num());
+            g_scan.ms += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+            g_scan.at = i;
+            if (i < objects.Num()) return;
+
+            ++g_scanCount;
+            g_lastScanMs = g_scan.ms;
+            spdlog::debug("Debug world: scan #{} of '{}': {} components, {} new ({} shapes), {} remembered, {:.2f} ms of work",
+                          g_scanCount, g_map, g_scan.components, g_scan.added, g_scan.addedShapes, g_shapes.size(),
+                          g_lastScanMs);
+            g_scan.at = kNotScanning;
         }
 
         // ---- Baking all levels -----------------------------------------------------------------------------------------
@@ -682,7 +740,9 @@ namespace debugworld
                 std::ifstream in(it->path());
                 std::string text;
                 std::getline(in, text);
-                if (text == kBakedMarker) out.insert(Lower(it->path().stem().string()));
+                // A bake of an older cache version still counts when that version is still read
+                if (text == kBakedMarker || text == "baked " + std::to_string(kOldestCacheVersion))
+                    out.insert(Lower(it->path().stem().string()));
             }
             return out;
         }
@@ -1058,6 +1118,7 @@ namespace debugworld
             g_cacheDirty = false;
             g_fromDisk = cfg.useCache && LoadCache(map);
             g_lastObjectCount = 0;
+            g_scan.at = kNotScanning;           // A scan of the old level stops here
             g_forceScan = !g_fromDisk || cfg.scanCached;
             g_dirty = true;
             debugrender::SetScene(nullptr);
@@ -1074,8 +1135,9 @@ namespace debugworld
             g_forceScan = false;
             g_lastObjectCount = objectCount;
             g_lastScan = now;
-            ScanStatic();
+            StartScan();
         }
+        ScanSlice();
 
         // Write the cache once nothing new has turned up for a few seconds.
         if (g_cacheDirty && cfg.useCache && std::chrono::duration<double>(now - g_dirtySince).count() > 4.0)
@@ -1099,7 +1161,7 @@ namespace debugworld
         auto scene = std::make_shared<debugrender::Scene>();
         rmesh::Builder builder(scene->mesh);
         constexpr std::size_t kMaxVertices = 3000000;   // A hard stop for dense levels
-        constexpr std::size_t kMaxLabels = 150;
+        constexpr std::size_t kMaxLabels = 300;          // The nearest ones: the overlay lays them out without overlaps
 
         const auto styleFor = [&](int category)
         {
@@ -1109,11 +1171,13 @@ namespace debugworld
             style.outline = cfg.style != DrawStyle::Solid;
             return style;
         };
-        const auto addLabel = [&](const Shape& s, std::uint32_t color)
+        struct LabelCandidate { const Shape* shape; std::uint32_t color; float distance; };
+        std::vector<LabelCandidate> labelCandidates;
+        const auto addLabel = [&](const Shape& s, std::uint32_t color, float distance)
         {
-            if (cfg.labels && !s.name.empty() && scene->labels.size() < kMaxLabels &&
+            if (cfg.labels && !s.name.empty() && distance <= cfg.labelDistance &&
                 s.category != static_cast<int>(Category::Cylinder))
-                scene->labels.push_back({s.center, s.name, color});
+                labelCandidates.push_back({&s, color, distance});
         };
 
         std::array<std::size_t, kCategoryCount> perCategory{};
@@ -1143,8 +1207,16 @@ namespace debugworld
                 FadeFrom(scene->mesh.lines, lines, alpha);
             }
             if (!s.name.empty()) ++perCategory[s.category];
-            addLabel(s, cfg.colors[s.category]);
+            addLabel(s, cfg.colors[s.category], distance);
         }
+        // The nearest labels (scan order would leave out the ones right next to you in a busy level)
+        if (labelCandidates.size() > kMaxLabels)
+        {
+            std::nth_element(labelCandidates.begin(), labelCandidates.begin() + kMaxLabels, labelCandidates.end(),
+                             [](const LabelCandidate& a, const LabelCandidate& b) { return a.distance < b.distance; });
+            labelCandidates.resize(kMaxLabels);
+        }
+        for (const LabelCandidate& c : labelCandidates) scene->labels.push_back({c.shape->center, c.shape->name, c.color});
         {
             std::lock_guard lock(g_infoMutex);
             for (int c = 0; c < kCategoryCount; ++c)
@@ -1216,6 +1288,7 @@ namespace debugworld
             g_keys.clear();
             g_cacheDirty = false;
             g_fromDisk = false;
+            g_scan.at = kNotScanning;   // Start over: what it found so far is gone
             g_forceScan = true;
             g_dirty = true;
             PublishInfo();
@@ -1250,8 +1323,9 @@ namespace debugworld
             });
             for (int m : order)
             {
+                // Checkpoint A is the level start: loading the start as well would load the same place twice
                 const auto& cps = maps[m].checkpoints;
-                for (int c = 0; c <= static_cast<int>(cps.size()); ++c)
+                for (int c = cps.empty() ? 0 : 1; c <= static_cast<int>(cps.size()); ++c)
                     g_bake.jobs.push_back({m, c, maps[m].label + " - " + (c == 0 ? std::string("start") : cps[c - 1])});
             }
             if (g_bake.jobs.empty())
@@ -1299,7 +1373,8 @@ namespace debugworld
     {
         static const char* const names[kCategoryCount] = {"trigger", "kill zone", "checkpoint", "blocking volume",
                                                           "movement", "volume", "cylinder", "spawn point", "pickup",
-                                                          "AI only", "navigation point"};
+                                                          "AI only", "navigation point", "post process volume",
+                                                          "audio volume", "fog volume", "streaming volume"};
         return category >= 0 && category < kCategoryCount ? names[category] : "?";
     }
 

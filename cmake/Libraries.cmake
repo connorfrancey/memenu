@@ -172,6 +172,9 @@ option(MEMENU_SDK_DOCS "Add the SDK documentation target (needs Doxygen)" OFF)
 #   mmultiplayer-fast-findobject.patch   UObject::FindObject compares the engine's name index before it builds full
 #                                        names; every SDK function looks itself up on its first call, and building
 #                                        the full name of all ~100k objects for that froze the game up to a second.
+#   mmultiplayer-fast-names.patch        FNameEntry::GetName narrows ASCII with a loop instead of a std::locale per
+#                                        call, and FName(const char*) compares names in place and remembers what it
+#                                        found (it built a string for every cached and every table entry per lookup).
 if(MEMENU_GAME)
 find_package(Git REQUIRED)
 CPMAddPackage(
@@ -181,6 +184,7 @@ CPMAddPackage(
         SOURCE_SUBDIR Client/sdk
         PATCH_COMMAND "${GIT_EXECUTABLE}" apply --unsafe-paths
             "${CMAKE_CURRENT_LIST_DIR}/patches/mmultiplayer-fast-findobject.patch"
+            "${CMAKE_CURRENT_LIST_DIR}/patches/mmultiplayer-fast-names.patch"
         OPTIONS
             "ME_SDK_BUILD_DOCS ${MEMENU_SDK_DOCS}"
 )

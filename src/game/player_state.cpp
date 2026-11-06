@@ -7,11 +7,14 @@
 #include <Windows.h>
 
 #include <ME_SDK.hpp>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +36,12 @@ struct Layout {
     int offset = 0, elementSize = 0, arrayDim = 0;
 };
 Layout g_layout;
+
+std::string Lower(std::string s)
+{
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
 
 std::uint32_t Dword(const void* p, int at)
 {
@@ -115,6 +124,15 @@ bool Calibrate(ATdPlayerPawn* pawn, ATdPlayerController* controller)
     return true;
 }
 
+bool EnsureLayout(ATdPlayerPawn* pawn, ATdPlayerController* controller)
+{
+    if (!g_layout.tried) {
+        g_layout.tried = true;
+        g_layout.ok = Calibrate(pawn, controller);
+    }
+    return g_layout.ok;
+}
+
 // ---- per-class copy plan -------------------------------------------------------------------------------------------
 struct Field {
     std::uint32_t offset;
@@ -175,17 +193,27 @@ const std::vector<Field>& PlanFor(UClass* cls)
 }
 
 // ---- snapshots -----------------------------------------------------------------------------------------------------
+std::uint32_t PlanBytes(const std::vector<Field>& plan)
+{
+    std::uint32_t n = 0;
+    for (const Field& f : plan) n += f.size;
+    return n;
+}
+
+// The values of one object. Kept by class name rather than UClass pointer, so a snapshot read back from a file (a later
+// game session) can be checked against the object it goes on: same class, same number of bytes.
 struct ObjectSnapshot {
-    UClass* cls = nullptr;
+    std::string className;
     std::vector<std::uint8_t> data;
 
     void Take(UObject* object)
     {
         data.clear();
-        cls = object ? object->Class : nullptr;
+        className.clear();
         if (!object) return;
+        className = object->Class->GetName();
         const auto* base = reinterpret_cast<const std::uint8_t*>(object);
-        for (const Field& f : PlanFor(cls)) {
+        for (const Field& f : PlanFor(object->Class)) {
             std::uint32_t bits;
             const std::uint8_t* src = base + f.offset;
             if (f.mask) {
@@ -196,12 +224,18 @@ struct ObjectSnapshot {
         }
     }
 
+    bool Fits(UObject* object) const
+    {
+        return object && !className.empty() && object->Class->GetName() == className &&
+               data.size() == PlanBytes(PlanFor(object->Class));
+    }
+
     void Restore(UObject* object) const
     {
-        if (!object || object->Class != cls) return;
+        if (!Fits(object)) return;
         auto* base = reinterpret_cast<std::uint8_t*>(object);
         const std::uint8_t* src = data.data();
-        for (const Field& f : PlanFor(cls)) {
+        for (const Field& f : PlanFor(object->Class)) {
             if (f.mask) {
                 std::uint32_t bits, cur;
                 std::memcpy(&bits, src, 4);
@@ -217,6 +251,8 @@ struct ObjectSnapshot {
 };
 
 struct Snapshot {
+    std::string map;                        // Lower case; a state only loads in the level it was saved in
+    FVector location{}, velocity{};
     ObjectSnapshot pawn, controller;
     std::vector<ObjectSnapshot> moves;      // same index as pawn->Moves
 
@@ -244,13 +280,12 @@ bool player_state::Save()
     auto* world = game::World();
     if (!pawn || !controller || !world) return false;
 
-    if (!g_layout.tried) {
-        g_layout.tried = true;
-        g_layout.ok = Calibrate(pawn, controller);
-    }
-    if (!g_layout.ok) return false;
+    if (!EnsureLayout(pawn, controller)) return false;
 
     Snapshot& s = g_save;
+    s.map = Lower(game::MapName());
+    s.location = pawn->Location;
+    s.velocity = pawn->Velocity;
     s.pawn.Take(pawn);
     s.controller.Take(controller);
     s.moves.resize(pawn->Moves.Num());
@@ -292,6 +327,16 @@ bool player_state::Load()
     }
 
     const Snapshot& s = g_save;
+    if (!s.map.empty() && s.map != Lower(game::MapName())) {
+        spdlog::info("Save state: not loaded (saved in {}, this is {})", s.map, game::MapName());
+        return false;
+    }
+    // Checked before anything changes: a state read from a file may come from another game version
+    if (!EnsureLayout(pawn, controller) || !s.pawn.Fits(pawn) || !s.controller.Fits(controller)) {
+        spdlog::warn("Save state: not loaded (it does not fit this player: {} / {})", s.pawn.className,
+                     s.controller.className);
+        return false;
+    }
 
     // Back into the walking states first, like the trainer. Without naming them, SetInitialState sends the controller
     // to its default state, which ignores movement and jump input: the player couldn't jump and kept the restored
@@ -349,6 +394,121 @@ bool player_state::Load()
     spdlog::info("Save state: loaded, player at ({:.0f}, {:.0f}, {:.0f})", pawn->Location.X, pawn->Location.Y,
                  pawn->Location.Z);
     return true;
+}
+
+namespace {
+
+std::string ToHex(const std::vector<std::uint8_t>& bytes)
+{
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (std::uint8_t b : bytes) {
+        out += kDigits[b >> 4];
+        out += kDigits[b & 15];
+    }
+    return out;
+}
+
+bool FromHex(const std::string& hex, std::vector<std::uint8_t>& out)
+{
+    auto digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    if (hex.size() % 2) return false;
+    out.resize(hex.size() / 2);
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const int hi = digit(hex[2 * i]), lo = digit(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::uint8_t>(hi << 4 | lo);
+    }
+    return true;
+}
+
+nlohmann::json ToJson(const ObjectSnapshot& o) { return {{"class", o.className}, {"data", ToHex(o.data)}}; }
+
+bool FromJson(const nlohmann::json& j, ObjectSnapshot& o)
+{
+    o.className = j.at("class").get<std::string>();
+    return FromHex(j.at("data").get<std::string>(), o.data);
+}
+
+nlohmann::json Vec(const FVector& v) { return {v.X, v.Y, v.Z}; }
+
+FVector Vec(const nlohmann::json& j)
+{
+    FVector v{};
+    v.X = j.at(0).get<float>();
+    v.Y = j.at(1).get<float>();
+    v.Z = j.at(2).get<float>();
+    return v;
+}
+
+template <class E>
+TEnumAsByte<E> Enum(const nlohmann::json& j)
+{
+    return TEnumAsByte<E>(static_cast<std::uint8_t>(j.get<int>()));
+}
+
+constexpr int kFormat = 1;
+
+} // namespace
+
+nlohmann::json player_state::Export()
+{
+    if (!g_hasSave) return nullptr;
+    const Snapshot& s = g_save;
+    nlohmann::json moves = nlohmann::json::array();
+    for (const ObjectSnapshot& m : s.moves) moves.push_back(ToJson(m));
+    return {
+        {"format", kFormat},
+        {"map", s.map},
+        {"location", Vec(s.location)},
+        {"velocity", Vec(s.velocity)},
+        {"movementState", static_cast<int>(s.movementState.GetValue())},
+        {"soundMode", static_cast<int>(s.soundMode.GetValue())},
+        {"reactionTime", s.reactionTime},
+        {"timeDilation", s.timeDilation},
+        {"collision", {s.collisionHeight, s.collisionRadius}},
+        {"rootMotionMode", static_cast<int>(s.rootMotionMode.GetValue())},
+        {"neck", {s.startTranslateAtDegree, s.quadraticForward, s.quadraticDownward}},
+        {"pawn", ToJson(s.pawn)},
+        {"controller", ToJson(s.controller)},
+        {"moves", std::move(moves)},
+    };
+}
+
+bool player_state::Import(const nlohmann::json& j)
+{
+    try {
+        if (!j.is_object() || j.value("format", 0) != kFormat) return false;
+        Snapshot s;
+        s.map = Lower(j.at("map").get<std::string>());
+        s.location = Vec(j.at("location"));
+        s.velocity = Vec(j.at("velocity"));
+        if (!FromJson(j.at("pawn"), s.pawn) || !FromJson(j.at("controller"), s.controller)) return false;
+        for (const auto& m : j.at("moves"))
+            if (!FromJson(m, s.moves.emplace_back())) return false;
+        s.movementState = Enum<EMovement>(j.at("movementState"));
+        s.soundMode = Enum<ESoundMode>(j.at("soundMode"));
+        s.reactionTime = j.at("reactionTime").get<bool>();
+        s.timeDilation = j.at("timeDilation").get<float>();
+        s.collisionHeight = j.at("collision").at(0).get<float>();
+        s.collisionRadius = j.at("collision").at(1).get<float>();
+        s.rootMotionMode = Enum<ERootMotionMode>(j.at("rootMotionMode"));
+        s.startTranslateAtDegree = j.at("neck").at(0).get<float>();
+        s.quadraticForward = j.at("neck").at(1).get<float>();
+        s.quadraticDownward = j.at("neck").at(2).get<float>();
+        g_save = std::move(s);
+        g_hasSave = true;
+        return true;
+    } catch (const nlohmann::json::exception& e) {
+        spdlog::warn("Save state: can't read a stored state: {}", e.what());
+        return false;
+    }
 }
 
 bool player_state::HasSave() { return g_hasSave; }

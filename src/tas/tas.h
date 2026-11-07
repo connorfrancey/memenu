@@ -69,6 +69,13 @@ struct Options {
     // A bookmark "Split: <level>" on the frame a level is completed, recording and playing (a playback moves it to where
     // the level is completed now). See tas/splits.h.
     bool autoSplits = true;
+    // Memory snapshots (tas/snapshot.h): a keyframe of the game's whole state every `keyframeInterval` frames while a
+    // session runs. Going back (Go to, frame back, rewind, restart) puts the nearest keyframe back and runs the few frames
+    // after it, instead of loading the level and running the whole replay again. A playback that reaches a keyframe
+    // again is compared with it and put back to it exactly: within a session nothing can desync.
+    bool snapshots = true;
+    int keyframeInterval = 6;
+    int snapshotBudgetMB = 2048;      // past it, keyframes far from where the session is are thinned out
     StartKind recordStart = StartKind::Checkpoint;
     std::string recordCommand, recordMap, recordCheckpoint;
 };
@@ -88,6 +95,15 @@ struct Status {
     std::size_t syncChecked = 0;      // frames compared and matching this playback
     bool verified = false;            // the last playback matched the recording on every recorded frame
     std::string message;              // last thing that happened
+    // Memory snapshots (see Options::snapshots)
+    bool snapshots = false;           // keyframes are kept for this session
+    std::string snapshotsOff;         // why not (unavailable, turned off, a level load...)
+    std::size_t keyframes = 0;
+    std::uint64_t snapshotBytes = 0;
+    double captureMs = 0.0, restoreMs = 0.0, snapshotBeginMs = 0.0;
+    std::size_t snapped = 0;          // keyframes reached again that differed and were put back (this session)
+    std::size_t snappedPages = 0;
+    Sync player;                      // the player at the start of `frame` (while paused: as it is now)
 };
 
 // What differs from when the current macro was recorded (the game, its settings, the menu's modules). `fixed`: playback
@@ -103,6 +119,7 @@ std::vector<Issue> Preflight();
 void ResetSync();
 
 bool Init();                          // after game::Init()
+void Shutdown();                      // at unload, after game::Shutdown(): background threads end
 bool Available();
 
 void SetOptions(const Options& options);

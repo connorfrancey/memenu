@@ -73,6 +73,7 @@ namespace debugworld
         std::vector<Shape> g_shapes;                                // The remembered volumes of g_map
         std::unordered_set<std::string> g_keys;                     // "<actor>/<component>" of everything in g_shapes
         std::string g_map;
+        bool g_restored = false;                                    // A TAS snapshot was put back (game thread)
         bool g_fromDisk = false;
         bool g_cacheDirty = false;
         Clock::time_point g_dirtySince{};
@@ -1108,6 +1109,28 @@ namespace debugworld
         // ---- Which level is this? Remember its volumes, or read them from disk -----------------------------------------
         const std::string map = MapKey();
         if (map.empty()) return;
+        static bool watchesRestores = false;
+        if (!watchesRestores)
+        {
+            // A TAS snapshot put back: the components found may be gone. Start over as for a new level (without saving).
+            game::OnStateRestored([] { g_restored = true; });
+            watchesRestores = true;
+        }
+        if (g_restored)
+        {
+            g_restored = false;
+            if (g_cacheDirty && cfg.useCache) SaveCache(g_map);   // what was found is still the level's
+            g_cacheDirty = false;
+            g_shapes.clear(); g_shapeNamesFor = ~std::size_t{0};
+            g_keys.clear();
+            g_fromDisk = cfg.useCache && LoadCache(g_map);
+            g_lastObjectCount = 0;
+            g_scan.at = kNotScanning;
+            g_forceScan = !g_fromDisk || cfg.scanCached;
+            g_dirty = true;
+            debugrender::SetScene(nullptr);
+            ClearCylinders();
+        }
         if (map != g_map)
         {
             if (g_cacheDirty && cfg.useCache) SaveCache(g_map);

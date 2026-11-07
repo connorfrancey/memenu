@@ -158,7 +158,8 @@ memenu_feature(tool_overlay      trainer      STAGE 5  FILES features/trainer/to
 # TAS / replay
 memenu_feature(tas               tas GAME STAGE 12 FILES features/tas/tas_module.cpp features/tas/timeline_view.cpp features/tas/replay_editor.cpp features/tas/macro_library.cpp
                   tas/engine.cpp tas/replay.cpp tas/tas.cpp
-                  tas/timeline.cpp tas/history.cpp tas/input_monitor.cpp tas/splits.cpp)
+                  tas/timeline.cpp tas/history.cpp tas/input_monitor.cpp tas/splits.cpp tas/memory_map.cpp
+                  tas/snapshot.cpp tas/d3d_pins.cpp)
 
 # World
 memenu_feature(game_speed        world GAME STAGE 9 FILES features/world/game_speed.cpp)

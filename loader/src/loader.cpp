@@ -14,12 +14,15 @@
 // The installer finds this string in the file to tell our dinput8.dll from someone else's.
 extern "C" const char MemenuLoaderMarker[] = "memenu-loader:" MEMENU_VERSION;
 
+namespace memenu_tracker { bool Install(); }
+
 namespace
 {
     constexpr DWORD kWindowTimeoutMs = 5 * 60 * 1000;   // Give up waiting for the game window after this long
     constexpr DWORD kSettleMs = 2000;                   // After the window shows up (same as the old launcher)
 
     HMODULE g_self = nullptr;
+    bool g_tracking = false;                            // memenu_tracker::Install() succeeded
     std::wstring g_dir;                                 // Folder of this DLL (the game's Binaries folder)
 
     // ---- Log: <dir>\memenu\loader.log ---------------------------------------------------------------------------
@@ -88,6 +91,7 @@ namespace
 
     DWORD WINAPI LoaderThread(LPVOID)
     {
+        Log(g_tracking ? "tracking the game's memory (TAS snapshots)" : "not tracking the game's memory");
         const std::wstring menu = g_dir + L"\\memenu\\medge_menu.dll";
         if (GetFileAttributesW(menu.c_str()) == INVALID_FILE_ATTRIBUTES) {
             Log("%ls not found: nothing to load (reinstall with memenu_installer.exe)", menu.c_str());
@@ -187,8 +191,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
         // Only the game itself: other programs that happen to load DirectInput from this folder get plain DirectInput.
         // The thread starts running once the loader lock is released, so LoadLibrary there is safe.
-        if (IsGameProcess())
+        if (IsGameProcess()) {
+            // Before the game's own code runs: its memory is tracked from its first allocation (TAS snapshots).
+            // memenu\no-tracker turns that off.
+            if (GetFileAttributesW((g_dir + L"\\memenu\\no-tracker").c_str()) == INVALID_FILE_ATTRIBUTES)
+                g_tracking = memenu_tracker::Install();
             if (HANDLE h = CreateThread(nullptr, 0, LoaderThread, nullptr, 0, nullptr)) CloseHandle(h);
+        }
     }
     return TRUE;
 }

@@ -471,6 +471,12 @@ namespace {
 void UpdateNow(const Config& cfg)
 {
     if (!game::Ready() || game::IsLoading()) return;
+    static bool watchesRestores = false;
+    if (!watchesRestores) {
+        // A TAS snapshot put back: the components and meshes read so far may be gone. Read the level again.
+        game::OnStateRestored([] { g_map.clear(); });
+        watchesRestores = true;
+    }
     const std::string map = Lower(game::MapName());
     if (map.empty()) return;
     if (map != g_map) {

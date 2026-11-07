@@ -7,3 +7,4 @@ EXPORTS
     DllUnregisterServer = Proxy_DllUnregisterServer PRIVATE
     GetdfDIJoystick     = Proxy_GetdfDIJoystick
     MemenuLoaderMarker  DATA
+    MemenuGetTracker    = Proxy_MemenuGetTracker

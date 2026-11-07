@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <intrin.h>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -78,9 +79,12 @@ bool OnGameThreadVirtual()
 // ---- hooks ------------------------------------------------------------------------------------------------------------
 // The engine's frame timing (mtas: "UpdateEngine"). Takes no arguments; ecx/edx are passed through untouched in case it
 // is a member function.
+std::uintptr_t g_callerStack = 0;     // the game thread's stack pointer where the engine called the frame timing
+
 void __fastcall TimeHook(void* ecx, void* edx)
 {
     g_gameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_callerStack = reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
     if (g_frameHandler && g_frameHandler()) return;
     oTime(ecx, edx);
 }
@@ -304,6 +308,8 @@ bool Init()
 }
 
 bool Available() { return g_available; }
+
+std::uintptr_t CallerStack() { return g_callerStack; }
 
 bool IsGameThread() { return GetCurrentThreadId() == g_gameThread.load(std::memory_order_relaxed); }
 

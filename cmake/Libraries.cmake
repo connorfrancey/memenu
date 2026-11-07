@@ -66,8 +66,9 @@ CPMAddPackage(
         OPTIONS "SPDLOG_INSTALL OFF"
 )
 
-# zstd: compresses the previous session's log into logs/.old/ (log.cpp). Only the compressor is built, by hand like
-# MinHook: zstd's own CMake project is large and sets its own runtime-library flags.
+# zstd: compresses the previous session's log into logs/.old/ (log.cpp) and the TAS's memory snapshots
+# (tas/snapshot.cpp). Built by hand like MinHook: zstd's own CMake project is large and sets its own runtime-library
+# flags. The target keeps its old name; it has the decompressor too.
 CPMAddPackage(
         NAME zstd
         GITHUB_REPOSITORY facebook/zstd
@@ -77,7 +78,8 @@ CPMAddPackage(
 if(zstd_ADDED)
     file(GLOB zstd_SOURCES CONFIGURE_DEPENDS
             ${zstd_SOURCE_DIR}/lib/common/*.c
-            ${zstd_SOURCE_DIR}/lib/compress/*.c)
+            ${zstd_SOURCE_DIR}/lib/compress/*.c
+            ${zstd_SOURCE_DIR}/lib/decompress/*.c)
     add_library(zstd_compress STATIC ${zstd_SOURCES})
     target_include_directories(zstd_compress SYSTEM PUBLIC ${zstd_SOURCE_DIR}/lib)
     target_compile_definitions(zstd_compress PRIVATE ZSTD_DISABLE_ASM XXH_NAMESPACE=ZSTD_)

@@ -48,6 +48,7 @@ static void Run(HMODULE module)
     });
     unload::Requested();   // Creates the unload event before anything can go wrong
     const bool selfTest = selftest::Requested();   // `selftest` file next to the DLL: see selftest.h
+    if (selfTest) diag::LogGameCrashesUntil(~0ull);    // Every crash, the game's too, with its stack
     if (selfTest) config::SetAutoSave(false);      // The test changes settings: never into the player's config
 
     STARTUP_STEP(clk::Init());                // Before anything measures time (scheduler, caches)
@@ -104,6 +105,9 @@ static void Run(HMODULE module)
         modules::DisableAll();  // Modules queue their cleanup on the game thread...
 #if MEMENU_GAME
         game::Shutdown();       // ...which we wait for before the hooks go away
+#endif
+#if MEMENU_FEATURE_TAS
+        tas::Shutdown();        // The snapshot workers
 #endif
         hooks::Uninstall();
         if (selfTest) selftest::Finish(true);

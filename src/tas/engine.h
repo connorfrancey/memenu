@@ -20,6 +20,9 @@ bool Init();                    // after game::Init(). False: a pattern is missi
 bool Available();
 
 bool IsGameThread();
+// Where the engine's own frames start on the game thread's stack during this frame's timing call (the address of the
+// hook's return address): everything above it is the engine's main loop, the same every frame.
+std::uintptr_t CallerStack();
 
 // ---- frame timing ---------------------------------------------------------------------------------------------------
 // Called on the game thread at the start of every engine frame, before the engine ticks. Return true when the session

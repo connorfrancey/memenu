@@ -1,6 +1,9 @@
 #include "tas/tas.h"
 #include "tas/engine.h"
 #include "tas/input_monitor.h"
+#include "tas/memory_map.h"
+#include "tas/d3d_pins.h"
+#include "tas/snapshot.h"
 #include "tas/examples.h"
 #include "tas/splits.h"
 #include "tas/timeline.h"
@@ -112,9 +115,24 @@ struct Session {
     // event comes during the engine's tick; the bookmark goes on the next frame, the first one after the level ended)
     std::set<std::string> splitsDone;
     std::vector<std::string> pendingSplits;
+
+    // Memory snapshots (tas/snapshot.h). The game's memory is put back by the snapshot; what the session itself keeps
+    // about a frame (its clock, the keys it pressed, the splits passed) is kept here per keyframe.
+    bool snapshots = false;           // keyframes are taken
+    bool snapshotsRestart = false;    // a level load ended them: start again at the next frame
+    std::string snapshotsOff;
+    struct KeyState {
+        double vtime = 0.0;
+        std::vector<int> held;
+        std::set<std::string> splitsDone;
+    };
+    std::map<std::uint32_t, KeyState> keyStates;
+    std::vector<std::uint64_t> frameHashes;   // what each frame ran with: a keyframe after a changed frame is stale
+    std::size_t snapped = 0, snappedPages = 0;
 };
 Session s;
 Options opt;                          // copy for this frame
+std::atomic<bool> g_displayReset{false};   // the device was reset: Direct3D pins let go of, snapshots start over
 
 void SetMessage(std::string text, bool toast = false)
 {
@@ -641,6 +659,173 @@ bool WaitWhilePaused()
     return waited;
 }
 
+// ---- memory snapshots --------------------------------------------------------------------------------------------------------
+// What frame `f` runs with: its time step, its inputs and the camera key on it. With g_mutex held.
+std::uint64_t FrameHash(const Replay& r, std::size_t f)
+{
+    std::uint64_t h = 0xCBF29CE484222325ull;
+    const auto mix = [&](const void* data, std::size_t n) {
+        const auto* b = static_cast<const std::uint8_t*>(data);
+        for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 0x100000001B3ull;
+    };
+    const Frame& fr = r.frames[f];
+    mix(&fr.dt, sizeof fr.dt);
+    for (std::uint32_t i = 0; i < fr.count; ++i) {
+        const Event& e = r.events[fr.first + i];
+        mix(&e, sizeof e);
+        const std::string& name = r.Name(e.name);
+        mix(name.data(), name.size());
+    }
+    float yaw = 0.f, pitch = 0.f;
+    if (timeline::CameraAt(r, f, yaw, pitch)) {
+        mix(&yaw, sizeof yaw);
+        mix(&pitch, sizeof pitch);
+    }
+    return h;
+}
+
+void SaveKeyState(std::uint32_t frame) { s.keyStates[frame] = {s.vtime, s.held, s.splitsDone}; }
+
+// At a frame boundary: the state now becomes the session's first keyframe.
+void StartSnapshots()
+{
+    s.snapshots = false;
+    s.snapshotsRestart = false;
+    s.keyStates.clear();
+    s.frameHashes.clear();
+    if (!opt.snapshots) {
+        s.snapshotsOff = "turned off";
+        return;
+    }
+    if (!snapshot::Available()) {
+        s.snapshotsOff = snapshot::WhyUnavailable();
+        return;
+    }
+    if (!snapshot::Begin(static_cast<std::uint32_t>(s.frame))) {
+        s.snapshotsOff = snapshot::GetStats().lastError;
+        return;
+    }
+    s.snapshots = true;
+    s.snapshotsOff.clear();
+    SaveKeyState(static_cast<std::uint32_t>(s.frame));
+}
+
+void StopSnapshots(const std::string& why)
+{
+    if (s.snapshots) snapshot::End();
+    s.snapshots = false;
+    s.keyStates.clear();
+    s.frameHashes.clear();
+    if (!why.empty()) s.snapshotsOff = why;
+}
+
+// Keyframes after a frame whose inputs (or time step, or camera) changed since it ran are no longer that timeline's.
+// With g_mutex held.
+void DropStaleKeyframes()
+{
+    if (!s.snapshots) return;
+    const Replay& r = g_replay;
+    std::size_t changed = std::min(s.frameHashes.size(), r.frames.size());
+    for (std::size_t f = 0; f < changed; ++f)
+        if (s.frameHashes[f] != FrameHash(r, f)) {
+            changed = f;
+            break;
+        }
+    if (changed >= s.frameHashes.size()) return;
+    snapshot::DropAfter(static_cast<std::uint32_t>(changed));
+    s.keyStates.erase(s.keyStates.upper_bound(static_cast<std::uint32_t>(changed)), s.keyStates.end());
+    s.frameHashes.resize(changed);
+}
+
+// At the start of frame s.frame, before its input goes in: a new keyframe every Options::keyframeInterval frames, or
+// the check of one this run reached again.
+void SnapshotFrame()
+{
+    if (s.snapshotsRestart || g_displayReset.exchange(false)) {
+        StopSnapshots({});
+        StartSnapshots();
+    }
+    if (!s.snapshots) return;
+    const auto frame = static_cast<std::uint32_t>(s.frame);
+    snapshot::SetFrame(frame);
+    if (snapshot::Has(frame)) {
+        const auto anchor = snapshot::Anchor();
+        if (anchor && *anchor < frame) {
+            // Reached again with the same inputs: it must be the same state. Anything else is put back as it was.
+            if (const std::size_t pages = snapshot::Verify(frame, true)) {
+                ++s.snapped;
+                s.snappedPages += pages;
+                spdlog::warn("TAS: frame {} reached again {} pages different: put back as before", frame, pages);
+            }
+            if (auto it = s.keyStates.find(frame); it != s.keyStates.end()) s.vtime = it->second.vtime;
+        }
+        return;
+    }
+    // Every `interval` frames from the last one (one the game's threads were too busy for is taken a frame later)
+    snapshot::SetBudget(static_cast<std::uint64_t>(std::max(256, opt.snapshotBudgetMB)) << 20);
+    const auto interval = static_cast<std::uint32_t>(std::max(1, opt.keyframeInterval));
+    const auto last = snapshot::Nearest(~0u);
+    if (last && (*last >= frame || frame - *last < interval)) return;
+    if (snapshot::Capture(frame)) {
+        SaveKeyState(frame);
+    } else if (!snapshot::Active()) {
+        s.snapshots = false;
+        s.keyStates.clear();
+        s.snapshotsOff = snapshot::GetStats().lastError;
+        SetMessage("snapshots stopped: " + s.snapshotsOff, true);
+    }
+}
+
+// After frame `f` ran: what it ran with. If that isn't what it ran with when the keyframes after it were taken (a take
+// over, a new recording from here, an edit), they belong to another timeline: dropped before this run reaches one of
+// them (it would be "put back" into the old timeline). With g_mutex held.
+void RecordFrameHash(std::size_t f)
+{
+    if (!s.snapshots || f >= g_replay.frames.size()) return;
+    const std::uint64_t h = FrameHash(g_replay, f);
+    if (f < s.frameHashes.size() && s.frameHashes[f] != h) {
+        snapshot::DropAfter(static_cast<std::uint32_t>(f));
+        s.keyStates.erase(s.keyStates.upper_bound(static_cast<std::uint32_t>(f)), s.keyStates.end());
+        s.frameHashes.resize(f);
+    }
+    if (s.frameHashes.size() <= f) s.frameHashes.resize(f + 1, 0);
+    s.frameHashes[f] = h;
+}
+
+// Puts back the nearest keyframe at or before `frame`. Afterwards s.frame is that keyframe; the caller runs the frames
+// up to `frame` (a seek). False when snapshots can't do it (no session, nothing stored there, or the target is just
+// ahead with no keyframe in between: playing on is quicker).
+bool RestoreForGoto(std::size_t frame)
+{
+    if (!s.snapshots || s.armed || s.mode == Mode::Idle) return false;
+    {
+        std::lock_guard lock(g_mutex);
+        DropStaleKeyframes();
+    }
+    const auto key = snapshot::Nearest(static_cast<std::uint32_t>(frame));
+    if (!key) return false;
+    if (frame >= s.frame && *key <= s.frame) return false;
+    if (!snapshot::Restore(*key)) {
+        StopSnapshots("a restore failed: " + snapshot::GetStats().lastError);
+        SetMessage("couldn't go back with snapshots: " + s.snapshotsOff, true);
+        return false;
+    }
+    if (auto it = s.keyStates.find(*key); it != s.keyStates.end()) {
+        s.vtime = it->second.vtime;
+        s.held = it->second.held;
+        s.splitsDone = it->second.splitsDone;
+    }
+    s.frame = *key;
+    s.pending.clear();
+    s.pendingSplits.clear();
+    s.endReached = false;
+    s.deathSeen = false;
+    if (s.desyncFrame >= static_cast<long long>(*key)) s.desyncFrame = -1;
+    engine::SetFrameTime(s.vtime, NominalDt(g_replay.fixedHz));
+    game::StateRestored();
+    return true;
+}
+
 // ---- session -------------------------------------------------------------------------------------------------------------------
 void Begin(Mode mode)
 {
@@ -661,6 +846,7 @@ void Begin(Mode mode)
     s.desyncInfo.clear();
     s.splitsDone.clear();
     s.pendingSplits.clear();
+    s.snapped = s.snappedPages = 0;
     s.blockStreaming = opt.blockStreaming;
     if (mode == Mode::Playing && opt.matchRecording) {
         std::lock_guard lock(g_mutex);
@@ -694,6 +880,7 @@ void Begin(Mode mode)
         engine::SeedRand(g_replay.seed);
         ResetPlayerInput();
         ApplyMatch();
+        StartSnapshots();
         SetMessage(mode == Mode::Recording ? "recording" : "playing");
         return;
     }
@@ -809,6 +996,7 @@ void StopNow(const char* why)
         if (!copy.frames.empty()) Autosave(copy);
     }
     RestoreInput();
+    StopSnapshots({});
     s.recordEnv = {};
     s.mode = Mode::Idle;
     s.armed = false;
@@ -855,6 +1043,30 @@ void RecordNow(StartKind start, const std::string& command, const std::string& m
 // Playing: play again from the start.
 void RestartNow()
 {
+    // Snapshots: frame 0 is the first keyframe, put back at once
+    if (s.snapshots && !s.armed && snapshot::Has(0)) {
+        if (s.mode == Mode::Recording) {
+            std::lock_guard lock(g_mutex);
+            g_replay.Truncate(0);
+            g_replay.syncValidUntil = 0;
+        }
+        const Mode mode = s.mode;
+        if (RestoreForGoto(0) && s.frame == 0) {
+            s.mode = mode;
+            s.seekTo = kNoSeek;
+            s.recordAfterSeek = false;
+            s.splitsDone.clear();
+            s.desyncFrame = -1;
+            s.syncChecked = 0;
+            s.corrections = 0;
+            s.lastReal = engine::RealSeconds();
+            g_paused = false;
+            g_advance = 0;
+            SetMessage(mode == Mode::Recording ? "recording restarted" : "playing from the start", true);
+            PublishStatus();
+            return;
+        }
+    }
     if (s.mode == Mode::Recording) {
         StartKind start;
         std::string command, map, checkpoint;
@@ -919,6 +1131,23 @@ void RewindNow(const char* why)
         std::lock_guard lock(g_mutex);
         g_replay.Truncate(target);
         ++g_replay.rerecords;
+    }
+    // Snapshots: put back the keyframe before the target, run up to it, record from there. No level load.
+    if (RestoreForGoto(target)) {
+        s.mode = Mode::Playing;
+        g_advance = 0;
+        if (s.frame < target) {
+            s.seekTo = target;
+            s.recordAfterSeek = true;
+            g_paused = false;
+            if (opt.seekWithoutRendering) SetRendering(false);
+        } else {
+            TakeOverNow();
+            g_paused = true;
+        }
+        SetMessage(std::string(why) + ": back to frame " + std::to_string(target), true);
+        PublishStatus();
+        return;
     }
     StopNow(why);
     if (target == 0) {
@@ -1067,7 +1296,9 @@ void PlaybackEnded()
 
 void PublishStatus()
 {
+    const Sync player = s.mode != Mode::Idle && !s.armed && !game::IsLoading() ? Sample() : Sync{};
     std::lock_guard lock(g_mutex);
+    g_status.player = player;
     g_status.mode = s.mode;
     g_status.armed = s.armed;
     g_status.paused = g_paused;
@@ -1078,6 +1309,16 @@ void PublishStatus()
     g_status.desyncFrame = s.desyncFrame;
     g_status.syncChecked = s.syncChecked;
     g_status.corrections = s.corrections;
+    const snapshot::Stats st = snapshot::GetStats();
+    g_status.snapshots = s.snapshots;
+    g_status.snapshotsOff = s.snapshotsOff;
+    g_status.keyframes = st.keyframes;
+    g_status.snapshotBytes = st.storedBytes;
+    g_status.captureMs = st.lastCaptureMs;
+    g_status.restoreMs = st.lastRestoreMs;
+    g_status.snapshotBeginMs = st.beginMs;
+    g_status.snapped = s.snapped;
+    g_status.snappedPages = s.snappedPages;
 }
 
 // Arm: wait for the start level, running frames at the nominal step (they are the same in every run too).
@@ -1090,6 +1331,7 @@ bool ArmFrame(bool& result)
         ApplyMatch();                  // the level's own player input exists now
         s.vtime = kStartTime;      // frame 0 starts at the same clock in every run
         s.lastReal = engine::RealSeconds() - NominalDt(g_replay.fixedHz);   // the load isn't part of frame 0
+        StartSnapshots();              // frame 0: the base
         SetMessage(s.mode == Mode::Recording ? "recording" : "playing");
         return false;
     }
@@ -1161,6 +1403,7 @@ bool OnFrame()
     } else {
         dt = static_cast<float>(MeasureDt());   // stored as float: use exactly what playback will use
     }
+    SnapshotFrame();                    // before the frame's input: a keyframe is the state at the start of its frame
     s.vtime += dt;
     engine::SetFrameTime(s.vtime, dt);
 
@@ -1212,6 +1455,7 @@ bool OnFrame()
             s.pending.clear();
         }
         FlushSplits(r);
+        RecordFrameHash(s.frame);
     }
     ++s.frame;
     PublishStatus();
@@ -1221,6 +1465,8 @@ bool OnFrame()
 void OnLevelLoad(bool finished)
 {
     if (finished) return;
+    // A whole level in and out of memory: keyframes from before it aren't kept (a fresh base after it)
+    if (s.snapshots) s.snapshotsRestart = true;
     s.streaming.clear();                   // those levels are gone
     if (s.mode != Mode::Idle && s.armed) {
         // The start level is loading: from here on every run does the same, so this is where the run's randomness
@@ -1274,7 +1520,19 @@ void InstallExamples()
 bool Init()
 {
     InstallExamples();
+    memmap::Install();             // As early as possible: memory the game allocates before this is unattributed
     if (!engine::Init()) return false;
+    snapshot::Init();
+    // memenu/no-d3dpins (debugging): the Direct3D lifetime hooks aren't installed (no snapshots then)
+    if (std::filesystem::exists(paths::Dir() / "no-d3dpins")) spdlog::warn("TAS snapshots: no-d3dpins: Direct3D hooks off");
+    else hooks::OnDevice([](IDirect3DDevice9* device) { d3dpins::Install(device); });
+    hooks::OnBeforeReset([] {
+        // Pinned D3DPOOL_DEFAULT objects would make the Reset fail: let go of them now, start snapshots over after it
+        if (d3dpins::Active()) {
+            d3dpins::End();
+            g_displayReset = true;
+        }
+    });
     engine::SetFrameHandler(&OnFrame);
     engine::SetInputFilter(&FilterInput);
     input::Install();               // What the engine gets, for the input display
@@ -1287,6 +1545,8 @@ bool Init()
 }
 
 bool Available() { return engine::Available(); }
+
+void Shutdown() { snapshot::Shutdown(); }
 
 void SetOptions(const Options& options)
 {
@@ -1383,6 +1643,27 @@ void GotoNow(std::size_t frame)
         }
         if (count == 0) return;
         frame = std::min(frame, count);
+
+        // Snapshots: the nearest keyframe is put back at once, the few frames after it run (no level load)
+        if (RestoreForGoto(frame)) {
+            if (s.mode == Mode::Recording) {
+                // The take is kept and played back from here: take over to record again from a frame
+                s.mode = Mode::Playing;
+                SetRendering(true);
+            }
+            s.recordAfterSeek = false;
+            g_advance = 0;
+            if (s.frame < frame) {
+                s.seekTo = frame;
+                g_paused = false;
+                if (opt.seekWithoutRendering) SetRendering(false);
+            } else {
+                s.seekTo = kNoSeek;
+                g_paused = true;
+            }
+            PublishStatus();
+            return;
+        }
 
         if (s.mode != Mode::Playing || s.armed || frame < s.frame) {
             // A macro that starts "now" starts wherever the player is: from idle that's fine, but a running one

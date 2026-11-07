@@ -449,6 +449,20 @@ namespace
     }
     bool g_loggedOffscreen = false;
 
+    std::mutex g_deviceCallbacksMutex;
+    std::vector<void (*)(IDirect3DDevice9*)> g_onDevice;     // run once at the next EndScene
+    std::vector<void (*)()> g_onBeforeReset;
+
+    void RunDeviceCallbacks(IDirect3DDevice9* dev)
+    {
+        std::vector<void (*)(IDirect3DDevice9*)> run;
+        {
+            std::lock_guard lock(g_deviceCallbacksMutex);
+            run.swap(g_onDevice);
+        }
+        for (auto fn : run) fn(dev);
+    }
+
     HRESULT WINAPI HookedEndScene(IDirect3DDevice9* dev)
     {
         if (t_stalledDraw) return oEndScene(dev);   // an overlay inside our own stalled frame's Present
@@ -457,6 +471,7 @@ namespace
         std::lock_guard lock(g_frameMutex);
         if (!g_imguiReady) InitImGui(dev);
         g_device = dev;
+        RunDeviceCallbacks(dev);
 
         if (g_releaseRequested.load())
         {
@@ -503,6 +518,14 @@ namespace
 
     HRESULT WINAPI HookedReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
     {
+        {
+            std::vector<void (*)()> run;
+            {
+                std::lock_guard lock(g_deviceCallbacksMutex);
+                run = g_onBeforeReset;
+            }
+            for (auto fn : run) fn();
+        }
 #if MEMENU_GAME
         debugrender::OnLostDevice();
 #endif
@@ -742,6 +765,18 @@ void hooks::RunOnRenderThread(std::function<void()> fn)
 {
     std::lock_guard lock(g_renderQueueMutex);
     g_renderQueue.push_back(std::move(fn));
+}
+
+void hooks::OnDevice(void (*fn)(IDirect3DDevice9*))
+{
+    std::lock_guard lock(g_deviceCallbacksMutex);
+    g_onDevice.push_back(fn);
+}
+
+void hooks::OnBeforeReset(void (*fn)())
+{
+    std::lock_guard lock(g_deviceCallbacksMutex);
+    g_onBeforeReset.push_back(fn);
 }
 
 void hooks::Uninstall()

@@ -1,7 +1,9 @@
 # memenu loader: a dinput8.dll proxy that sits next to MirrorsEdge.exe and loads memenu\medge_menu.dll with the game.
 # 32-bit like the game (the root CMakeLists enforces that). Installed by memenu_installer (installer/).
 
-add_library(memenu_loader SHARED src/loader.cpp src/dinput8.def)
+add_library(memenu_loader SHARED src/loader.cpp src/tracker.cpp src/dinput8.def)
+# MinHook: the tracker hooks VirtualAlloc / VirtualFree / CloseHandle from the start of the process
+target_link_libraries(memenu_loader PRIVATE minhook)
 set_target_properties(memenu_loader PROPERTIES OUTPUT_NAME dinput8 PREFIX "")
 target_compile_definitions(memenu_loader PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX MEMENU_VERSION="${MEMENU_VERSION}")
 

@@ -78,6 +78,11 @@ namespace game {
 	// A level load starts (finished = false) and ends (finished = true). Game thread, inside the engine's load function.
 	using LevelLoadCallback = void (*)(bool finished);
 	void OnLevelLoad(LevelLoadCallback callback);
+
+	// The TAS put back a memory snapshot: every game object pointer kept from before may point at something else now (or
+	// at nothing). StateRestored() drops the player and the caches and runs the callbacks. Game thread.
+	void OnStateRestored(void (*callback)());
+	void StateRestored();
 	
 	// A script function the engine calls from native code through UObject::ProcessEvent: events like a Kismet action's
 	// Activated(), delegates of the UI. `fullName` as the engine names it ("Function TdGame.SeqAct_TdLevelCompleted.Activated").

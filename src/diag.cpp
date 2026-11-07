@@ -4,6 +4,9 @@
 #include <Psapi.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <string>
 #include <cctype>
 #include <vector>
 
@@ -111,6 +114,9 @@ namespace {
         spdlog::info("{} modules loaded, {} outside {}", mods.size(), outside, winDir);
     }
 
+    std::atomic<unsigned long long> g_gameCrashesUntil{0};
+    std::string (*g_released)(std::uintptr_t) = nullptr;
+
     LONG CALLBACK CrashLogger(EXCEPTION_POINTERS* ep)
     {
         switch (ep->ExceptionRecord->ExceptionCode)
@@ -121,11 +127,12 @@ namespace {
             default:    // Not a crash (C++ exceptions, debugger events...), or a stack overflow we can't log from
                 return EXCEPTION_CONTINUE_SEARCH;
         }
-        if (!InSelf(ep->ExceptionRecord->ExceptionAddress)) return EXCEPTION_CONTINUE_SEARCH;   // The game's own business
+        const bool game = GetTickCount64() < g_gameCrashesUntil.load(std::memory_order_relaxed);
+        if (!InSelf(ep->ExceptionRecord->ExceptionAddress) && !game) return EXCEPTION_CONTINUE_SEARCH;   // The game's business
         static thread_local bool inside = false;
         if (inside) return EXCEPTION_CONTINUE_SEARCH;
         inside = true;
-        diag::LogFatal(ep, "Crash in the menu");
+        diag::LogFatal(ep, InSelf(ep->ExceptionRecord->ExceptionAddress) ? "Crash in the menu" : "Crash in the game");
         inside = false;
         return EXCEPTION_CONTINUE_SEARCH;   // Only logs: the game's own handling (crash dialog) still happens
     }
@@ -187,6 +194,9 @@ long diag::LogFatal(const EXCEPTION_POINTERS* ep, const char* where)
     spdlog::critical("{}: exception 0x{:08X}{} at {} (thread {})", where, static_cast<unsigned long>(er->ExceptionCode),
                      detail, DescribeAddress(er->ExceptionAddress), GetCurrentThreadId());
 
+    if ((er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) && er->NumberParameters >= 2 && g_released)
+        if (const std::string what = g_released(er->ExceptionInformation[1]); !what.empty())
+            spdlog::critical("  the address is in {}", what);
 #if defined(_M_IX86)
     const CONTEXT* c = ep->ContextRecord;
     spdlog::critical("  eax={:08X} ebx={:08X} ecx={:08X} edx={:08X} esi={:08X} edi={:08X} ebp={:08X} esp={:08X}",
@@ -207,6 +217,30 @@ long diag::LogFatal(const EXCEPTION_POINTERS* ep, const char* where)
         ebp = frame[0];
     }
 #endif
+#if defined(_M_IX86)
+    // Values on the stack that point into modules (release builds have no frame chain to follow)
+    {
+        std::string scan;
+        int found = 0;
+        for (std::uintptr_t p = c->Esp; p < c->Esp + 4096 && found < 16; p += 4) {
+            std::uintptr_t v = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(p), &v, sizeof v, nullptr)) break;
+            HMODULE m = nullptr;
+            if (v > 0x10000 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                  reinterpret_cast<LPCWSTR>(v), &m) && m) {
+                scan += " " + DescribeAddress(reinterpret_cast<void*>(v));
+                ++found;
+            }
+        }
+        spdlog::critical("  stack:{}", scan);
+    }
+#endif
     if (auto logger = spdlog::default_logger()) logger->flush();
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void diag::LogGameCrashesUntil(unsigned long long untilTick, std::string (*released)(std::uintptr_t))
+{
+    g_released = released;
+    g_gameCrashesUntil = untilTick;
 }

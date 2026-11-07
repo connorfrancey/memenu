@@ -39,6 +39,7 @@ namespace {
     std::vector<game::TickCallback> g_tickCallbacks;
     std::vector<std::function<void()>> g_queue;
     std::vector<game::LevelLoadCallback> g_levelLoadCallbacks;
+    std::vector<void (*)()> g_stateRestoredCallbacks;
     std::vector<game::StateChangeCallback> g_stateChangeCallbacks;   // Run by the state handler hook
 
     // The local player's world and controller, game thread only. Kept between ticks while their slots in the object
@@ -630,6 +631,26 @@ void game::OnLevelLoad(LevelLoadCallback callback)
 {
     std::lock_guard lock(g_mutex);
     g_levelLoadCallbacks.push_back(callback);
+}
+
+void game::OnStateRestored(void (*callback)())
+{
+    std::lock_guard lock(g_mutex);
+    g_stateRestoredCallbacks.push_back(callback);
+}
+
+void game::StateRestored()
+{
+    // Like a level load for whatever remembers game objects: the player, the caches
+    g_playerPawn = nullptr;
+    DropCache();
+    cache::NextLevel();
+    std::vector<void (*)()> callbacks;
+    {
+        std::lock_guard lock(g_mutex);
+        callbacks = g_stateRestoredCallbacks;
+    }
+    for (auto fn : callbacks) fn();
 }
 
 void game::OnPlayerStateChange(StateChangeCallback callback)

@@ -90,6 +90,9 @@ public:
         in(bookmarkSection, {&autoSplits, &bookmarks});
         in(splitsSection, {&splitsOnly, &splitTable});
         in(desyncSection, {&desyncChecks, &onDesync, &matchRecording});
+        in(snapshotSection, {&snapshots, &snapshotInfo});
+        keyframeEvery.VisibleIf([this] { return snapshotSection && snapshots.Get(); });
+        snapshotBudget.VisibleIf([this] { return snapshotSection && snapshots.Get(); });
         correctMax.VisibleIf([this] { return desyncSection && onDesync.Get() == 1; });
         in(filesSection, {&files});
         in(keysSection, {&recordKey, &playKey, &pauseKey, &advanceKey, &frameBackKey, &restartKey, &rewindKey,
@@ -154,6 +157,9 @@ private:
         o.keyPrevBookmark = prevBookmarkKey;
         o.keyNextBookmark = nextBookmarkKey;
         o.autoSplits = autoSplits;
+        o.snapshots = snapshots;
+        o.keyframeInterval = static_cast<int>(keyframeEvery.Get() + 0.5f);
+        o.snapshotBudgetMB = static_cast<int>(snapshotBudget.Get() + 0.5f);
         const RecordStart rs = Start();
         o.recordStart = rs.kind;
         o.recordCommand = rs.command;
@@ -563,6 +569,30 @@ private:
     }
 
     // What differs from when the macro was recorded, and what playback does about it. Refreshed twice a second.
+    // What the memory snapshots do in this session (or why there are none).
+    void DrawSnapshotInfo(float width)
+    {
+        const tas::Status& st = status_;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
+        if (st.mode == tas::Mode::Idle) {
+            ImGui::TextDisabled("Kept while a macro records or plays");
+            if (!st.snapshotsOff.empty()) ImGui::TextDisabled("Last session: %s", st.snapshotsOff.c_str());
+        } else if (!st.snapshots) {
+            ImGui::TextColored({1.f, 0.75f, 0.3f, 1.f}, "No snapshots: %s",
+                               st.snapshotsOff.empty() ? "waiting for the level" : st.snapshotsOff.c_str());
+        } else {
+            ImGui::Text("%zu keyframes, %.1f MB", st.keyframes, static_cast<double>(st.snapshotBytes) / (1024.0 * 1024.0));
+            ImGui::TextDisabled("Keyframe %.1f ms, go back %.1f ms, start %.0f ms", st.captureMs, st.restoreMs,
+                                st.snapshotBeginMs);
+            if (st.snapped)
+                ImGui::TextColored({1.f, 0.75f, 0.3f, 1.f}, "%zu keyframes ran differently (%zu pages): put back as recorded",
+                                   st.snapped, st.snappedPages);
+            else
+                ImGui::TextColored({0.4f, 1.f, 0.5f, 1.f}, "Every keyframe reached again was identical");
+        }
+        ImGui::PopTextWrapPos();
+    }
+
     void DrawDesyncChecks(float width)
     {
         const double now = ImGui::GetTime();
@@ -888,6 +918,19 @@ private:
                                  "On play, use the recording's streaming setting and mouse sensitivity, and play keys "
                                  "whose binding changed as the key that does that now. Your settings come back after"};
 
+    ctl::Section snapshotSection{this, "Snapshots", false};
+    ctl::Checkbox snapshots{this, "Instant rewind", true,
+                            "Keeps the game's whole state every few frames while a macro records or plays: going back "
+                            "(Go to, Frame back, Rewind, Restart) puts it back at once instead of loading the level and "
+                            "playing everything again, and a playback that gets back to a kept frame is put back to it "
+                            "exactly, so it can't desync. Needs the menu installed (its loader starts with the game)"};
+    ctl::Slider keyframeEvery{this, "Keyframe every", 6.f, 1.f, 60.f, "%.0f frames", 1.f,
+                              "Fewer frames: going back is quicker, more memory and a little more time per frame"};
+    ctl::Slider snapshotBudget{this, "Memory", 2048.f, 256.f, 16384.f, "%.0f MB", 256.f,
+                               "How much RAM the keyframes may use (outside the game's own memory). Past it, keyframes "
+                               "far from where you are are thinned out: going back there takes a few frames longer"};
+    ctl::Custom snapshotInfo{this, [this](float w) { DrawSnapshotInfo(w); }};
+
     ctl::Section filesSection{this, "Macros", true};
     ctl::Custom files{this, [this](float w) { library_.DrawList(w); }};
 
@@ -896,7 +939,8 @@ private:
     ctl::KeyHold playKey{this, "Play", VK_F3};
     ctl::KeyHold pauseKey{this, "Pause / resume", VK_F5};
     ctl::KeyHold advanceKey{this, "Frame advance", VK_F6};
-    ctl::KeyHold frameBackKey{this, "Frame back", 0, "Replays up to the frame before this one and pauses there"};
+    ctl::KeyHold frameBackKey{this, "Frame back", 0,
+                              "Goes to the frame before this one and pauses there (instant with snapshots)"};
     ctl::KeyHold restartKey{this, "Restart", VK_F4};
     ctl::KeyHold rewindKey{this, "Rewind", VK_F9};
     ctl::KeyHold takeOverKey{this, "Take over", VK_F7};

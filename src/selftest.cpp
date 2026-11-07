@@ -37,6 +37,9 @@
 #include "features/tas/timeline_view.h"
 #include "tas/input_monitor.h"
 #include "tas/macro.h"
+#include "tas/engine.h"
+#include "tas/memory_map.h"
+#include "tas/snapshot.h"
 #include "tas/timeline.h"
 #include "tas/tas.h"
 #endif
@@ -63,7 +66,9 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace selftest {
@@ -200,6 +205,19 @@ bool WaitTicks(unsigned n, double timeout = 10.0)
     if (WaitFor(timeout, done) || g_aborted) return true;
     spdlog::error("Stall: {} frames and ticks did not come within {:.0f} s (frames {} -> {})", n, timeout, frames0,
                   hooks::EndSceneCalls());
+#if MEMENU_FEATURE_TAS
+    // Where the game's threads are (once per test run: enough to see a hang)
+    static bool dumped = false;
+    if (!dumped) {
+        dumped = true;
+        for (const auto& t : tas::memmap::Threads()) {
+            if (t.startModule != "mirrorsedge.exe" && t.startModule.rfind("physx", 0) != 0) continue;
+            std::string line;
+            for (const auto& w : tas::memmap::StackSample(t.id, 28)) line += w + " ";
+            spdlog::warn("Stall: thread {} ({}) state {} wait {}: {}", t.id, t.startModule, t.state, t.waitReason, line);
+        }
+    }
+#endif
     return false;
 }
 
@@ -927,6 +945,274 @@ void TestTasGoto()
     End(s);
 }
 
+// Opt-in investigation: the engine's rendering thread switched off (ToggleRenderingThread), then the level loaded again.
+// If the load hangs, the game thread's stack is logged.
+void TestRenderingThreadOff()
+{
+    Step& s = Begin("Rendering thread off");
+    Probe p(s);
+    const auto exeThreads = [] {
+        int n = 0;
+        for (const auto& t : tas::memmap::Threads()) n += t.startModule == "mirrorsedge.exe" ? 1 : 0;
+        return n;
+    };
+    const int before = exeThreads();
+    OnGameThread([] { game::ConsoleCommand("ToggleRenderingThread"); });
+    WaitTicks(5);
+    const int after = exeThreads();
+    s.notes.push_back("exe threads " + std::to_string(before) + " -> " + std::to_string(after));
+
+    std::atomic<bool> done{false};
+    DWORD gameThread = 0;
+    OnGameThread([&] { gameThread = GetCurrentThreadId(); });
+    std::thread watchdog([&] {
+        for (int i = 0; i < 80 && !done; ++i) Sleep(100);
+        if (done) return;
+        for (int round = 0; round < 3; ++round) {
+            for (const auto& t : tas::memmap::Threads()) {
+                if (t.startModule != "mirrorsedge.exe" && t.id != gameThread) continue;
+                std::string line;
+                for (const auto& w : tas::memmap::StackSample(t.id, 28)) line += w + " ";
+                spdlog::warn("Rendering off: thread {}{} state {} wait {}: {}", t.id, t.id == gameThread ? " (game)" : "",
+                             t.state, t.waitReason, line);
+            }
+            Sleep(1000);
+        }
+    });
+    const int loads = g_loadsFinished.load();
+    const auto maps = levels::Maps();
+    for (int i = 0; i < static_cast<int>(maps.size()); ++i)
+        if (Lower(maps[i].label).find(Lower(g_options.map)) != std::string::npos) {
+            OnGameThread([&] { levels::Load(i, g_options.checkpoint, levels::Method::Game, false); });
+            break;
+        }
+    const bool loaded = WaitFor(25.0, [&] { return g_loadsFinished.load() > loads && !game::IsLoading(); });
+    done = true;
+    watchdog.join();
+    if (!loaded) p.Problem("the level didn't load with the rendering thread off");
+    else {
+        const std::string why = WaitPlayerReady(20.0);
+        if (!why.empty()) p.Problem("after loading: " + why);
+        else s.notes.push_back("loaded with the rendering thread off");
+    }
+    p.Check(1, false);
+    End(s);
+}
+
+// Memory snapshots (tas/snapshot.h), on a macro from a level start that runs, jumps and turns:
+//   1. a playback keeps keyframes (the loader tracks the game's memory)
+//   2. Go to an earlier frame puts the game back without loading the level: the player is exactly (bit for bit) where
+//      the recording had them on that frame
+//   3. playing on from there to the end gets exactly the same end state; keyframes reached again are compared
+//   4. Frame back, ten times: each one exact, and how long one takes
+//   5. Restart goes back to frame 0 without a level load
+// Then the session stops and the game must still be playable.
+void TestTasSnapshots()
+{
+    Step& s = Begin("TAS snapshots");
+    Probe p(s);
+    const auto fail = [&](const std::string& why) {
+        p.Problem(why);
+        p.Check(1, false);
+        End(s);
+    };
+    if (!tas::Available()) return fail("the TAS engine hooks were not found");
+
+    const auto maps = levels::Maps();
+    int index = -1;
+    for (int i = 0; i < static_cast<int>(maps.size()); ++i)
+        if (Lower(maps[i].label).find(Lower(g_options.map)) != std::string::npos) { index = i; break; }
+    if (index < 0) return fail("no level matching '" + g_options.map + "'");
+    const int cp = std::min(g_options.checkpoint, static_cast<int>(maps[index].checkpoints.size()));
+
+    Module* tasModule = nullptr;
+    modules::ForEach([&](modules::Tab&, Module& m) { if (m.Name() == "TAS / Macro") tasModule = &m; });
+    auto* atEnd = tasModule ? dynamic_cast<ctl::Combo*>(tasModule->FindSetting("At the end")) : nullptr;
+    auto* instant = tasModule ? dynamic_cast<ctl::Checkbox*>(tasModule->FindSetting("Instant rewind")) : nullptr;
+    if (!atEnd || !instant) return fail("the TAS module's At the end / Instant rewind controls were not found");
+    const int atEndWas = atEnd->Get();
+    const bool instantWas = instant->Get();
+
+    std::string forward, jump;
+    OnGameThread([&] {
+        auto* pc = game::Controller();
+        forward = KeyFor(pc, "GBA_MoveForward", "W");
+        jump = KeyFor(pc, "GBA_Jump", "SpaceBar");
+    });
+    tas::Macro m(60.f);
+    m.Describe("memenu self-test: snapshots").Wait(5).Press(forward).Wait(30);
+    for (int i = 0; i < 20; ++i) m.Axis("MouseX", 6.f).Wait(1);     // turning while running
+    m.Hold(jump, 3).Wait(50).Release(forward).Wait(40);
+    tas::Replay macro = m.Build();
+    macro.start = tas::StartKind::Checkpoint;
+    macro.map = maps[index].label;
+    macro.checkpoint = cp > 0 ? maps[index].checkpoints[static_cast<std::size_t>(cp - 1)] : std::string();
+    macro.syncValidUntil = 0;                       // this playback records the reference states
+    const std::size_t frames = macro.FrameCount();
+
+    tas::Replay saved;
+    tas::WithReplay([&](tas::Replay& r) { saved = r; r = macro; });
+    OnRenderThread([&] {
+        gui::visible = false;
+        atEnd->Set(static_cast<int>(tas::AtEnd::Pause));
+        instant->Set(true);
+    });
+    WaitTicks(3);
+
+    const auto pausedOn = [](std::size_t frame) {
+        const tas::Status st = tas::GetStatus();
+        return st.mode == tas::Mode::Playing && st.paused && !st.seeking && st.frame == frame;
+    };
+    const auto describe = [](const tas::Sync& a) {
+        char text[160];
+        std::snprintf(text, sizeof text, "(%.3f, %.3f, %.3f) v (%.3f, %.3f, %.3f) move %u", a.x, a.y, a.z, a.vx, a.vy,
+                      a.vz, a.state);
+        return std::string(text);
+    };
+    const auto reference = [&](std::size_t frame) {
+        tas::Sync want;
+        tas::WithReplay([&](tas::Replay& r) { if (frame < r.sync.size()) want = r.sync[frame]; });
+        return want;
+    };
+    // Goes to `frame` and checks the player against the recording; the milliseconds it took (-1: it didn't get there)
+    const auto goTo = [&](std::size_t frame, bool back) -> double {
+        const ULONGLONG t0 = GetTickCount64();
+        if (back) tas::FrameBack(1);
+        else tas::Goto(frame);
+        if (!WaitFor(20.0, [&] { return pausedOn(frame); })) {
+            const tas::Status st = tas::GetStatus();
+            p.Problem("going to frame " + std::to_string(frame) + " stopped on " + std::to_string(st.frame) +
+                      (st.paused ? " (paused)" : " (running)") + ": " + st.message);
+            return -1.0;
+        }
+        const double ms = static_cast<double>(GetTickCount64() - t0);
+        const tas::Sync now = tas::GetStatus().player;
+        const tas::Sync want = frame < frames ? reference(frame) : now;
+        if (frame < frames && !(now == want))
+            p.Problem("frame " + std::to_string(frame) + ": the player is at " + describe(now) + ", recorded " +
+                      describe(want));
+        return ms;
+    };
+
+    // 1. The reference run, keyframes kept
+    const int loadsBefore = g_loadsFinished.load();
+    tas::Play();
+    bool started = false;
+    WaitFor(90.0, [&] {
+        const tas::Status st = tas::GetStatus();
+        started |= st.mode != tas::Mode::Idle;
+        return pausedOn(frames) || (started && st.mode == tas::Mode::Idle);
+    });
+    tas::Status end = tas::GetStatus();
+    if (!pausedOn(frames)) {
+        tas::Stop();
+        tas::WithReplay([&](tas::Replay& r) { r = saved; });
+        OnRenderThread([&] { atEnd->Set(atEndWas); instant->Set(instantWas); gui::visible = true; });
+        return fail("the playback didn't pause at its end (frame " + std::to_string(end.frame) + " of " +
+                    std::to_string(frames) + "): " + end.message);
+    }
+    if (!end.snapshots) {
+        tas::Stop();
+        tas::WithReplay([&](tas::Replay& r) { r = saved; });
+        OnRenderThread([&] { atEnd->Set(atEndWas); instant->Set(instantWas); gui::visible = true; });
+        return fail("no snapshots: " + end.snapshotsOff);
+    }
+    const tas::Sync endPlayer = end.player;
+    char line[200];
+    std::snprintf(line, sizeof line, "%zu frames, %zu keyframes, %.1f MB stored; base %.0f ms, last keyframe %.1f ms",
+                  frames, end.keyframes, static_cast<double>(end.snapshotBytes) / 1048576.0, end.snapshotBeginMs,
+                  end.captureMs);
+    s.notes.push_back(line);
+    const int loadsAfterPlay = g_loadsFinished.load();
+    // 2. Back to an earlier frame
+    const double backMs = goTo(37, false);
+    if (backMs >= 0) {
+        std::snprintf(line, sizeof line, "went back to frame 37 in %.0f ms (restore %.1f ms), exactly as recorded", backMs,
+                      tas::GetStatus().restoreMs);
+        s.notes.push_back(line);
+    }
+
+    // 3. On to the end again: the same end state
+    const double fwdMs = goTo(frames, false);
+    if (fwdMs >= 0) {
+        const tas::Status st = tas::GetStatus();
+        if (!(st.player == endPlayer))
+            p.Problem("playing on from 37 ended at " + describe(st.player) + ", the first time " + describe(endPlayer));
+        std::snprintf(line, sizeof line, "played on to the end in %.0f ms: %s; %zu keyframes reached again differed "
+                      "(%zu pages, put back)", fwdMs, st.player == endPlayer ? "same end state" : "DIFFERENT end state",
+                      st.snapped, st.snappedPages);
+        s.notes.push_back(line);
+    }
+
+    // 4. Frame back, ten times
+    double total = 0.0, worst = 0.0;
+    int steps = 0;
+    for (std::size_t f = frames; f > frames - 10 && !g_aborted; --f) {
+        const double ms = goTo(f - 1, true);
+        if (ms < 0) break;
+        total += ms;
+        worst = std::max(worst, ms);
+        ++steps;
+    }
+    if (steps) {
+        std::snprintf(line, sizeof line, "frame back x%d: %.0f ms each on average, %.0f ms at most", steps,
+                      total / steps, worst);
+        s.notes.push_back(line);
+    }
+
+    // 4b. Early keyframes, the frames right after the level loaded, before frame 0 itself
+    for (std::size_t f : {std::size_t{12}, std::size_t{6}}) {
+        const double ms = goTo(f, false);
+        if (ms >= 0) s.notes.push_back("went back to frame " + std::to_string(f));
+        else break;
+    }
+
+    // 5. Restart: frame 0 without loading the level
+    tas::Restart();
+    if (!WaitFor(10.0, [] { const auto st = tas::GetStatus(); return st.mode == tas::Mode::Playing && st.frame <= 3 && !st.armed; }))
+        p.Problem("Restart didn't go back to frame 0 (frame " + std::to_string(tas::GetStatus().frame) + ")");
+    else if (g_loadsFinished.load() != loadsAfterPlay)
+        p.Problem("Restart loaded the level instead of putting frame 0 back");
+    else
+        s.notes.push_back("restart: back at frame 0 without loading the level");
+    (void)loadsBefore;
+
+    // 6. A small memory budget: older keyframes are thinned out, and going back there is still exact (from an earlier
+    // keyframe, running the frames between)
+    auto* budget = dynamic_cast<ctl::Slider*>(tasModule->FindSetting("Memory"));
+    if (budget) {
+        const float budgetWas = budget->Get();
+        OnRenderThread([&] { budget->Set(256.f); });
+        WaitFor(90.0, [&] { return pausedOn(frames); });
+        const tas::Status thin = tas::GetStatus();
+        std::snprintf(line, sizeof line, "with 256 MB: %zu keyframes, %.1f MB", thin.keyframes,
+                      static_cast<double>(thin.snapshotBytes) / 1048576.0);
+        s.notes.push_back(line);
+        if (thin.snapshotBytes > end.snapshotBytes) p.Problem("the budget didn't thin any keyframe out");
+        for (std::size_t f : {std::size_t{10}, std::size_t{20}, std::size_t{100}})
+            if (goTo(f, false) < 0) break;
+        s.notes.push_back("went back to frames 10, 20 and 100 after thinning");
+        OnRenderThread([&] { budget->Set(budgetWas); });
+    } else {
+        p.Problem("the TAS module's Memory control was not found");
+    }
+
+    tas::Stop();
+    if (!WaitFor(5.0, [] { return tas::GetStatus().mode == tas::Mode::Idle; })) p.Problem("the session did not stop");
+    if (tas::GetStatus().snapshots) p.Problem("the snapshots weren't let go of when the session stopped");
+
+    tas::WithReplay([&](tas::Replay& r) { r = saved; });
+    OnRenderThread([&] {
+        atEnd->Set(atEndWas);
+        instant->Set(instantWas);
+        gui::visible = true;
+    });
+    if (const std::string why = WaitPlayerReady(); !why.empty()) p.Problem("after the session: " + why);
+    WaitTicks(10);
+    p.Check(1, true);
+    End(s);
+}
+
 // The TAS's workflow helpers, with a "now" macro recorded on the spot:
 //   1. a recording is autosaved when it stops, and counts as not saved until it is
 //   2. bookmarks survive a save and a load (and count as changes)
@@ -1277,6 +1563,198 @@ void TestTasDesync()
         gui::visible = true;
     });
     WaitTicks(5);
+    p.Check(1, true);
+    End(s);
+}
+#endif
+
+#if MEMENU_FEATURE_TAS
+// Not a check: measures what memory snapshots of the game would hold (opt-in: --only "TAS memory survey"). How much of
+// the process is the game's, how much of it changes in one frame and in a second, which threads there are and what
+// switching the rendering thread off does. Everything goes to the notes and the log.
+void TestTasMemorySurvey()
+{
+    using namespace tas::memmap;
+    Step& s = Begin("TAS memory survey");
+    Probe p(s);
+    const auto note = [&](std::string text) {
+        spdlog::info("Survey: {}", text);
+        s.notes.push_back(std::move(text));
+    };
+    const auto mb = [](std::uint64_t bytes) { return std::to_string(bytes / (1024 * 1024)) + " MB"; };
+    if (!Tracking()) note("the allocation tracker is not running: virtual memory can't be attributed");
+
+    // Threads
+    const auto threadLines = [&](const char* when) {
+        std::map<std::string, int> byModule;
+        for (const auto& t : Threads()) {
+            ++byModule[t.startModule];
+            spdlog::info("Survey: thread {} start {}+{:#x} state {} wait {} stack {:#x}-{:#x} cycles {}", t.id,
+                         t.startModule, t.start, t.state, t.waitReason, t.stackLow, t.stackHigh, t.cycles);
+        }
+        std::string line = std::string("threads ") + when + ":";
+        for (const auto& [m, n] : byModule) line += " " + m + " x" + std::to_string(n);
+        note(line);
+    };
+    threadLines("now");
+
+    // The game's own threads: how busy each is over a second, and where it is (a few stack samples)
+    {
+        std::map<std::uint32_t, std::uint64_t> cycles0;
+        for (const auto& t : Threads()) cycles0[t.id] = t.cycles;
+        Wait(1.0);
+        for (const auto& t : Threads()) {
+            if (t.startModule != "mirrorsedge.exe" && t.startModule.rfind("physx", 0) != 0) continue;
+            const double mcycles = static_cast<double>(t.cycles - cycles0[t.id]) / 1e6;
+            note("thread " + std::to_string(t.id) + " (" + t.startModule + ") " + std::to_string(static_cast<int>(mcycles)) +
+                 " Mcycles/s, state " + std::to_string(t.state) + " wait " + std::to_string(t.waitReason));
+            if (tas::engine::IsGameThread()) continue;
+            for (int sample = 0; sample < 3; ++sample) {
+                std::string line = "  ";
+                for (const auto& w : StackSample(t.id, 10)) line += w + " ";
+                spdlog::info("Survey: thread {} sample {}: {}", t.id, sample, line);
+                if (sample == 0) s.notes.push_back(line);
+                Wait(0.05);
+            }
+        }
+    }
+    // Every heap: its size, and every module whose data holds its handle (who uses it)
+    {
+        const auto modules = Modules();
+        for (const auto& h : Heaps()) {
+            std::uint64_t bytes = 0, blocks = 0;
+            if (HeapLock(h.handle)) {
+                PROCESS_HEAP_ENTRY e{};
+                while (HeapWalk(h.handle, &e))
+                    if (e.wFlags & PROCESS_HEAP_ENTRY_BUSY) { bytes += e.cbData; ++blocks; }
+                HeapUnlock(h.handle);
+            }
+            std::string refs;
+            const auto value = reinterpret_cast<std::uintptr_t>(h.handle);
+            for (const auto& m : modules) {
+                for (std::uintptr_t q = m.base; q < m.base + m.size;) {
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (!VirtualQuery(reinterpret_cast<void*>(q), &mbi, sizeof mbi)) break;
+                    const auto lo = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+                    const auto hi = std::min<std::uintptr_t>(lo + mbi.RegionSize, m.base + m.size);
+                    bool found = false;
+                    if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) && !(mbi.Protect & PAGE_GUARD))
+                        for (auto a = lo; a + 4 <= hi && !found; a += 4)
+                            found = *reinterpret_cast<const std::uintptr_t*>(a) == value;
+                    if (found) { refs += " " + m.name; break; }
+                    q = hi;
+                }
+            }
+            char text[256];
+            std::snprintf(text, sizeof text, "heap %p %s%s: %llu KB in %llu blocks; referenced by:%s", h.handle,
+                          h.what.c_str(), h.game ? " (game)" : "", static_cast<unsigned long long>(bytes / 1024),
+                          static_cast<unsigned long long>(blocks), refs.empty() ? " nobody" : refs.c_str());
+            note(text);
+        }
+    }
+
+    // Regions by owner, and the biggest kinds
+    std::vector<Region> regions;
+    double regionsMs = 0.0;
+    OnGameThread([&] {
+        const ULONGLONG t0 = GetTickCount64();
+        regions = Regions();
+        regionsMs = static_cast<double>(GetTickCount64() - t0);
+    }, 30.0);
+    std::map<std::string, std::uint64_t> byOwner, byWhat;
+    for (const auto& r : regions) {
+        byOwner[OwnerName(r.owner)] += r.size;
+        byWhat[std::string(OwnerName(r.owner)) + ": " + r.what] += r.size;
+    }
+    std::string owners = "writable memory (" + std::to_string(regions.size()) + " regions, listed in " +
+                         std::to_string(static_cast<int>(regionsMs)) + " ms):";
+    for (const auto& [o, b] : byOwner) owners += " " + o + " " + mb(b) + ";";
+    note(owners);
+    std::vector<std::pair<std::uint64_t, std::string>> whats;
+    for (const auto& [w, b] : byWhat) whats.emplace_back(b, w);
+    std::sort(whats.rbegin(), whats.rend());
+    for (std::size_t i = 0; i < whats.size() && i < 25; ++i) note("  " + whats[i].second + ": " + mb(whats[i].first));
+
+    std::string callers = "VirtualAlloc callers since the TAS started (bytes, live):";
+    int shown = 0;
+    for (const auto& c : AllocationCallers())
+        if (c.bytes && shown++ < 12) callers += " " + c.module + " " + mb(c.bytes) + "/" + mb(c.live) + ";";
+    note(callers);
+
+    // How much changes: page hashes of the game's memory and of the unattributed memory, now, a frame later, a second later
+    using Hashes = std::unordered_map<std::uintptr_t, std::pair<std::uint64_t, std::uint8_t>>;   // page -> hash, kind
+    const auto kindOf = [](const Region& r) -> int {
+        if (r.owner == Owner::GameImage) return 0;
+        if (r.owner == Owner::GameHeap) return 1;
+        if (r.owner == Owner::GameVirtual) return 2;
+        if (r.what == "virtual (unknown)") return 3;
+        return -1;
+    };
+    const char* kindNames[] = {"game image", "game heap", "game virtual", "unknown virtual"};
+    const auto hashAll = [&](Hashes& out, double& ms) {
+        OnGameThread([&] {
+            const ULONGLONG t0 = GetTickCount64();
+            out.clear();
+            for (const auto& r : Regions()) {
+                const int kind = kindOf(r);
+                if (kind < 0) continue;
+                for (std::uintptr_t a = r.base; a < r.base + r.size; a += kPage) {
+                    std::uint64_t h = 0;
+                    if (HashPage(reinterpret_cast<const void*>(a), h)) out[a] = {h, static_cast<std::uint8_t>(kind)};
+                }
+            }
+            ms = static_cast<double>(GetTickCount64() - t0);
+        }, 60.0);
+    };
+    const auto compare = [&](const Hashes& a, const Hashes& b, const char* when) {
+        std::uint64_t changed[4]{}, total[4]{}, added[4]{};
+        for (const auto& [page, hk] : b) {
+            total[hk.second] += kPage;
+            const auto it = a.find(page);
+            if (it == a.end()) added[hk.second] += kPage;
+            else if (it->second.first != hk.first) changed[hk.second] += kPage;
+        }
+        std::string line = std::string("changed ") + when + ":";
+        for (int k = 0; k < 4; ++k)
+            line += std::string(" ") + kindNames[k] + " " + std::to_string(changed[k] / 1024) + " KB of " + mb(total[k]) +
+                    " (+" + std::to_string(added[k] / 1024) + " KB new);";
+        note(line);
+    };
+    Hashes h0, h1, h2;
+    double ms0 = 0, ms1 = 0, ms2 = 0;
+    hashAll(h0, ms0);
+    WaitTicks(1);
+    hashAll(h1, ms1);
+    compare(h0, h1, "over 1 tick");
+    WaitTicks(62);
+    hashAll(h2, ms2);
+    compare(h1, h2, "over 62 ticks");
+    note("hashing took " + std::to_string(static_cast<int>(ms0)) + " / " + std::to_string(static_cast<int>(ms1)) + " / " +
+         std::to_string(static_cast<int>(ms2)) + " ms");
+
+    // The rendering thread: off and back on with the engine's own console command
+    std::set<std::uint32_t> before, after;
+    for (const auto& t : Threads()) before.insert(t.id);
+    OnGameThread([] { game::ConsoleCommand("ToggleRenderingThread"); });
+    WaitTicks(10);
+    for (const auto& t : Threads()) after.insert(t.id);
+    std::string gone, added;
+    for (auto id : before) if (!after.count(id)) gone += " " + std::to_string(id);
+    for (auto id : after) if (!before.count(id)) added += " " + std::to_string(id);
+    note("ToggleRenderingThread: threads gone [" + gone + " ] new [" + added + " ]");
+    threadLines("after the toggle");
+    Hashes r0, r1;
+    double rm0 = 0, rm1 = 0;
+    hashAll(r0, rm0);
+    WaitTicks(1);
+    hashAll(r1, rm1);
+    compare(r0, r1, "over 1 tick without the rendering thread");
+    OnGameThread([] { game::ConsoleCommand("ToggleRenderingThread"); });
+    WaitTicks(10);
+    std::set<std::uint32_t> back;
+    for (const auto& t : Threads()) back.insert(t.id);
+    note("toggled back: " + std::to_string(back.size()) + " threads (" + std::to_string(before.size()) + " before)");
+
     p.Check(1, true);
     End(s);
 }
@@ -1730,7 +2208,32 @@ void TestEngineDeath()
         pawn->TakeDamage(pawn->Health + 10000, nullptr, pawn->Location, Classes::FVector{},
                          Classes::UTdDmgType_Fell::StaticClass(), hit, nullptr);
     });
-    if (!WaitFor(10.0, [&] { return g_deathBefore > before; })) p->Problem("no death seen by the hook within 10 s");
+#if MEMENU_FEATURE_TAS
+    // With the rendering thread off (TAS snapshots) the hooked functions aren't reached: a respawn is the death then
+    if (tas::snapshot::RenderingThreadOff()) {
+        bool respawned = false;
+        WaitFor(10.0, [&] {
+            OnGameThread([&] { auto* pawn = game::Pawn(); respawned = pawn && pawn != pawnBefore && pawn->Health > 0; }, 1.0);
+            return respawned;
+        });
+        if (!respawned) p->Problem("the player didn't die and come back (rendering thread off: the hook can't see it)");
+        else s.notes.push_back("rendering thread off (TAS snapshots): death seen as a respawn, the hook isn't reached");
+        WaitPlayerReady();
+        p->Check(1, false);
+        End(s);
+        return;
+    }
+#endif
+    if (!WaitFor(10.0, [&] { return g_deathBefore > before; })) {
+        std::string state = "no player";
+        OnGameThread([&] {
+            if (auto* pawn = game::Pawn())
+                state = "health " + std::to_string(pawn->Health) + ", physics " + std::to_string(static_cast<int>(pawn->Physics.GetValue())) +
+                        ", move " + std::to_string(static_cast<int>(pawn->MovementState.GetValue())) +
+                        (pawn == pawnBefore ? ", same pawn" : ", another pawn");
+        }, 2.0);
+        p->Problem("no death seen by the hook within 10 s (" + state + ")");
+    }
     else {
         if (!WaitFor(10.0, [&] { return g_deathAfter > after; })) p->Problem("the after-death call never came");
         // Back in the game: a new pawn, alive and movable
@@ -2437,6 +2940,49 @@ void Run()
 #if MEMENU_GAME
     game::OnLevelLoad(&OnLevelLoad);
 #endif
+#if MEMENU_FEATURE_TAS
+    // Hang watchdog: no frame for 8 s, the game's threads' stacks go to the log (once a hang)
+    static std::atomic<bool> watching{true};
+    std::thread watchdog([] {
+        unsigned last = hooks::EndSceneCalls();
+        ULONGLONG since = GetTickCount64();
+        bool dumped = false;
+        while (watching) {
+            Sleep(250);
+            const unsigned now = hooks::EndSceneCalls();
+            static ULONGLONG loadingSince = 0;
+            if (game::IsLoading()) {
+                if (!loadingSince) loadingSince = GetTickCount64();
+            } else {
+                loadingSince = 0;
+            }
+            if (now != last && !(loadingSince && GetTickCount64() - loadingSince > 10000)) {
+                last = now;
+                since = GetTickCount64();
+                dumped = false;
+                continue;
+            }
+            if (dumped || (GetTickCount64() - since < 8000 && !loadingSince)) continue;
+            dumped = true;
+            spdlog::warn("Hang: no frame for 8 s, or loading for 10 s (step: {})", g_current);
+            for (int round = 0; round < 2; ++round) {
+                for (const auto& t : tas::memmap::Threads()) {
+                    if (t.startModule != "mirrorsedge.exe" && t.startModule.rfind("physx", 0) != 0) continue;
+                    std::string line;
+                    for (const auto& w : tas::memmap::StackSample(t.id, 32)) line += w + " ";
+                    spdlog::warn("Hang: thread {} ({}) state {} wait {}: {}", t.id, t.startModule, t.state, t.waitReason, line);
+                }
+                spdlog::default_logger()->flush();
+                Sleep(1000);
+            }
+        }
+    });
+    // Ends before the test does: the menu unloads after it
+    struct StopWatchdog {
+        std::thread& t;
+        ~StopWatchdog() { watching = false; if (t.joinable()) t.join(); }
+    } stopWatchdog{watchdog};
+#endif
     const auto saved = SaveAll();
     notify::SetMuted(true);         // Nothing on screen but what the modules draw (the HUD checks measure it)
     if (g_options.fast) SetFrameRateCap(false);
@@ -2447,14 +2993,17 @@ void Run()
             TestInputBlocking();
             // The feature tests, by name (--only / --skip pick them like modules). `fastTas`: its playbacks don't
             // depend on pacing, so in fast mode they run as fast as they go.
-            struct Named { const char* name; void (*run)(); bool fastTas; };
+            struct Named { const char* name; void (*run)(); bool fastTas; bool optIn = false; };
             const Named tests[] = {
 #if MEMENU_FEATURE_TAS
                 {"TAS macro", &TestTasMacro, true},
                 {"TAS camera keys", &TestTasCamera, true},
                 {"TAS go to and step", &TestTasGoto, true},
                 {"TAS desync fixing", &TestTasDesync, true},
+                {"TAS snapshots", &TestTasSnapshots, true},
                 {"TAS workflow", &TestTasWorkflow, false},      // Records and loops in real time
+                {"TAS memory survey", &TestTasMemorySurvey, false, true},   // Measurements only: --only
+                {"Rendering thread off", &TestRenderingThreadOff, false, true},
 #if MEMENU_FEATURE_INPUT_OVERLAY
                 {"Input overlay", &TestInputOverlay, true},
 #endif
@@ -2491,6 +3040,7 @@ void Run()
             };
             for (const Named* t = tests; t->name && !g_aborted; ++t) {
                 if (!g_options.only.empty() && !g_options.only.count(t->name)) continue;
+                if (t->optIn && !g_options.only.count(t->name)) continue;
                 if (g_options.skip.count(t->name)) continue;
 #if MEMENU_FEATURE_TAS
                 const ScopedTasSpeed speed(g_options.fast && t->fastTas);

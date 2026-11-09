@@ -3,6 +3,7 @@
 #include "game/game.h"
 #include "game/object_ref.h"
 #include "game/uobject.h"
+#include "runtime/engine_calls.h"
 
 #include <Windows.h>
 
@@ -349,9 +350,9 @@ bool player_state::Load()
     if (auto* hud = static_cast<ATdHUD*>(controller->myHUD)) {
         if (auto* fx = hud->EffectManager; fx && fx->ReactionTimeEffect && fx->ReactionTimeEffect->bIsActive)
             fx->ReactionTimeEffect->ResetPP();
-        hud->ToggleReactionTime(s.reactionTime);
+        mirage::engine::ToggleReactionTime(hud, s.reactionTime);
     }
-    controller->SetSoundMode(s.soundMode, 0.f, true, 0.f);
+    mirage::engine::SetSoundMode(controller, static_cast<std::uint8_t>(s.soundMode.GetValue()), 0.f, true, 0.f);
     if (world->Game) world->Game->GameSpeed = s.timeDilation;
 
     if (pawn->LeftHandWorldIKController) pawn->LeftHandWorldIKController->StrengthTarget = 0.f;
@@ -359,7 +360,7 @@ bool player_state::Load()
 
     pawn->StopSlideEffect();
     pawn->StopAllCustomAnimations(0.f);
-    pawn->SetMove(s.movementState, false, false);
+    mirage::engine::SetMove(pawn, s.movementState);
 
     s.pawn.Restore(pawn);
     s.controller.Restore(controller);
@@ -528,7 +529,7 @@ void player_state::ResetMovement(ATdPlayerPawn* pawn, ATdPlayerController* contr
 
     pawn->StopSlideEffect();
     pawn->StopAllCustomAnimations(0.f);
-    pawn->SetMove(EMovement::MOVE_Walking, false, false);
+    mirage::engine::SetMove(pawn, EMovement::MOVE_Walking);
 
     controller->bIgnoreLookInput = 0;
     controller->bIgnoreMoveInput = 0;

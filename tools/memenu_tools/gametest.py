@@ -12,21 +12,34 @@ engine, so every game feature does nothing there and passes. This does it in the
 
 No administrator rights needed as long as the game folder is writable and the game doesn't run as administrator
 (Steam's default; compatibility mode "Run as administrator" breaks it, and the menu's own key handling too).
+
+On Linux the game runs in Steam's Proton: it is started with `steam steam://rungameid/17410` (Steam handles Proton and
+the game's DRM), found in /proc, and the menu's unload is seen in /proc/<pid>/maps. The game's Steam launch options
+need WINEDLLOVERRIDES="dinput8=n,b" (install.sh says so too), or Proton uses its own dinput8.dll and the menu never
+loads: checked before starting (linux_launch_options). See doc/linux-development.md.
 """
 
 from __future__ import annotations
 
 import ctypes
 import json
+import os
+import re
 import shutil
+import signal
 import subprocess
+import sys
 import time
-from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from . import devtest
+
+LINUX = sys.platform.startswith("linux")
+if not LINUX:
+    from ctypes import wintypes
+APP_ID = "17410"        # Mirror's Edge on Steam
 
 DEFAULT_GAME_DIRS = [
     Path(r"C:\Program Files (x86)\Steam\steamapps\common\mirrors edge\Binaries"),
@@ -34,10 +47,29 @@ DEFAULT_GAME_DIRS = [
 ]
 
 
+def steam_roots() -> list[Path]:
+    """Where Steam is installed: Windows, or Linux (native, the Debian/Ubuntu package's ~/.steam, Flatpak)."""
+    if not LINUX:
+        return [Path(r"C:\Program Files (x86)\Steam"), Path(r"C:\Program Files\Steam")]
+    home = Path.home()
+    roots = [home / ".steam" / "steam", home / ".local" / "share" / "Steam", home / ".steam" / "debian-installation",
+             home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam"]
+    seen, out = set(), []
+    for r in roots:
+        try:
+            real = r.resolve()
+        except OSError:
+            continue
+        if real.is_dir() and real not in seen:
+            seen.add(real)
+            out.append(real)
+    return out
+
+
 def steam_library_dirs() -> list[Path]:
     """Every Steam library's `steamapps\\common\\mirrors edge\\Binaries` (from libraryfolders.vdf)."""
     out = []
-    for steam in (Path(r"C:\Program Files (x86)\Steam"), Path(r"C:\Program Files\Steam")):
+    for steam in steam_roots():
         vdf = steam / "steamapps" / "libraryfolders.vdf"
         if not vdf.exists():
             continue
@@ -49,7 +81,8 @@ def steam_library_dirs() -> list[Path]:
 
 
 def find_game_dir() -> Path | None:
-    for d in DEFAULT_GAME_DIRS + steam_library_dirs():
+    for d in ([] if LINUX else DEFAULT_GAME_DIRS) + [r / "steamapps" / "common" / "mirrors edge" / "Binaries"
+                                                     for r in steam_roots()] + steam_library_dirs():
         if (d / devtest.GAME_EXE).exists():
             return d
     return None
@@ -104,7 +137,37 @@ def cleanup(game_dir: Path) -> None:
             p.unlink()
 
 
+def linux_launch_options() -> str | None:
+    """The game's Steam launch options (localconfig.vdf of every Steam user here, joined), None if Steam has none set.
+    Linux only: there they must hand Proton WINEDLLOVERRIDES="dinput8=n,b"."""
+    found = []
+    for root in steam_roots():
+        for vdf in (root / "userdata").glob("*/config/localconfig.vdf"):
+            text = vdf.read_text(encoding="utf-8", errors="replace")
+            # "17410" { ... "LaunchOptions" "..." ... }: the first LaunchOptions after the app's key, within its block
+            for m in re.finditer(r'"' + APP_ID + r'"\s*\{', text):
+                block = text[m.end():m.end() + 4000]
+                end = block.find("\n\t\t\t\t}")
+                if end > 0:
+                    block = block[:end]
+                lo = re.search(r'"LaunchOptions"\s*"((?:[^"\\]|\\.)*)"', block)
+                if lo:
+                    found.append(lo.group(1).replace('\\"', '"'))
+    return " | ".join(found) if found else None
+
+
+def _linux_module_loaded(pid: int, name: str) -> bool | None:
+    """Whether Wine has `name` mapped in the process (it maps a PE DLL from its file), None if unknown."""
+    try:
+        maps = Path(f"/proc/{pid}/maps").read_text(errors="replace").lower()
+    except OSError:
+        return None
+    return name.lower() in maps
+
+
 def _module_loaded(pid: int, name: str) -> bool | None:
+    if LINUX:
+        return _linux_module_loaded(pid, name)
     """Whether a DLL called `name` is loaded in process `pid` (None: couldn't tell)."""
     psapi, kernel32 = ctypes.WinDLL("psapi", use_last_error=True), ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -131,6 +194,12 @@ def _module_loaded(pid: int, name: str) -> bool | None:
 
 
 def _close_windows(pid: int) -> None:
+    if LINUX:       # Wine ends the process on SIGTERM; the menu has unloaded by then (its results are on disk)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return
     """Asks the game to quit: WM_CLOSE to its top-level windows."""
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -151,6 +220,47 @@ def _close_windows(pid: int) -> None:
     user32.EnumWindows(proc_type(each), 0)
 
 
+class _LinuxGame:
+    """The game started through Steam on Linux, with the parts of subprocess.Popen that run() uses."""
+
+    def __init__(self, start_timeout: float = 90.0):
+        before = set(devtest.game_pids())
+        subprocess.Popen(["steam", f"steam://rungameid/{APP_ID}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        self.pid = 0
+        self.returncode: int | None = None
+        deadline = time.monotonic() + start_timeout
+        while time.monotonic() < deadline and not self.pid:
+            new = [p for p in devtest.game_pids() if p not in before]
+            if new:
+                self.pid = new[0]
+            else:
+                time.sleep(0.5)
+        if not self.pid:
+            raise OSError(f"Steam did not start Mirror's Edge within {start_timeout:.0f} s (is Steam running and "
+                          f"logged in, with the game installed and Proton chosen?)")
+
+    def poll(self) -> int | None:
+        if self.returncode is None and not Path(f"/proc/{self.pid}").exists():
+            self.returncode = 0         # Not ours to wait for: the exit code is Steam's
+        return self.returncode
+
+    def wait(self, timeout: float) -> int:
+        deadline = time.monotonic() + timeout
+        while self.poll() is None:
+            if time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired("MirrorsEdge.exe", timeout)
+            time.sleep(0.25)
+        return self.returncode or 0
+
+    def kill(self) -> None:
+        for pid in devtest.game_pids() or [self.pid]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def run(game_dir: Path, timeout: float, on_progress=None, close: bool = True) -> Result:
     """Starts the game, waits for the self-test to finish and the game to close (or `timeout` seconds).
 
@@ -164,7 +274,7 @@ def run(game_dir: Path, timeout: float, on_progress=None, close: bool = True) ->
     start = datetime.now()
     t0 = time.monotonic()
     try:
-        proc = subprocess.Popen([str(game_dir / devtest.GAME_EXE)], cwd=game_dir)
+        proc = _LinuxGame() if LINUX else subprocess.Popen([str(game_dir / devtest.GAME_EXE)], cwd=game_dir)
     except OSError as e:
         if getattr(e, "winerror", None) == 740:   # ERROR_ELEVATION_REQUIRED
             raise ElevationRequired() from e
@@ -237,6 +347,8 @@ def _environment_problem(res: Result, steam_error: str) -> str:
 
 def _steam_error_window() -> str:
     """The title of a visible Steam error window, if there is one ("Steam Error", the P:0000065432 load error)."""
+    if LINUX:
+        return ""
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows.argtypes = [proc_type, wintypes.LPARAM]
@@ -266,6 +378,8 @@ def _read(path: Path) -> dict | None:
 
 def compat_layers() -> str:
     """The compatibility layers set on MirrorsEdge.exe for this user ("" if none), e.g. "~ RUNASADMIN WINXPSP3"."""
+    if LINUX:
+        return ""
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,

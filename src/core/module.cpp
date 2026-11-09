@@ -1,5 +1,6 @@
 #include "core/module.h"
 #include "core/clock.h"
+#include "core/profile.h"
 #include "core/keys.h"
 #include "core/notify.h"
 #include "core/scheduler.h"
@@ -128,6 +129,7 @@ void modules::Render()
 {
     for (auto& m : g_modules) {
         if (!m->Enabled()) continue;
+        PROF_ZONE_NAMED(m->Name().c_str(), m->Name().size());
         const clk::Ticks t0 = clk::Now();
         m->OnRender();
         sched::RecordRender(*m, clk::Micros(clk::Now() - t0));
@@ -159,6 +161,7 @@ void modules::OnKey(int vk)
         if (keys::Fires(binding, vk, mods)) best = std::max(best, keys::Specificity(binding));
     };
     for (auto& m : g_modules) {
+        if (m->Hidden()) continue;
         consider(m->key);
         for (ctl::Setting* s : m->Settings()) {
             consider(s->key);
@@ -169,6 +172,7 @@ void modules::OnKey(int vk)
     const auto fires = [&](int binding) { return keys::Fires(binding, vk, mods) && keys::Specificity(binding) == best; };
 
     for (auto& m : g_modules) {
+        if (m->Hidden()) continue;
         if (fires(m->key)) {
             m->Toggle();
             if (!m->IsAction()) notify::Push(m->Name() + ": " + (m->Enabled() ? "ON" : "OFF"));

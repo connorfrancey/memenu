@@ -1,4 +1,5 @@
 #include "game/object_ref.h"
+#include "core/string_cache.h"
 
 #include <mutex>
 #include <unordered_map>
@@ -8,7 +9,7 @@ namespace game
 	namespace 
 	{
 		std::mutex g_nameMutex;
-		std::unordered_map<std::string, int> g_names;
+		std::unordered_map<str::Atom, int> g_names;		// Interned: a lookup builds no std::string
 		cache::Stats& g_nameStats = cache::Register("FName lookups", cache::Scope::Manual);
 
 	}
@@ -20,10 +21,11 @@ namespace game
 
 	int NameIndex(const char* name)
 	{
+		const str::Atom key = str::Intern(name);
 		if (opt::kEnabled)	// No optimizations: walk the name table on every call
 		{
 			std::lock_guard lock(g_nameMutex);
-			if (auto it = g_names.find(name); it != g_names.end())
+			if (auto it = g_names.find(key); it != g_names.end())
 			{
 				g_nameStats.hits.fetch_add(1, std::memory_order_relaxed);
 				return it->second;
@@ -41,7 +43,7 @@ namespace game
 		if (opt::kEnabled && found >= 0)
 		{
 			std::lock_guard lock(g_nameMutex);
-			g_names.emplace(name, found);
+			g_names.emplace(key, found);
 		}
 		return found;
 	}

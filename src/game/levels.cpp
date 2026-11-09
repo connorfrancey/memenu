@@ -4,6 +4,7 @@
 #include <Windows.h>
 
 #include "game/uobject.h"
+#include "runtime/engine_calls.h"
 
 #include <ME_SDK.hpp>
 #include <spdlog/spdlog.h>
@@ -276,8 +277,7 @@ namespace levels
             const std::wstring level = Widen(map.file), checkpointName = Widen(cp.name), mode = Widen(map.gameMode),
                                url;
             // Same call the game's own level-select menu makes. Achievements stay off for loads made from here.
-            data->StartGame(Classes::FString(level.c_str()), Classes::FString(checkpointName.c_str()),
-                            Classes::FString(mode.c_str()), Classes::FString(url.c_str()), saveProgress, false);
+            mirage::engine::StartGame(data, level, checkpointName, mode, url, saveProgress, false);
             SetMessage("StartGame " + map.file + (cp.name.empty() ? "" : " @ " + cp.name));
         });
     }
@@ -288,7 +288,7 @@ namespace levels
         {
             if (auto* data = FindGameData())
             {
-                data->RestartFromLastCheckpoint(false, false);
+                mirage::engine::RestartFromLastCheckpoint(data, false, false);
                 SetMessage("Restarting from last checkpoint");
             }
             else SetMessage("Game data store not found");

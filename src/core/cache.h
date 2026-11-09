@@ -20,9 +20,23 @@
 // Every cache registers named statistics (hits, misses, time spent recomputing) that the performance monitor shows.
 // A Value belongs to one thread (in practice the game thread): it is not locked. The statistics are atomics, so any
 // thread may read them. Names of game objects: see game/object_ref.h.
-namespace cache 
+//
+// More caches, each in its own header:
+//   core/ttl_cache.h         cache::TtlMap       keyed values that expire a set time after they were stored
+//   core/lru_cache.h         cache::Lru          keyed values, at most N: the least recently used one goes first
+//   core/memory_cache.h      mem::Cache          values read from game memory (crash-safe), per tick/level/TTL
+//   core/signature_cache.h   sig::Cache          byte pattern scan results, kept on disk for the same game exe
+//   core/address_cache.h     addr::Cache         named addresses and pointer chains
+//   core/function_cache.h    cache::Memo         a function's results by its arguments (memoization)
+//   core/negative_cache.h    cache::NegativeCache  lookups that failed, not tried again for a while
+//   core/string_cache.h      str::Intern         one shared copy of each name; compared by pointer
+//   core/hardware.h          hw::Get             CPU, memory, OS and GPU, queried once
+//   game/object_cache.h      game::FindObject    game objects by full name, checked alive on every use
+namespace cache
 {
-	enum class Scope : std::uint8_t { Tick, Level, Timed, Manual };
+	// Tick/Level/Timed/Manual: when a value goes stale (see above). Lru and Persistent only label statistics: an LRU
+	// cache (bounded by size, not time) and one that is kept on disk between sessions.
+	enum class Scope : std::uint8_t { Tick, Level, Timed, Manual, Lru, Persistent };
 	
 	// ---- Epochs (bumped by the game layer) ---------------------------------------------------------------------------------------------------
 	std::uint32_t TickEpoch();
@@ -38,6 +52,8 @@ namespace cache
 		std::atomic<std::uint64_t> hits{0}, misses{0};
 		std::atomic<std::uint64_t> computeTicks{0};			// Clock ticks spent computing (all misses)
 		std::atomic<std::uint64_t> invalidations{0};
+		std::atomic<std::uint64_t> evictions{0};			// Keyed caches: entries dropped to make room or expired
+		std::atomic<std::uint64_t> entries{0};				// Keyed caches: entries held now (1 or 0 for a Value)
 	};
 	// Stats live as long as the process (never freed), so a pointer to them is always valid.
 	Stats& Register(std::string name, Scope scope);
@@ -46,12 +62,53 @@ namespace cache
 	{
 		std::string name;
 		Scope scope;
-		std::uint64_t hits, misses, invalidations;
+		std::uint64_t hits, misses, invalidations, evictions, entries;
 		double computeSeconds;
 	};
 	std::vector<StatsView> Snapshot();
-	
+
 	const char* ScopeName(Scope scope);
+
+	// ---- Freshness, shared by every cache ----------------------------------------------------------------------------------------------------
+	// The stamp to store with a value computed now, and whether a value stored with `stamp` is still fresh. Timed stamps
+	// are clock ticks, Tick/Level ones epochs; Manual/Lru/Persistent values never go stale on their own.
+	inline std::uint64_t StampFor(Scope scope, clk::Ticks now)
+	{
+		switch (scope)
+		{
+			case Scope::Tick: return TickEpoch();
+			case Scope::Level: return LevelEpoch();
+			case Scope::Timed: return now;
+			default: return 0;
+		}
+	}
+	inline bool IsFresh(Scope scope, std::uint64_t stamp, clk::Ticks ttl, clk::Ticks now)
+	{
+		switch (scope)
+		{
+			case Scope::Tick: return stamp == TickEpoch();
+			case Scope::Level: return stamp == LevelEpoch();
+			case Scope::Timed: return now - stamp < ttl;
+			default: return true;
+		}
+	}
+
+	// Times a computation into `stats` (one miss).
+	template <class F>
+	decltype(auto) Compute(Stats& stats, F&& compute)
+	{
+		struct Timer
+		{
+			Stats& s;
+			clk::Ticks t0 = clk::Now();
+			~Timer()
+			{
+				s.misses.fetch_add(1, std::memory_order_relaxed);
+				s.computeTicks.fetch_add(clk::Now() - t0, std::memory_order_relaxed);
+			}
+		} timer{stats};
+		return std::forward<F>(compute)();
+	}
 	
 	// ---- A cached value ----------------------------------------------------------------------------------------------------------------------
 	template <class T>
@@ -71,46 +128,30 @@ namespace cache
 				stats_->hits.fetch_add(1, std::memory_order_relaxed);
 				return value_;
 			}
-			const clk::Ticks t0 = clk::Now();
-			value_ = std::forward<F>(compute)();
-			const clk::Ticks t1 = clk::Now();
-			stamp_ = Stamp(t1);
+			value_ = Compute(*stats_, std::forward<F>(compute));
+			stamp_ = StampFor(scope_, clk::Now());
+			if (!valid_) stats_->entries.store(1, std::memory_order_relaxed);
 			valid_ = true;
-			stats_->misses.fetch_add(1, std::memory_order_relaxed);
-			stats_->computeTicks.fetch_add(t1 - t0, std::memory_order_relaxed);
 			return value_;
 		}
 
 		void Invalidate()
 		{
-			if (valid_) stats_->invalidations.fetch_add(1, std::memory_order_relaxed);
+			if (valid_)
+			{
+				stats_->invalidations.fetch_add(1, std::memory_order_relaxed);
+				stats_->entries.store(0, std::memory_order_relaxed);
+			}
 			valid_ = false;
 		}
 
 		bool Valid() const { return valid_; }
 
 	private:
-		std::uint64_t Stamp(clk::Ticks now) const 
-		{
-			switch (scope_) 
-			{
-				case Scope::Tick: return TickEpoch();
-				case Scope::Level: return LevelEpoch();
-				case Scope::Timed: return now;
-				default: return 0;
-			}
-		}
-		
 		bool Fresh() const
 		{
 			if (!opt::kEnabled || !valid_) return false;	// No optimizations: recompute on every Get()
-			switch (scope_) 
-			{
-				case Scope::Tick: return stamp_ == TickEpoch();
-				case Scope::Level: return stamp_ == LevelEpoch();
-				case Scope::Timed: return clk::Now() - stamp_ < ttl_;
-				default: return true;
-			}
+			return IsFresh(scope_, stamp_, ttl_, scope_ == Scope::Timed ? clk::Now() : 0);
 		}
 		
 		Stats* stats_;

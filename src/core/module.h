@@ -41,6 +41,9 @@ public:
 	int Order() const { return order_; }
 	
 	virtual bool IsAction() const { return false; }
+	// Left out of the menu, the search, the hotkey list and key presses while true (developer-only modules while
+	// developer mode is off). Its saved state and settings are kept. Any thread.
+	virtual bool Hidden() const { return false; }
 	bool Enabled() const { return enabled_; }
 	void SetEnabled(bool on);					// Calls OnEnable/OnDisable, and switches off the rest of its group
 	void Toggle();								// Action modules run OnTrigger instead

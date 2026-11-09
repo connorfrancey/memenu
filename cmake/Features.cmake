@@ -171,6 +171,7 @@ memenu_feature(crosshair         visual STAGE 5 FILES features/visual/crosshair.
 memenu_feature(input_overlay     visual STAGE 5 FILES features/visual/input_overlay.cpp features/visual/input_layout.cpp)
 memenu_feature(fov               visual GAME STAGE 9 FILES features/visual/fov.cpp)
 memenu_feature(show_fps          visual STAGE 5 FILES features/visual/show_fps.cpp)
+memenu_feature(info_lines        visual GAME STAGE 7 FILES features/visual/info_lines.cpp)
 memenu_feature(frame_rate        visual GAME STAGE 9 FILES features/visual/frame_rate.cpp)
 memenu_feature(clear_frame       visual GAME STAGE 9 FILES features/visual/clear_frame.cpp)
 
@@ -178,6 +179,7 @@ memenu_feature(clear_frame       visual GAME STAGE 9 FILES features/visual/clear
 memenu_feature(collision_view    debug GAME STAGE 11 FILES features/debug/collision_view.cpp)
 memenu_feature(log_viewer        debug      STAGE 4  FILES features/debug/log_viewer.cpp)
 memenu_feature(performance       debug      STAGE 5  FILES features/debug/performance.cpp)
+memenu_feature(self_test         debug      STAGE 4  FILES features/debug/self_test.cpp)   # Shown in developer mode only
 
 # Levels
 memenu_feature(level_loader      levels GAME STAGE 8 FILES features/levels/level_loader.cpp)

@@ -1,5 +1,7 @@
 #include "selftest.h"
 
+#include "config.h"
+#include "core/devmode.h"
 #include "core/module.h"
 #include "core/notify.h"
 #include "core/scheduler.h"
@@ -16,12 +18,20 @@
 #include "game/levels.h"
 #include "game/player_state.h"
 #include "game/save_library.h"
+#include "runtime/call.h"
+#include "runtime/engine_calls.h"
+#include "runtime/layout.h"
+#include "runtime/lua_vm.h"
+#include "runtime/packages.h"
 #if MEMENU_FEATURE_SPEEDRUN_TIMER
 #include "speedrun/live.h"
 #endif
 #if MEMENU_FEATURE_COLLISION_VIEW
 #include "game/debug_world.h"
 #include "game/static_world.h"
+#endif
+#if MEMENU_FEATURE_INFO_LINES
+#include "features/visual/info_lines.h"
 #endif
 #if MEMENU_FEATURE_KICKGLITCH_HELPER
 #include "features/trainer/kickglitch_helper.h"
@@ -85,6 +95,7 @@ struct Options {
     // The engine's frame rate cap (62) off while testing, and TAS playbacks that don't depend on pacing as fast as they
     // go: the waits count frames and ticks, so they pass as fast as the PC draws. Off: the game as players run it.
     bool fast = true;
+    bool keepLevel = false;     // Run from the menu: test in the level the player is in (no level load)
 };
 
 struct Step {
@@ -99,7 +110,16 @@ Options g_options;
 std::vector<Step> g_steps;
 std::string g_current;          // Step in progress (written to the result, so a crash shows where it was)
 ULONGLONG g_started = 0;
-bool g_aborted = false;         // Unload requested in the middle: stop testing
+bool g_aborted = false;         // Unload requested (or Stop) in the middle: stop testing
+
+// Runs from the menu (developer mode, Start): on a thread of their own, published for the Test module's window
+std::atomic<bool> g_stop{false};        // Stop(): the waits give up, the run ends and puts everything back
+std::atomic<bool> g_restoring{false};   // Putting settings back: waits work even after Stop or an unload request
+std::atomic<bool> g_interactive{false}; // A run from the menu is going
+std::thread g_worker;
+std::mutex g_publishMutex;
+Progress g_published;
+int g_runs = 0;
 
 // Buttons that would open windows on the desktop, delete files or run for minutes: never pressed
 const std::set<std::string> kNoPress = {"Open log file", "Open themes folder", "Open save states folder",
@@ -130,8 +150,27 @@ std::set<std::string> SplitList(const std::string& s)
 
 std::filesystem::path ResultPath() { return paths::Dir() / "selftest-result.json"; }
 
+// Copies the steps for the Test module's window (any thread reads them through Snapshot)
+void Publish()
+{
+    std::lock_guard lock(g_publishMutex);
+    g_published.seconds = static_cast<double>(GetTickCount64() - g_started) / 1000.0;
+    g_published.steps.clear();
+    for (const Step& st : g_steps) {
+        StepView v;
+        v.name = st.name;
+        v.seconds = st.seconds;
+        v.problems = st.problems;
+        v.notes = st.notes;
+        const bool current = &st == &g_steps.back() && st.name == g_current;
+        v.state = !st.ok ? StepView::State::Failed : current ? StepView::State::Running : StepView::State::Passed;
+        g_published.steps.push_back(std::move(v));
+    }
+}
+
 void WriteResult(bool finished)
 {
+    Publish();
     json root;
     root["finished"] = finished;
     bool passed = !g_steps.empty();
@@ -160,12 +199,18 @@ void WriteResult(bool finished)
 }
 
 // ---- Waiting --------------------------------------------------------------------------------------------------------
+// Unload requested or Stop() pressed: the test ends. Not while settings are put back afterwards (that must finish).
+bool Interrupted()
+{
+    return !g_restoring && (g_stop || unload::Requested());
+}
+
 // Sleeps in small steps; false if unload was requested meanwhile (the test stops then).
 bool Wait(double seconds)
 {
     const ULONGLONG end = GetTickCount64() + static_cast<ULONGLONG>(seconds * 1000.0);
     while (GetTickCount64() < end) {
-        if (unload::Requested()) { g_aborted = true; return false; }
+        if (Interrupted()) { g_aborted = true; return false; }
         Sleep(1);
     }
     return true;
@@ -177,7 +222,7 @@ bool WaitFor(double seconds, const std::function<bool()>& cond)
     const ULONGLONG end = GetTickCount64() + static_cast<ULONGLONG>(seconds * 1000.0);
     while (GetTickCount64() < end) {
         if (cond()) return true;
-        if (unload::Requested()) { g_aborted = true; return false; }
+        if (Interrupted()) { g_aborted = true; return false; }
         Sleep(1);
     }
     return cond();
@@ -366,6 +411,55 @@ Expectation ExpectationFor(Module& m)
                 [] { auto* w = game::World();
                      return Expect(w && std::fabs(w->TimeDilation - 1.f) < 0.01f, "TimeDilation not back to 1"); }};
     }
+#if MEMENU_FEATURE_INFO_LINES
+    if (name == "Info Lines") {
+        // The built-in example (a profile without a file), never the player's own: it must parse and evaluate without a
+        // problem, draw lines with a player in the level, and its values must be the game's (x through fmt).
+        static std::string savedProfile;
+        static bool savedExpanded = false;
+        static unsigned long long editorFramesBefore = 0;
+        static constexpr const char* kTestProfile = "selftest (built-in example)";
+        // The setting is read on the render thread: changed there too.
+        return {[&m] {
+                    editorFramesBefore = info_lines::EditorFrames();
+                    hooks::RunOnRenderThread([&m] {
+                        if (auto* t = dynamic_cast<ctl::Text*>(m.FindSetting("Profile"))) {
+                            savedProfile = t->Get();
+                            t->Set(kTestProfile);
+                        }
+                        savedExpanded = m.expanded;
+                        m.expanded = true;                      // Its editor is drawn while the menu is open
+                        info_lines::SetEditorOpenForTest(true);
+                    });
+                },
+                [] { return WithPlayer([](ATdPlayerPawn* p, ATdPlayerController*) -> std::string {
+                    const info_lines::Status st = info_lines::LastStatus();
+                    if (st.frames == 0) return "it never drew";
+                    if (st.profile != kTestProfile) return "it shows profile '" + st.profile + "', not the test's";
+                    if (!st.errors.empty())
+                        return "the example has problems: line " + std::to_string(st.errors[0].line) + ": " + st.errors[0].message;
+                    if (st.lines == 0) return "the example drew no lines with a player in the level";
+                    std::vector<hud::Error> errors;
+                    const std::string text = info_lines::Evaluate("{x:.0f}|{statename}|{map}", &errors);
+                    if (!errors.empty()) return "evaluating values: " + errors[0].message;
+                    const std::size_t bar = text.find('|');
+                    const double x = std::atof(text.substr(0, bar).c_str());
+                    if (std::fabs(x - p->Location.X) > 100.0)
+                        return "{x} is " + text.substr(0, bar) + ", the player is at X " + std::to_string(p->Location.X);
+                    if (text.find("|?") != std::string::npos || text.back() == '|')
+                        return "a value is missing: '" + text + "'";
+                    return std::string(); }); },
+                [&m] {
+                    hooks::RunOnRenderThread([&m] {
+                        if (auto* t = dynamic_cast<ctl::Text*>(m.FindSetting("Profile"))) t->Set(savedProfile);
+                        m.expanded = savedExpanded;
+                        info_lines::SetEditorOpenForTest(false);
+                    });
+                    if (info_lines::EditorFrames() == editorFramesBefore) return std::string("its editor was never drawn");
+                    return std::string();
+                }};
+    }
+#endif
     if (name == "Save State")
         return {[] { player_state::Clear(); if (auto* p = game::Pawn()) g_savedAt = p->Location; },
                 [] { return Expect(player_state::HasSave(), "no state was saved"); }, {}};
@@ -376,8 +470,9 @@ Expectation ExpectationFor(Module& m)
                     if (d >= 150.f) return "the player is " + std::to_string(static_cast<int>(d)) +
                                            " units from the saved position after loading it";
                     // The controller left in its default state ignores movement and jump input after a load. (The SDK's
-                    // GetStateName() always answers None; IsInState works.)
-                    return c->IsInState(game::Name("PlayerWalking"), false)
+                    // GetStateName() always answers None; game::IsInState works.)
+                    if (game::IsInState(c, "Dead")) return std::string("the controller reads as Dead: the state check is broken");
+                    return game::IsInState(c, "PlayerWalking")
                                ? std::string()
                                : std::string("the controller is not in PlayerWalking after loading (no move or jump input)"); }); },
                 {}};
@@ -408,7 +503,7 @@ Expectation ExpectationFor(Module& m)
                     const float d = Distance(p->Location, g_savedAt);
                     if (d >= 150.f) return "the player is " + std::to_string(static_cast<int>(d)) +
                                            " units from the stored position after loading it";
-                    return Expect(c->IsInState(game::Name("PlayerWalking"), false),
+                    return Expect(game::IsInState(c, "PlayerWalking"),
                                   "the controller is not in PlayerWalking after loading");
                 }); },
                 [] {
@@ -447,14 +542,22 @@ Expectation ExpectationFor(Module& m)
                 [] { return WithPlayer([](ATdPlayerPawn*, ATdPlayerController* c) {
                     return Expect(c->PlayerCamera && !c->PlayerCamera->bLockedFOV, "the camera's FOV is still locked"); }); }};
     }
-    if (name == "Teleport to Spawn")
-        return {[] { if (auto* p = game::Pawn()) { p->Location.Z += 600.f; p->Location.X += 300.f; g_savedAt = p->Location; } },
-                [] { return WithPlayer([](ATdPlayerPawn* p, ATdPlayerController*) {
+    if (name == "Teleport to Spawn") {
+        // Moved away and turned a quarter: the teleport must bring both back (the turn is SetRotation, a native-index
+        // function the SDK's call never ran)
+        static int turnedYaw = 0;
+        return {[] {
+                    if (auto* p = game::Pawn()) { p->Location.Z += 600.f; p->Location.X += 300.f; g_savedAt = p->Location; }
+                    if (auto* c = game::Controller()) { c->Rotation.Yaw += 16384; turnedYaw = static_cast<int>(c->Rotation.Yaw); }
+                },
+                [] { return WithPlayer([](ATdPlayerPawn* p, ATdPlayerController* c) {
                     char where[160];
                     std::snprintf(where, sizeof where, "the player was not moved: at (%.0f, %.0f, %.0f), moved away to (%.0f, %.0f, %.0f)",
                                   p->Location.X, p->Location.Y, p->Location.Z, g_savedAt.X, g_savedAt.Y, g_savedAt.Z);
-                    return Distance(p->Location, g_savedAt) > 200.f ? std::string() : std::string(where); }); },
+                    if (Distance(p->Location, g_savedAt) <= 200.f) return std::string(where);
+                    return Expect(static_cast<int>(c->Rotation.Yaw) != turnedYaw, "the view was not turned to the spawn point (SetRotation)"); }); },
                 {}};
+    }
     if (name == "Levels")
         return {{}, [] { return Expect(!levels::Maps().empty(), "the level list is empty"); }, {}};
     if (name == "Sublevels")
@@ -508,6 +611,7 @@ public:
         spdlog::error("Self-test: {}: {}", step_.name, text);
         step_.ok = false;
         step_.problems.push_back(std::move(text));
+        Publish();
     }
 
 private:
@@ -570,6 +674,17 @@ bool TestGame()
 
 bool TestLevel()
 {
+    if (g_options.keepLevel) {
+        Step& s = Begin("level (current)");
+        Probe p(s);
+        if (!game::GetStatus().hasPawn || game::IsLoading())
+            p.Problem("no player here: load a level first, or let the test load one");
+        else if (const std::string why = WaitPlayerReady(10.0); !why.empty())
+            p.Problem("the player can't be moved here: " + why);
+        p.Check(1, true);
+        End(s);
+        return s.ok;
+    }
     if (Lower(g_options.map) == "none") return true;
     Step& s = Begin("level " + g_options.map);
     Probe p(s);
@@ -1814,7 +1929,7 @@ void TestKickglitchHelper()
         pawn->Location.Z += 150.f;
         pawn->Velocity = Classes::FVector{};
         pawn->Physics = Classes::EPhysics::PHYS_Falling;
-        pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+        mirage::engine::SetMove(pawn, Classes::EMovement::MOVE_Falling);
         if (tool) tool->SetEnabled(true);
     });
     WaitTicks(1);
@@ -1870,7 +1985,7 @@ void TestAutoKickglitch()
         pawn->Location.Z += 150.f;
         pawn->Velocity = Classes::FVector{};
         pawn->Physics = Classes::EPhysics::PHYS_Falling;
-        pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+        mirage::engine::SetMove(pawn, Classes::EMovement::MOVE_Falling);
     });
     WaitTicks(1);
     OnGameThread([] { if (auto* pawn = game::Pawn()) pawn->MovementState = Classes::EMovement::MOVE_MeleeWallrun; });
@@ -1915,7 +2030,7 @@ void TestAutoKickglitch()
             pawn->Location.Z += 400.f;
             pawn->Velocity = Classes::FVector{};
             pawn->Physics = Classes::EPhysics::PHYS_Falling;
-            pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+            mirage::engine::SetMove(pawn, Classes::EMovement::MOVE_Falling);
         });
         WaitTicks(2);
         bool airKick = false;
@@ -2020,7 +2135,7 @@ void TestEngineStateHook()
             pawn->Location.Z += 150.f;
             pawn->Velocity = Classes::FVector{};
             pawn->Physics = Classes::EPhysics::PHYS_Falling;
-            pawn->SetMove(Classes::EMovement::MOVE_Falling, false, false);
+            mirage::engine::SetMove(pawn, Classes::EMovement::MOVE_Falling);
         });
         if (!WaitFor(3.0, [&] { return !strang->Enabled(); })) p->Problem("Strang was still armed after a new move began");
         else s.notes.push_back("Strang fired on the state change");
@@ -2146,6 +2261,211 @@ void TestFrameRate()
 #endif
 
 // "set" on the engine object, read back from the object itself.
+// Mirage step 1: UnrealLib reads the game's script packages inside the game, and Lua runs, without stopping the game
+// (the parse runs on this thread while the game keeps ticking and drawing), within a time and memory budget.
+void TestMirageRuntime()
+{
+    constexpr double kMaxSeconds = 20.0;
+    constexpr std::int64_t kMaxPeakBytes = 512ll << 20;
+    // Still allocated after the release, on a second run (the first keeps one-time setup): counted from the menu's own
+    // allocations (runtime/memory.h), so only the menu's other threads add a little noise. A leak repeats every run.
+    constexpr std::int64_t kMaxRetainedBytes = 1ll << 20;
+
+    Step& s = Begin("Mirage runtime");
+    Probe p(s);
+    const mirage::packages::Report pk = mirage::packages::Probe();
+    if (!pk.ok) {
+        p.Problem("UnrealLib: " + pk.error);
+    } else {
+        for (const auto& pkg : pk.packages)
+            s.notes.push_back(pkg.name + ": " + std::to_string(pkg.exports) + " exports, " + std::to_string(pkg.classes) +
+                              " classes, " + std::to_string(pkg.functions) + " functions");
+        char line[160];
+        std::snprintf(line, sizeof line, "UnrealLib: %zu classes, %zu properties in %.2f s, +%.0f MB loaded, +%.1f MB after",
+                      pk.classesRead, pk.properties, pk.seconds, static_cast<double>(pk.peakBytes) / 1048576.0,
+                      static_cast<double>(pk.retainedBytes) / 1048576.0);
+        s.notes.push_back(line);
+        if (pk.seconds > kMaxSeconds)
+            p.Problem("reading the script packages took " + std::to_string(pk.seconds) + " s (budget " +
+                      std::to_string(kMaxSeconds) + " s)");
+        const mirage::packages::Report again = mirage::packages::Probe();
+        std::snprintf(line, sizeof line, "second run: %.2f s, +%.0f MB loaded, +%.1f MB after", again.seconds,
+                      static_cast<double>(again.peakBytes) / 1048576.0, static_cast<double>(again.retainedBytes) / 1048576.0);
+        s.notes.push_back(line);
+        const std::int64_t peak = std::max(pk.peakBytes, again.ok ? again.peakBytes : 0);
+        if (peak > kMaxPeakBytes)
+            p.Problem("reading the script packages used " + std::to_string(peak >> 20) + " MB (budget " +
+                      std::to_string(kMaxPeakBytes >> 20) + " MB)");
+        if (!again.ok) p.Problem("UnrealLib, second run: " + again.error);
+        else if (again.retainedBytes > kMaxRetainedBytes)
+            p.Problem("a second run left " + std::to_string(again.retainedBytes >> 10) +
+                      " KB more allocated after UnrealLib released everything: a leak");
+    }
+
+    const mirage::lua::ProbeReport lua = mirage::lua::Probe();
+    for (const std::string& problem : lua.problems) p.Problem("Lua: " + problem);
+    if (lua.ok)
+        s.notes.push_back(std::string(mirage::lua::Version()) + ": " + std::to_string(lua.notes.size()) + " checks passed");
+
+    p.Check(1, true);       // The game kept drawing and ticking meanwhile
+    End(s);
+}
+
+// Mirage step 2: the layouts UnrealLib computes from the script packages are the engine's own, for every class, struct,
+// function and state of Core, Engine and TdGame. Every difference goes to memenu\mirage-layouts.txt.
+// Mirage step 2: calls with the engine's own parameter layout, native functions with a native index included (the SDK's
+// IsInState and SetLocation answered garbage: ProcessEvent refuses those, and its bool parameters were 1 byte).
+void TestMirageCalls()
+{
+    Step& s = Begin("Mirage calls");
+    Probe p(s);
+    std::vector<std::string> problems;
+    OnGameThread([&] {
+        auto* pawn = game::Pawn();
+        auto* pc = game::Controller();
+        if (!pawn || !pc) { problems.push_back("no player"); return; }
+        std::string why;
+        if (!mirage::call::LayoutChecked(&why)) { problems.push_back("UFunction layout: " + why); return; }
+        const auto call = [&](Classes::UObject* o, mirage::call::Params& params, const char* what) {
+            std::string error;
+            if (!params.Valid() || !mirage::call::Call(o, params, &error))
+                problems.push_back(std::string(what) + ": " + (params.Valid() ? error : params.Error()));
+        };
+
+        // IsInState (native 281), against the state read from the state frame
+        for (const char* state : {"PlayerWalking", "Dead"}) {
+            mirage::call::Params is(pc, "IsInState");
+            is.SetName("TestState", state);
+            is.Set("bTestStateStack", false);
+            call(pc, is, "IsInState");
+            const bool want = game::IsInState(pc, state);
+            if (is.GetBool("ReturnValue") != want)
+                problems.push_back(std::string("IsInState(") + state + ") answered " + (want ? "false" : "true"));
+        }
+
+        // SetLocation (native 267): the player really moves
+        const Classes::FVector before = pawn->Location;
+        Classes::FVector target = before;
+        target.Z += 64.f;
+        mirage::call::Params at(pawn, "SetLocation");
+        at.SetRaw("NewLocation", &target, sizeof target);
+        call(pawn, at, "SetLocation");
+        const float moved = pawn->Location.Z - before.Z;
+        if (!at.GetBool("ReturnValue")) problems.push_back("SetLocation returned false");
+        else if (std::fabs(moved - 64.f) > 1.f)
+            problems.push_back("SetLocation returned true but the player moved " + std::to_string(moved) + " up, not 64");
+        pawn->Location = before;
+
+        // SetMove (script, two bools before a bool return value). It returns false for the move the player is already in
+        // (`if (NewMove == MovementState) return false;`), true for a change: both answers must come back right.
+        const auto setMove = [&](Classes::EMovement m) {
+            mirage::call::Params move(pawn, "SetMove");
+            move.Set("NewMove", std::uint8_t{static_cast<std::uint8_t>(m)});
+            move.Set("bViaReplication", false);
+            move.Set("bCheckCanDo", false);
+            call(pawn, move, "SetMove");
+            return move.GetBool("ReturnValue");
+        };
+        using Classes::EMovement;
+        if (pawn->MovementState == EMovement::MOVE_Walking && setMove(EMovement::MOVE_Walking))
+            problems.push_back("SetMove(Walking) while walking returned true (the script returns false)");
+        if (!setMove(EMovement::MOVE_Crouch)) problems.push_back("SetMove(Crouch) returned false");
+        else if (pawn->MovementState != EMovement::MOVE_Crouch) problems.push_back("SetMove(Crouch) did not crouch");
+        if (!setMove(EMovement::MOVE_Walking)) problems.push_back("SetMove(Walking) after crouching returned false");
+        else if (pawn->MovementState != EMovement::MOVE_Walking) problems.push_back("SetMove(Walking) did not walk");
+
+        // Wrong types are refused, not written
+        mirage::call::Params wrong(pc, "IsInState");
+        if (wrong.Set("TestState", 1.f)) problems.push_back("a float was accepted for a name parameter");
+        if (wrong.Set("NoSuchParameter", true)) problems.push_back("an unknown parameter was accepted");
+        if (!problems.empty()) return;
+        s.notes.push_back("IsInState, SetLocation (native) and SetMove (script) answered like the engine");
+    }, 10.0);
+    for (const auto& problem : problems) p.Problem(problem);
+    WaitGrounded();
+    p.Check(1, true);
+    End(s);
+}
+
+void TestMirageLayouts()
+{
+    Step& s = Begin("Mirage layouts");
+    Probe p(s);
+    const std::vector<std::string> packages{"Core", "Engine", "TdGame"};
+
+    mirage::layout::Layouts live;
+    const clk::Ticks t0 = clk::Now();
+    if (!OnGameThread([&] { live = mirage::layout::Live(packages); }, 30.0)) p.Problem("reading the live layouts timed out");
+    const double liveSeconds = clk::SecondsSince(t0);
+    const clk::Ticks t1 = clk::Now();
+    const mirage::layout::Computed computed = mirage::layout::Compute(mirage::packages::CookedDir(), packages);
+    const double computeSeconds = clk::SecondsSince(t1);
+    if (!computed.error.empty()) p.Problem("UnrealLib: " + computed.error);
+
+    const mirage::layout::Report r = mirage::layout::Compare(live, computed.layouts);
+    char line[200];
+    std::snprintf(line, sizeof line, "%zu live (%.2f s), %zu computed (%.2f s); %zu compared: %zu match; properties %zu of %zu",
+                  live.size(), liveSeconds, computed.layouts.size(), computeSeconds, r.structs, r.structsMatching,
+                  r.propertiesMatching, r.properties);
+    s.notes.push_back(line);
+    if (r.onlyLive || r.onlyComputed)
+        s.notes.push_back(std::to_string(r.onlyLive) + " only in the engine, " + std::to_string(r.onlyComputed) +
+                          " only computed");
+    for (const auto& [cause, n] : r.byCause) s.notes.push_back("  " + std::to_string(n) + "x " + cause);
+
+    // Everything into a file, to read the differences one by one
+    const std::filesystem::path file = paths::Dir() / "mirage-layouts.txt";
+    {
+        std::ofstream out(file, std::ios::trunc);
+        out << line << "\n\n";
+        for (const auto& [cause, n] : r.byCause) out << n << "  " << cause << "\n";
+        out << "\n";
+        for (const auto& m : r.mismatches) out << m.path << ": " << m.what << "\n";
+        out << "\nOnly in the engine:\n";
+        for (const auto& path : r.onlyLivePaths) out << "  " << path << "\n";
+        out << "Only computed:\n";
+        for (const auto& path : r.onlyComputedPaths) out << "  " << path << "\n";
+        // Both sides of the structs named in MEMENU_LAYOUT_DETAIL (comma separated paths), property by property
+        out << "\n";
+        char* detail = nullptr;
+        std::size_t len = 0;
+        if (_dupenv_s(&detail, &len, "MEMENU_LAYOUT_DETAIL") == 0 && detail) {
+            std::string list = detail;
+            std::free(detail);
+            std::size_t start = 0;
+            while (start <= list.size()) {
+                const std::size_t comma = list.find(',', start);
+                const std::string path = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                start = comma == std::string::npos ? list.size() + 1 : comma + 1;
+                const mirage::layout::Layouts* const sides[] = {&live, &computed.layouts};
+                for (const auto* side : sides) {
+                    const auto it = side->find(path);
+                    out << (side == &live ? "live     " : "computed ") << path;
+                    if (it == side->end()) { out << ": none\n"; continue; }
+                    char head[96];
+                    std::snprintf(head, sizeof head, " (%s, size %#x, align %u, super %s)\n", it->second.kind.c_str(),
+                                  it->second.size, it->second.alignment, it->second.super.c_str());
+                    out << head;
+                    for (const auto& prop : it->second.properties) {
+                        char row[160];
+                        std::snprintf(row, sizeof row, "    %#06x %-10s x%u size %-4u mask %#x  %s %s\n", prop.offset,
+                                      mirage::layout::KindName(prop.kind), prop.arrayDim, prop.elementSize, prop.boolMask,
+                                      prop.name.c_str(), prop.type.c_str());
+                        out << row;
+                    }
+                }
+            }
+        }
+    }
+    if (!r.mismatches.empty())
+        p.Problem(std::to_string(r.mismatches.size()) + " structs differ from the engine (first: " +
+                  r.mismatches[0].path + ": " + r.mismatches[0].what + "); all in " + file.string());
+    if (r.structs == 0) p.Problem("nothing was compared");
+
+    p.Check(1, true);
+    End(s);
+}
+
 void TestEngineConsole()
 {
     Probe* p;
@@ -2249,7 +2569,7 @@ void TestEngineDeath()
             walking = WaitFor(30.0, [&] {
                 OnGameThread([&] {
                     auto* pc = game::Controller();
-                    walking = pc && game::Pawn() && pc->IsInState(game::Name("PlayerWalking"), false) &&
+                    walking = pc && game::Pawn() && game::IsInState(pc, "PlayerWalking") &&
                               !pc->bCinematicMode && !pc->bIgnoreMoveInput;
                     frozen = pc && pc->bFrozen;
                 }, 1.0);
@@ -2683,6 +3003,8 @@ void RestoreAll(const std::map<Module*, Saved>& saved)
 
 bool Selected(const Module& m)
 {
+    // The developer tools themselves: switching them would close the Test window (or developer mode) under the run
+    if (m.Name() == devmode::kModuleName || m.Name() == "Test") return false;
     if (!g_options.only.empty() && !g_options.only.count(m.Name())) return false;
     return !g_options.skip.count(m.Name());
 }
@@ -2885,6 +3207,67 @@ BOOL CALLBACK CloseGameWindow(HWND h, LPARAM)
     return TRUE;
 }
 
+// The feature tests, by name (--only / --skip pick them like modules). `fastTas`: its playbacks don't depend on pacing,
+// so in fast mode they run as fast as they go. `optIn`: measurements, only when picked by name.
+struct Named { const char* name; void (*run)(); bool fastTas; bool optIn = false; };
+
+const Named* FeatureList()
+{
+#if MEMENU_GAME
+    static const Named tests[] = {
+#if MEMENU_FEATURE_TAS
+        {"TAS macro", &TestTasMacro, true},
+        {"TAS camera keys", &TestTasCamera, true},
+        {"TAS go to and step", &TestTasGoto, true},
+        {"TAS desync fixing", &TestTasDesync, true},
+        {"TAS snapshots", &TestTasSnapshots, true},
+        {"TAS workflow", &TestTasWorkflow, false},      // Records and loops in real time
+        {"TAS memory survey", &TestTasMemorySurvey, false, true},   // Measurements only: --only
+        {"Rendering thread off", &TestRenderingThreadOff, false, true},
+#if MEMENU_FEATURE_INPUT_OVERLAY
+        {"Input overlay", &TestInputOverlay, true},
+#endif
+#endif
+#if MEMENU_FEATURE_KICKGLITCH_HELPER
+        {"Kickglitch helper", &TestKickglitchHelper, false},
+#endif
+#if MEMENU_FEATURE_AUTO_KICKGLITCH
+        {"Auto kickglitch", &TestAutoKickglitch, false},
+#endif
+#if MEMENU_FEATURE_KILL_BOTS
+        {"Kill bots", &TestKillBots, false},
+#endif
+#if MEMENU_FEATURE_KEY_BINDINGS
+        {"Keep key bindings", &TestKeepKeyBindings, false},
+#endif
+#if MEMENU_FEATURE_COLLISION_VIEW
+        {"Collision view inspect", &TestCollisionInspect, false},
+        {"Collision view static geometry", &TestCollisionStatic, false},
+#endif
+#if MEMENU_FEATURE_SPEEDRUN_TIMER
+        {"Speedrun timer", &TestSpeedrunTimer, false},
+#endif
+#if MEMENU_FEATURE_STRANG
+        {"Engine state hook", &TestEngineStateHook, false},
+#endif
+        {"Mirage runtime", &TestMirageRuntime, false},
+        {"Mirage layouts", &TestMirageLayouts, false},
+        {"Mirage calls", &TestMirageCalls, false},
+        {"Engine script events", &TestEngineScriptEvents, false},
+#if MEMENU_FEATURE_FRAME_RATE
+        {"Frame rate limit", &TestFrameRate, false},
+#endif
+        {"Engine console", &TestEngineConsole, false},
+        {"Engine death hook", &TestEngineDeath, false},     // Last: it restarts the checkpoint
+        {nullptr, nullptr, false},
+    };
+    return tests;
+#else
+    static const Named none[] = {{nullptr, nullptr, false}};
+    return none;
+#endif
+}
+
 } // namespace
 
 bool Requested()
@@ -2934,15 +3317,18 @@ void SetFrameRateCap(bool on)
 #endif
 }
 
-void Run()
+// The whole test (both ways: the `selftest` file and the Test module). Leaves the menu open when run from the menu.
+static void RunTests(bool fromMenu)
 {
-    if (!g_requested) return;
 #if MEMENU_GAME
-    game::OnLevelLoad(&OnLevelLoad);
+    static bool listening = false;      // Once: every run would add another callback
+    if (!listening) game::OnLevelLoad(&OnLevelLoad);
+    listening = true;
 #endif
 #if MEMENU_FEATURE_TAS
     // Hang watchdog: no frame for 8 s, the game's threads' stacks go to the log (once a hang)
     static std::atomic<bool> watching{true};
+    watching = true;                    // Again for every run
     std::thread watchdog([] {
         unsigned last = hooks::EndSceneCalls();
         ULONGLONG since = GetTickCount64();
@@ -2989,55 +3375,10 @@ void Run()
 
     if (TestFrames()) {
 #if MEMENU_GAME
-        if (TestGame() && !g_aborted && TestLevel() && !g_aborted && Lower(g_options.map) != "none") {
+        if (TestGame() && !g_aborted && TestLevel() && !g_aborted &&
+            (g_options.keepLevel || Lower(g_options.map) != "none")) {
             TestInputBlocking();
-            // The feature tests, by name (--only / --skip pick them like modules). `fastTas`: its playbacks don't
-            // depend on pacing, so in fast mode they run as fast as they go.
-            struct Named { const char* name; void (*run)(); bool fastTas; bool optIn = false; };
-            const Named tests[] = {
-#if MEMENU_FEATURE_TAS
-                {"TAS macro", &TestTasMacro, true},
-                {"TAS camera keys", &TestTasCamera, true},
-                {"TAS go to and step", &TestTasGoto, true},
-                {"TAS desync fixing", &TestTasDesync, true},
-                {"TAS snapshots", &TestTasSnapshots, true},
-                {"TAS workflow", &TestTasWorkflow, false},      // Records and loops in real time
-                {"TAS memory survey", &TestTasMemorySurvey, false, true},   // Measurements only: --only
-                {"Rendering thread off", &TestRenderingThreadOff, false, true},
-#if MEMENU_FEATURE_INPUT_OVERLAY
-                {"Input overlay", &TestInputOverlay, true},
-#endif
-#endif
-#if MEMENU_FEATURE_KICKGLITCH_HELPER
-                {"Kickglitch helper", &TestKickglitchHelper, false},
-#endif
-#if MEMENU_FEATURE_AUTO_KICKGLITCH
-                {"Auto kickglitch", &TestAutoKickglitch, false},
-#endif
-#if MEMENU_FEATURE_KILL_BOTS
-                {"Kill bots", &TestKillBots, false},
-#endif
-#if MEMENU_FEATURE_KEY_BINDINGS
-                {"Keep key bindings", &TestKeepKeyBindings, false},
-#endif
-#if MEMENU_FEATURE_COLLISION_VIEW
-                {"Collision view inspect", &TestCollisionInspect, false},
-                {"Collision view static geometry", &TestCollisionStatic, false},
-#endif
-#if MEMENU_FEATURE_SPEEDRUN_TIMER
-                {"Speedrun timer", &TestSpeedrunTimer, false},
-#endif
-#if MEMENU_FEATURE_STRANG
-                {"Engine state hook", &TestEngineStateHook, false},
-#endif
-                {"Engine script events", &TestEngineScriptEvents, false},
-#if MEMENU_FEATURE_FRAME_RATE
-                {"Frame rate limit", &TestFrameRate, false},
-#endif
-                {"Engine console", &TestEngineConsole, false},
-                {"Engine death hook", &TestEngineDeath, false},     // Last: it restarts the checkpoint
-                {nullptr, nullptr, false},
-            };
+            const Named* tests = FeatureList();
             for (const Named* t = tests; t->name && !g_aborted; ++t) {
                 if (!g_options.only.empty() && !g_options.only.count(t->name)) continue;
                 if (t->optIn && !g_options.only.count(t->name)) continue;
@@ -3060,10 +3401,18 @@ void Run()
         if (!g_aborted && g_options.only.empty()) TestAllOn(mods);
     }
     if (!g_aborted) Performance();
+    g_restoring = true;                 // Stopped or not: everything goes back the way it was
     if (g_options.fast) SetFrameRateCap(true);
     notify::SetMuted(false);
     RestoreAll(saved);
-    gui::visible = false;
+    g_restoring = false;
+    gui::visible = fromMenu;            // From the menu: the menu stays open on the results
+}
+
+void Run()
+{
+    if (!g_requested) return;
+    RunTests(false);
     spdlog::info("Self-test: done, unloading");
 }
 
@@ -3090,6 +3439,107 @@ void Finish(bool unloadedCleanly)
         spdlog::info("Self-test: closing the game");
         EnumWindows(CloseGameWindow, 0);
     }
+}
+
+// ---- Runs from the menu (developer mode) --------------------------------------------------------------------------------
+std::vector<TestInfo> FeatureTests()
+{
+    std::vector<TestInfo> out;
+    for (const Named* t = FeatureList(); t->name; ++t) out.push_back({t->name, t->optIn});
+    return out;
+}
+
+bool Running() { return g_interactive.load(); }
+
+void Stop()
+{
+    if (!g_interactive) return;
+    g_stop = true;
+    spdlog::info("Self-test: stopping...");
+}
+
+bool Start(RunOptions o)
+{
+    if (g_requested || g_interactive.exchange(true)) return false;   // A run (or the file's test) is going
+    if (g_worker.joinable()) g_worker.join();                        // The last run's thread: already done
+
+    g_options = Options{};
+    g_options.only = std::move(o.only);
+    g_options.keepLevel = !o.loadLevel;
+    g_options.map = o.map.empty() ? "edge_p" : o.map;
+    g_options.checkpoint = std::max(0, o.checkpoint);
+    g_options.ticks = std::clamp(o.ticks, 2u, 3600u);
+    g_options.fast = o.fast;
+    g_options.quit = false;
+    g_steps.clear();
+    g_current.clear();
+    g_aborted = false;
+    g_stop = false;
+    g_started = GetTickCount64();
+
+    // How many steps to expect, for the progress bar: frames, game, level, input blocking, the picked feature tests and
+    // modules, all modules on (full runs), performance
+    int planned = 2;
+#if MEMENU_GAME
+    planned += 2;
+    for (const Named* t = FeatureList(); t->name; ++t)
+        if (g_options.only.empty() ? !t->optIn : g_options.only.count(t->name) != 0) ++planned;
+#endif
+    modules::ForEach([&](modules::Tab&, Module& m) { if (Selected(m)) ++planned; });
+    if (g_options.only.empty()) ++planned;
+
+    std::vector<logging::Entry> ignored;
+    const std::uint64_t firstLog = logging::CopySince(0, ignored);
+    {
+        std::lock_guard lock(g_publishMutex);
+        g_published = Progress{};
+        g_published.running = true;
+        g_published.run = ++g_runs;
+        g_published.planned = planned;
+        g_published.firstLogId = firstLog;
+    }
+    spdlog::info("Self-test: run {} started: {}, {}, {} ticks per module, {}", g_runs,
+                 g_options.only.empty() ? "everything" : std::to_string(g_options.only.size()) + " test(s) picked",
+                 g_options.keepLevel ? "current level" : "level " + g_options.map, g_options.ticks,
+                 g_options.fast ? "fast mode" : "real speed");
+
+    g_worker = std::thread([] {
+        config::SetAutoSave(false);     // The test switches settings: never into the player's config (put back after)
+        RunTests(true);
+        WriteResult(true);              // selftest-result.json, like `memenu game-test`
+        int failed = 0;
+        for (const Step& st : g_steps) failed += st.ok ? 0 : 1;
+        const double seconds = static_cast<double>(GetTickCount64() - g_started) / 1000.0;
+        if (g_aborted)
+            spdlog::warn("Self-test: run stopped after {} steps ({} failed), {:.1f} s", g_steps.size(), failed, seconds);
+        else if (failed)
+            spdlog::error("Self-test: run FAILED: {} of {} steps failed, {:.1f} s", failed, g_steps.size(), seconds);
+        else
+            spdlog::info("Self-test: run PASSED: {} steps, {:.1f} s", g_steps.size(), seconds);
+        config::SetAutoSave(true);
+        {
+            std::lock_guard lock(g_publishMutex);
+            g_published.running = false;
+            g_published.stopped = g_aborted;
+            g_published.seconds = seconds;
+        }
+        g_interactive = false;
+    });
+    return true;
+}
+
+void Shutdown()
+{
+    if (g_interactive) g_stop = true;
+    if (g_worker.joinable()) g_worker.join();
+}
+
+Progress Snapshot()
+{
+    std::lock_guard lock(g_publishMutex);
+    Progress p = g_published;
+    if (p.running) p.seconds = static_cast<double>(GetTickCount64() - g_started) / 1000.0;
+    return p;
 }
 
 } // namespace selftest

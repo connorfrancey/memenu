@@ -3,14 +3,18 @@
 
 #include "config.h"
 #include "core/clock.h"
+#include "core/hardware.h"
 #include "core/module.h"
+#include "core/profile.h"
 #include "core/scheduler.h"
+#include "core/signature_cache.h"
 #include "diag.h"
 #include "failsafe.h"
 #include "hooks.h"
 #include "log.h"
 #include "paths.h"
 #include "selftest.h"
+#include "core/devmode.h"
 #include "test_mode.h"
 #include "unload.h"
 #if MEMENU_GAME
@@ -52,13 +56,16 @@ static void Run(HMODULE module)
     if (selfTest) config::SetAutoSave(false);      // The test changes settings: never into the player's config
 
     STARTUP_STEP(clk::Init());                // Before anything measures time (scheduler, caches)
+    prof::Start();                            // Tracy builds only: profiler threads (stopped after the hooks are gone)
     STARTUP_STEP(theme::Init());              // themes/ folder + built-in theme files
     STARTUP_STEP(modules::Init());            // Every module registered with MEM_MODULE
     STARTUP_STEP(modules::ApplyDefaults());   // Modules flagged enabledByDefault
     STARTUP_STEP(config::Load());             // Saved state overrides the defaults
+    devmode::ApplyBuild();                    // A developer build (memenu --dev) switches developer mode on
     STARTUP_STEP(sched::Init());              // Run order of the modules' OnTick
 
     const bool installed = STARTUP_STEP(hooks::Install());
+    spdlog::info("Hardware: {}", hw::Get().Summary());   // After the hooks: they add the GPU
     if (installed)
     {
 #if MEMENU_GAME
@@ -81,6 +88,7 @@ static void Run(HMODULE module)
         spdlog::info("Built without game integration (no game features enabled): menu only");
 #endif
 
+        sig::Game().Save();   // The pattern scans of startup: the next start skips them
         spdlog::info("Startup finished in {} ms; waiting for the game to draw a frame (EndScene)",
                      GetTickCount64() - attachedAt);
 
@@ -100,6 +108,7 @@ static void Run(HMODULE module)
             }
         }
         spdlog::info("Unload requested: unloading (EndScene ran {} times)", hooks::EndSceneCalls());
+        selftest::Shutdown();   // A run started from the Test module: stopped, settings put back (needs the hooks)
 
         config::Save();         // Save before DisableAll so the enabled state is kept
         modules::DisableAll();  // Modules queue their cleanup on the game thread...
@@ -119,6 +128,7 @@ static void Run(HMODULE module)
         if (selfTest) selftest::Finish(false);
     }
 
+    prof::Stop();           // After the hooks: nothing records zones any more
     spdlog::info("Unloading");
     testmode::Uninstall();
     diag::RemoveCrashLogger();

@@ -246,7 +246,7 @@ namespace
             bool header = false;
             for (Module* m : tab->modules)
             {
-                if (!Matches(*m, query)) continue;
+                if (m->Hidden() || !Matches(*m, query)) continue;
                 if (!header)
                 {
                     ImGui::Indent(8.f);
@@ -326,6 +326,7 @@ void gui::Render()
         {
             for (Module* m : tab->modules)
             {
+                if (m->Hidden()) continue;
                 if (m == reveal)    // From the search: bring this column forward and scroll to the module
                 {
                     ImGui::SetWindowFocus();

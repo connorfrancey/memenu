@@ -498,6 +498,7 @@ uv run memenu test            # unit tests (GoogleTest)
 uv run memenu install-game    # build and install into the game
 uv run memenu launch          # inject into a running game without installing
 uv run memenu package         # dist/memenu_installer-<version>.exe
+uv run memenu package --dll   # only the release DLL: dist/medge_menu-<version>.dll
 uv run memenu features        # every feature and whether it is built
 uv run memenu --copy-info     # diagnostic info (logs, builds, game, crashes) to the clipboard
 uv run memenu verbose-build   # build stage by stage and test every stage without the game
@@ -714,6 +715,16 @@ configuration, compiler, options, features). The format is described in `src/log
 
 Set `MEMENU_DEV=1` for developer mode: full tracebacks with local variables, timings, and `memenu dev ...`
 (`env`, `symbolize`, `logs`, `crashes`, `pe`, `host`, `unload`; see `tools/memenu_tools/devmode.py`).
+
+#### Profiling with Tracy
+
+`memenu build --tracy` builds the [Tracy](https://github.com/wolfpld/tracy) profiler client into the DLL (the
+build folder remembers it; `--no-tracy` takes it out again). Start the game, open the Tracy profiler and connect to
+`localhost`. It has to be the same Tracy version as `TRACY_VERSION` in `cmake/Versions.cmake`. You'll see a zone
+for every scheduler tick and every module's `OnTick` / `OnRender`, the menu's frame, and a plot of the
+scheduler's work per tick. Nothing is recorded until the profiler connects, and the client only listens on
+localhost. To time your own code, use `PROF_ZONE("name")` from `src/core/profile.h`. Without `--tracy` it
+compiles to nothing.
 
 ### Releasing
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 import ctypes
 import io
 import json
@@ -20,13 +21,33 @@ GAME_EXE = "MirrorsEdge.exe"
 
 # ---- the game process ----------------------------------------------------------------------------------------------
 def game_pids() -> list[int]:
-    """Process ids of running MirrorsEdge.exe (tasklist sees elevated processes too)."""
+    """Process ids of running MirrorsEdge.exe (tasklist sees elevated processes too; on Linux: Proton/Wine processes)."""
+    if sys.platform.startswith("linux"):
+        return linux_game_pids()
     out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {GAME_EXE}", "/FO", "CSV", "/NH"],
                          capture_output=True, text=True, check=False).stdout
     pids = []
     for row in csv.reader(io.StringIO(out)):
         if len(row) > 1 and row[0].lower() == GAME_EXE.lower():
             pids.append(int(row[1]))
+    return pids
+
+
+def linux_game_pids() -> list[int]:
+    """The Wine processes running MirrorsEdge.exe (Proton starts it as a Windows program: its command line names the
+    exe). Wrappers (the Steam reaper, proton's Python script, pressure-vessel) are left out: only the process whose
+    first argument is the exe itself."""
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        first = argv[0].decode(errors="replace").replace("\\", "/").lower() if argv else ""
+        if first.endswith("/" + GAME_EXE.lower()) or first == GAME_EXE.lower():
+            pids.append(int(entry.name))
     return pids
 
 
@@ -58,7 +79,10 @@ class Crash:
 
 
 def crashes_since(start: datetime) -> list[Crash]:
-    """Windows' Application Error records (event 1000) for the game since `start`, oldest first."""
+    """Windows' Application Error records (event 1000) for the game since `start`, oldest first. Linux has none (a
+    crash there shows in the menu's log and in Proton's log: PROTON_LOG=1)."""
+    if not sys.platform.startswith("win"):
+        return []
     script = (
         "$e = Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000; StartTime=[datetime]'"
         + start.strftime("%Y-%m-%dT%H:%M:%S")

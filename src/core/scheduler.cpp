@@ -1,4 +1,5 @@
 #include "core/scheduler.h"
+#include "core/profile.h"
 #include "core/cache.h"
 #include "core/clock.h"
 #include "core/module.h"
@@ -246,6 +247,9 @@ namespace sched
 	void Tick()
 	{
 		if (!g_initialized.load(std::memory_order_acquire)) return;
+		PROF_THREAD("Game thread");
+		PROF_FRAME_NAMED("Engine tick");
+		PROF_ZONE("sched::Tick");
 		cache::NextTick();
 		AdoptPending();
 
@@ -312,6 +316,7 @@ namespace sched
 
 			try
 			{
+				PROF_ZONE_NAMED(e.name.c_str(), e.name.size());
 				if (e.module) e.module->OnTick();
 				else if (e.run) e.run();
 				e.state.store(State::Ran, std::memory_order_relaxed);
@@ -334,6 +339,7 @@ namespace sched
 		const clk::Ticks work = clk::Now() - start;
 		const float workMs = static_cast<float>(clk::Seconds(work) * 1000.0);
 		g_lastMs.store(workMs, std::memory_order_relaxed);
+		PROF_PLOT("Scheduler work (ms)", static_cast<double>(workMs));
 		Ema(g_avgMs, workMs);
 		if (opt::kEnabled)		// No optimizations: no adaptive stretching, pressure stays 1
 		{

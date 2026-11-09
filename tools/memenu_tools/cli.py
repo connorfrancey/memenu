@@ -19,7 +19,9 @@
     uv run memenu verbose-build         build stage by stage, test each one without the game, report failures
     uv run memenu --copy-info           copy diagnostic info (logs, builds, game, crashes) to the clipboard
 
-Developer mode (MEMENU_DEV=1): full tracebacks, timings, and `memenu dev ...` tools (see devmode.py).
+Developer mode (`memenu --dev ...` or MEMENU_DEV=1): full tracebacks, timings, `memenu dev ...` tools (see
+devmode.py), and builds with MEMENU_DEV_MODE: the DLL switches its stored developer mode on, which shows the Test
+module (in-game self-tests with an output console). `--no-dev` builds without it (the menu keeps what it stored).
 """
 
 from __future__ import annotations
@@ -169,6 +171,25 @@ def _optimization_defines(config: str, optimizations: bool | None) -> tuple[str,
     return (f"{OPTIMIZATIONS}={'ON' if optimizations else 'OFF'}",)
 
 
+TRACY = "MEMENU_TRACY"
+
+tracy_option = click.option(
+    "--tracy/--no-tracy", "tracy", default=None,
+    help="Build with the Tracy profiler client: connect the Tracy profiler (the version in cmake/Versions.cmake) to "
+         "localhost while the game runs. Remembered by the build folder (default: off).")
+
+
+def tracy_on(config: str) -> bool:
+    return b.option_enabled(config, TRACY)
+
+
+def _tracy_defines(config: str, tracy: bool | None) -> tuple[str, ...]:
+    """The -D value --[no-]tracy needs in this build folder (empty when not given or unchanged)."""
+    if tracy is None or (b.cache_value(config, TRACY) is not None and tracy_on(config) == tracy):
+        return ()
+    return (f"{TRACY}={'ON' if tracy else 'OFF'}",)
+
+
 def _apply_features(ctx: click.Context, config: str, only: tuple[str, ...], enable: tuple[str, ...],
                     disable: tuple[str, ...], reset: bool, verbose: bool, extra: tuple[str, ...] = ()) -> None:
     defines = _feature_defines(ctx, config, only, enable, disable, reset) + extra
@@ -180,16 +201,41 @@ def _apply_features(ctx: click.Context, config: str, only: tuple[str, ...], enab
         ctx.exit(1)
 
 
+def _dev_wanted(ctx: click.Context) -> bool | None:
+    """MEMENU_DEV_MODE for this build: --dev / --no-dev, else ON in developer mode (MEMENU_DEV=1), else unchanged."""
+    flag = ctx.find_root().ensure_object(dict).get("dev")
+    if flag is not None:
+        return flag
+    return True if _devmode.enabled() else None
+
+
+def _apply_dev_mode(ctx: click.Context, tc: Toolchain, config: str, verbose: bool) -> None:
+    want = _dev_wanted(ctx)
+    if want is None or b.option_enabled(config, "MEMENU_DEV_MODE") == want:
+        return
+    console.print(f"{'Enabling' if want else 'Disabling'} developer mode (MEMENU_DEV_MODE) in "
+                  f"{b.build_dir(config).relative_to(ROOT)}")
+    result = b.configure(console, tc, config, verbose=verbose, defines=(f"MEMENU_DEV_MODE={'ON' if want else 'OFF'}",))
+    if result.returncode != 0:
+        console.print(f"[bold red]Configure failed[/] (log: {result.log})")
+        ctx.exit(1)
+
+
 def _build(ctx: click.Context, config: str, targets: tuple[str, ...] = (), keep_going: bool = False,
            jobs: int | None = None, verbose: bool = False, warnings: str = "ours") -> b.RunResult:
     tc = _toolchain(ctx)
     _ensure_configured(ctx, tc, config, verbose)
+    _apply_dev_mode(ctx, tc, config, verbose)
     start = time.perf_counter()
     result = b.build(console, tc, config, targets, keep_going, jobs, verbose, warnings)
     took = time.perf_counter() - start
     ours = [w for w in result.warnings if w.ours]
     if result.returncode == 0:
         note = "" if optimizations_on(config) else ", [yellow]no optimizations[/]"
+        if tracy_on(config):
+            note += ", [cyan]Tracy[/]"
+        if b.option_enabled(config, "MEMENU_DEV_MODE"):
+            note += ", [magenta]developer mode[/]"
         console.print(f"[bold green]Build succeeded[/] ({config}, {took:.1f}s, {len(ours)} warning(s) in our code{note})")
     else:
         console.print(f"[bold red]Build failed[/] ({config}, {took:.1f}s, {len(result.errors)} error(s)). "
@@ -256,16 +302,20 @@ def _artifact(config: str, name: str) -> Path:
 # ---- commands ------------------------------------------------------------------------------------------------------
 @click.group(context_settings={"help_option_names": ["-h", "--help"]}, invoke_without_command=True)
 @click.option("--refresh-env", is_flag=True, help="Capture the MSVC environment again (after a Visual Studio update).")
+@click.option("--dev/--no-dev", "dev", default=None,
+              help="Developer mode: builds switch the menu's developer mode on (the Test module: in-game self-tests), "
+                   "plus the tool's developer tools (like MEMENU_DEV=1). --no-dev builds without it.")
 @click.option("--copy-info", is_flag=True,
               help="Copy everything needed to diagnose a problem (system, git, build folders, game install, crash "
                    "records, the menu's current and archived logs) to the clipboard, and exit.")
 @click.pass_context
-def cli(ctx: click.Context, refresh_env: bool, copy_info: bool) -> None:
+def cli(ctx: click.Context, refresh_env: bool, dev: bool | None, copy_info: bool) -> None:
     """Build, test, install and package Mirror's Edge Menu.
 
     Run it without a command for an interactive menu.
     """
     ctx.ensure_object(dict)["refresh"] = refresh_env
+    ctx.obj["dev"] = dev
     if copy_info:
         _copy_info()
         ctx.exit(0)
@@ -310,7 +360,7 @@ def info(ctx: click.Context) -> None:
     table.add_column(style="bold")
     table.add_column()
     table.add_row("Project version", project_version())
-    table.add_row("Visual Studio", str(tc.vs_path))
+    table.add_row("Visual Studio" if tc.vs_path else "Compiler", str(tc.vs_path) if tc.vs_path else tc.compiler)
     table.add_row("MSVC", tc.env.get("VCToolsVersion", "?"))
     table.add_row("CMake", f"{tc.cmake} ({'.'.join(map(str, cmake_version(tc.cmake) or ()))})")
     table.add_row("Ninja", tc.ninja)
@@ -349,14 +399,17 @@ def version(check_tag: str | None) -> None:
 @with_option
 @feature_options
 @optimizations_option
+@tracy_option
 @verbose_option
 @click.pass_context
 def configure(ctx: click.Context, config: str, fresh: bool, defines: tuple[str, ...], parts: tuple[str, ...],
               only: tuple[str, ...], enable: tuple[str, ...], disable: tuple[str, ...], reset_features: bool,
-              optimizations: bool | None, verbose: bool) -> None:
+              optimizations: bool | None, tracy: bool | None, verbose: bool) -> None:
     """Run CMake for a configuration."""
     if optimizations is not None:
         defines += (f"{OPTIMIZATIONS}={'ON' if optimizations else 'OFF'}",)
+    if tracy is not None:
+        defines += (f"{TRACY}={'ON' if tracy else 'OFF'}",)
     defines = (_feature_defines(ctx, config, only, enable, disable, reset_features) + defines
                + tuple(f"{b.OPTIONS[p]}=ON" for p in parts))
     result = b.configure(console, _toolchain(ctx), config, fresh, verbose, defines)
@@ -377,12 +430,13 @@ def configure(ctx: click.Context, config: str, fresh: bool, defines: tuple[str, 
 @with_option
 @feature_options
 @optimizations_option
+@tracy_option
 @verbose_option
 @click.pass_context
 def build_cmd(ctx: click.Context, config: str, targets: tuple[str, ...], clean_first: bool, keep_going: bool,
               jobs: int | None, warnings: str, parts: tuple[str, ...], only: tuple[str, ...],
               enable: tuple[str, ...], disable: tuple[str, ...], reset_features: bool, optimizations: bool | None,
-              verbose: bool) -> None:
+              tracy: bool | None, verbose: bool) -> None:
     """Build (configures first when needed). By default only medge_menu.dll; see --with.
 
     
@@ -393,11 +447,12 @@ def build_cmd(ctx: click.Context, config: str, targets: tuple[str, ...], clean_f
       memenu build --enable all                     everything, TAS included
       memenu build --default-features               back to the defaults (everything but TAS)
       memenu build --no-optimizations               no caches / scheduler intervals (--optimizations: back on)
+      memenu build --tracy                          with the Tracy profiler client (--no-tracy: without)
     """
     if clean_first:
         _remove_build_dir(config)
     _apply_features(ctx, config, only, enable, disable, reset_features, verbose,
-                    extra=_optimization_defines(config, optimizations))
+                    extra=_optimization_defines(config, optimizations) + _tracy_defines(config, tracy))
     _enable_parts(ctx, config, parts, verbose)
     result = _build(ctx, config, targets, keep_going, jobs, verbose, warnings)
     if result.returncode == 0:
@@ -661,16 +716,14 @@ def test(ctx: click.Context, config: str, no_build: bool, name_filter: str | Non
     tc = _toolchain(ctx)
     if not no_build:
         _enable_parts(ctx, config, ["tests"], verbose)
-        if _build(ctx, config, ("memenu_tests", "installer_tests"), verbose=verbose).returncode != 0:
+        targets = ["memenu_tests", "installer_tests"]
+        # unreallib_tests only exists with MEMENU_UNREALLIB (its default follows MEMENU_BUILD_TESTS on first configure)
+        if b.option_enabled(config, "MEMENU_UNREALLIB"):
+            targets.append("unreallib_tests")
+        if _build(ctx, config, tuple(targets), verbose=verbose).returncode != 0:
             ctx.exit(1)
-    args = [tc.ctest, "--test-dir", str(b.build_dir(config)), "--output-on-failure"]
-    if name_filter:
-        args += ["-R", name_filter]
-    if verbose:
-        args.append("-V")
     console.rule("Tests")
-    code = tc.run(args, cwd=ROOT).returncode
-    console.print("[bold green]All tests passed[/]" if code == 0 else "[bold red]Tests failed[/]")
+    code = b.run_ctest(console, tc, config, name_filter, verbose)
     ctx.exit(code and 1)
 
 
@@ -702,6 +755,36 @@ def bench(ctx: click.Context, config: str, no_build: bool, list_groups: bool, cs
     args = [str(exe), *(["--list"] if list_groups else []), *(["--csv"] if csv else []), *groups]
     console.rule("Benchmarks")
     code = subprocess.run(args, cwd=ROOT).returncode
+    ctx.exit(code and 1)
+
+
+@cli.command("unreallib")
+@config_option
+@click.option("--no-build", is_flag=True, help="Run the check as it was last built.")
+@click.argument("cooked_pc", required=False, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@verbose_option
+@click.pass_context
+def unreallib(ctx: click.Context, config: str, no_build: bool, cooked_pc: Path | None, verbose: bool) -> None:
+    """Check that UnrealLib works: read, validate, resolve, decompile and load a map from the game's packages.
+
+    COOKED_PC is the game's TdGame/CookedPC folder; found like the launcher finds the game when left out.
+    """
+    if not no_build:
+        _enable_parts(ctx, config, ["tests"], verbose)
+        if not b.option_enabled(config, "MEMENU_UNREALLIB"):
+            console.print("Enabling MEMENU_UNREALLIB")
+            result = b.configure(console, _toolchain(ctx), config, verbose=verbose, defines=("MEMENU_UNREALLIB=ON",))
+            if result.returncode != 0:
+                console.print(f"[bold red]Configure failed[/] (log: {result.log})")
+                ctx.exit(1)
+        if _build(ctx, config, ("unreallib_status",), verbose=verbose).returncode != 0:
+            ctx.exit(1)
+    exe = _artifact(config, "unreallib_status.exe")
+    if not exe.exists():
+        console.print(f"[red]{exe} not found[/]: build it first (without --no-build).")
+        ctx.exit(1)
+    console.rule("UnrealLib")
+    code = subprocess.run([str(exe), *([str(cooked_pc)] if cooked_pc else [])], cwd=ROOT).returncode
     ctx.exit(code and 1)
 
 
@@ -961,9 +1044,19 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
                       "administrator\" and the Windows XP/98 modes make the game start elevated, which this tool "
                       "can't start or watch. Clear them in the exe's Properties > Compatibility, or run this from an "
                       "administrator terminal.")
+    if gt.LINUX:
+        options = gt.linux_launch_options() or ""
+        if "dinput8=n,b" not in options.replace(" ", ""):
+            console.print("[red]The game's Steam launch options don't load the menu's dinput8.dll[/] (Proton uses its "
+                          "own unless told). In Steam: Mirror's Edge > Properties > General > Launch Options:\n"
+                          "    WINEDLLOVERRIDES=\"dinput8=n,b\" %command%\n"
+                          f"Now: {escape(options) if options else 'none'}. Steam saves the options to disk when it "
+                          "exits, so restart Steam once after setting them. See doc/linux-development.md.")
+            ctx.exit(1)
     game_dir = game_dir or gt.find_game_dir()
     if not game_dir or not (game_dir / devtest.GAME_EXE).exists():
-        console.print("[red]Mirror's Edge not found.[/] Pass --dir <...\\Binaries>.")
+        console.print("[red]Mirror's Edge not found.[/] Pass --dir <...\\Binaries>" +
+                      (" or <...>/steamapps/common/mirrors edge/Binaries." if gt.LINUX else "."))
         ctx.exit(1)
 
     if build_dir:
@@ -1048,9 +1141,14 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
 
 @cli.command()
 @click.option("--no-build", is_flag=True, help="Package what was built last.")
+@click.option("--dll", "dll_only", is_flag=True,
+              help="Only the menu's DLL: build the release medge_menu.dll and copy it to dist/ (no installer or zips).")
 @click.pass_context
-def package(ctx: click.Context, no_build: bool) -> None:
+def package(ctx: click.Context, no_build: bool, dll_only: bool) -> None:
     """Build the release installer and copy it to dist/, with the zip to hand out (installer, launcher, readme, licenses)."""
+    if dll_only:
+        _export_dll(ctx, no_build)
+        return
     if not no_build:
         _enable_parts(ctx, "release", ["installer", "launcher"])
         if _build(ctx, "release", ("memenu_installer", "medge_launcher")).returncode != 0:
@@ -1115,6 +1213,28 @@ def package(ctx: click.Context, no_build: bool) -> None:
                             title="Packaged", border_style="green"))
 
 
+def _export_dll(ctx: click.Context, no_build: bool) -> None:
+    """package --dll: the release medge_menu.dll in dist/, versioned and under its own name, with its sha256."""
+    if not no_build and _build(ctx, "release", ("medge_menu",)).returncode != 0:
+        ctx.exit(1)
+    src = _artifact("release", "medge_menu.dll")
+    if not src.exists():
+        console.print("[red]No release medge_menu.dll yet.[/] Run without --no-build.")
+        ctx.exit(1)
+    dist = ROOT / "dist"
+    dist.mkdir(exist_ok=True)
+    versioned = dist / f"medge_menu-{project_version()}.dll"
+    fixed = dist / "medge_menu.dll"
+    shutil.copy2(src, versioned)
+    shutil.copy2(src, fixed)
+    digest = hashlib.sha256(versioned.read_bytes()).hexdigest()
+    # Its own sums file: SHA256SUMS.txt lists the release files and is rewritten by a full package
+    (dist / "SHA256SUMS-dll.txt").write_text(f"{digest}  {versioned.name}\n{digest}  {fixed.name}\n", encoding="ascii")
+    console.print(Panel.fit(f"[bold]{versioned.relative_to(ROOT)}[/] (and {fixed.relative_to(ROOT)})\n"
+                            f"{versioned.stat().st_size / 1e6:.1f} MB\nsha256 {digest}",
+                            title="DLL exported", border_style="green"))
+
+
 def _crlf(text: str) -> str:
     """Windows line endings: the zip's text files get opened in Notepad."""
     return text.replace("\r\n", "\n").replace("\n", "\r\n")
@@ -1153,6 +1273,9 @@ def _third_party_notices(config: str) -> str:
     section("Roboto Medium", "the menu's font, by Christian Robertson for Google", "https://fonts.google.com/specimen/Roboto",
             "Licensed under the Apache License, Version 2.0:\n\n" +
             (DIST_FILES / "Apache-2.0.txt").read_text(encoding="utf-8"))
+    section("Cousine", "the console's monospace font, by Steve Matteson", "https://fonts.google.com/specimen/Cousine",
+            "Licensed under the Apache License, Version 2.0:\n\n" +
+            (DIST_FILES / "Apache-2.0.txt").read_text(encoding="utf-8"))
     section("Mirror's Edge SDK", "game class layouts (generated headers)", "https://github.com/connorfrancey/mmultiplayer",
             "Generated from the game by the mmultiplayer project. Its repository has no license file.")
     return "\n".join(parts)
@@ -1163,10 +1286,35 @@ from . import devmode as _devmode   # noqa: E402 - registers `memenu dev ...` on
 _devmode.register(cli, console)
 
 
+def _early_dev_flag(argv: list[str]) -> None:
+    """--dev / --no-dev before the command: developer mode has to be known before the commands are set up (it shows
+    `memenu dev`, the interactive menu's developer tools, the tracebacks), so it goes into MEMENU_DEV right away."""
+    for arg in argv:
+        if not arg.startswith("-"):
+            return              # The command: options after it are its own
+        if arg == "--dev":
+            os.environ["MEMENU_DEV"] = "1"
+        elif arg == "--no-dev":
+            os.environ.pop("MEMENU_DEV", None)
+
+
+# Need Windows itself (the D3D9 test host, the installer and launcher exes, the minimal build's MSVC presets). On Linux
+# the game runs in Proton: install with install.sh, test with game-test.
+_WINDOWS_ONLY = {"verbose-build", "install-game", "uninstall-game", "launch", "dev-test", "package", "minimal"}
+
+
 def main() -> None:
-    if sys.platform != "win32":
-        Console(stderr=True).print("[red]This project builds on Windows only (32-bit MSVC).[/]")
+    if sys.platform != "win32" and not sys.platform.startswith("linux"):
+        Console(stderr=True).print("[red]This project builds on Windows and Linux (see doc/linux-development.md).[/]")
         sys.exit(2)
+    if sys.platform != "win32":
+        command = next((a for a in sys.argv[1:] if not a.startswith("-")), "")
+        if command in _WINDOWS_ONLY:
+            Console(stderr=True).print(f"[red]`memenu {command}` needs Windows.[/] On Linux: build, test, errors and "
+                                       "game-test work; install into the game with install.sh (see "
+                                       "doc/linux-development.md).")
+            sys.exit(2)
+    _early_dev_flag(sys.argv[1:])
     if _devmode.enabled():
         _devmode.setup(console)
     cli(obj={})

@@ -43,12 +43,13 @@ const std::vector<bindings::Slot>& bindings::All()
 {
     std::size_t signature = 0;
     modules::ForEach([&](modules::Tab&, Module& m) {
-        signature = signature * 31 + reinterpret_cast<std::size_t>(&m) + m.Settings().size();
+        signature = signature * 31 + reinterpret_cast<std::size_t>(&m) + m.Settings().size() + (m.Hidden() ? 7 : 0);
     });
     if (signature == g_slotsFor) return g_slots;
 
     g_slots.clear();
     modules::ForEach([&](modules::Tab&, Module& m) {
+        if (m.Hidden()) return;
         g_slots.push_back({Kind::Toggle, &m, nullptr, &m.key, m.IsAction() ? "Hotkey" : "Toggle"});
         for (ctl::Setting* s : m.Settings()) {
             if (auto* hold = dynamic_cast<ctl::KeyHold*>(s)) {

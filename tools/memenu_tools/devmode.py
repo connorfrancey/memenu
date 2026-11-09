@@ -82,7 +82,7 @@ def register(cli: click.Group, console: Console) -> None:
         t.add_row("Python", f"{sys.version.split()[0]} ({sys.executable})")
         try:
             tc = find_toolchain()
-            t.add_row("Visual Studio", str(tc.vs_path))
+            t.add_row("Visual Studio" if tc.vs_path else "Compiler", str(tc.vs_path) if tc.vs_path else tc.compiler)
             t.add_row("MSVC", tc.env.get("VCToolsVersion", "?"))
             t.add_row("CMake / Ninja", f"{tc.cmake} / {tc.ninja}")
         except Exception as e:   # noqa: BLE001

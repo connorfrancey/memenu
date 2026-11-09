@@ -1,7 +1,10 @@
 #include "hooks.h"
 #include "gui.h"
 #include "font.h"
+#include "core/profile.h"
+#include "core/clock.h"
 #if !MEMENU_MINIMAL
+#include "core/hardware.h"
 #include "core/module.h"
 #endif
 #if MEMENU_GAME
@@ -21,6 +24,7 @@
 #define HOOKS_LOG(level, ...) spdlog::level(__VA_ARGS__)
 #define HOOKS_DIAG 1   // The diagnostics below need spdlog/fmt
 #endif
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
@@ -229,7 +233,8 @@ namespace
             HOOKS_LOG(info, "Menu {}", gui::visible ? "opened" : "closed");
         }
 #if !MEMENU_MINIMAL
-        else modules::OnKey(static_cast<int>(wp));
+        // Typing in a text box (the console, a filter): letters are text, not module hotkeys
+        else if (!(gui::visible && ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)) modules::OnKey(static_cast<int>(wp));
 #endif
         return false;
     }
@@ -317,10 +322,25 @@ namespace
         return CallWindowProcW(oWndProc, hwnd, msg, wp, lp);
     }
 
+    // The console's monospace font (font.h): Cousine, or ImGui's built-in one (monospace too)
+    void LoadMonoFont()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        if (font::MonoSize() != 0) {
+            ImFontConfig cfg;
+            cfg.FontDataOwnedByAtlas = false;
+            cfg.OversampleH = 2;
+            std::snprintf(cfg.Name, sizeof cfg.Name, "Cousine");
+            font::g_mono = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(font::MonoData()),
+                                                          static_cast<int>(font::MonoSize()), 15.f, &cfg);
+        }
+        if (!font::g_mono) font::g_mono = io.Fonts->AddFontDefault();
+    }
+
     // The menu's font, built into the DLL (font.h). ImGui's own font if the build has none.
     void LoadMenuFont()
     {
-        if (font::MenuSize() == 0) return;
+        if (font::MenuSize() == 0) { LoadMonoFont(); return; }
         ImFontConfig cfg;
         cfg.FontDataOwnedByAtlas = false;   // Static data in the DLL: ImGui must not free it
         cfg.OversampleH = 2;
@@ -330,6 +350,7 @@ namespace
                                                    static_cast<int>(font::MenuSize()), 15.f, &cfg);
         if (f) io.FontDefault = f;
         else HOOKS_LOG(warn, "The menu font could not be loaded: using ImGui's built-in font");
+        LoadMonoFont();
     }
 
     void InitImGui(IDirect3DDevice9* dev)
@@ -400,8 +421,20 @@ namespace
     // One ImGui frame: the menu and every module's overlay, drawn into the current render target.
     void DrawMenu()
     {
+        PROF_THREAD("Render thread");
+        PROF_ZONE("Menu frame");
         ImGui_ImplDX9_NewFrame();
         ImGui_ImplWin32_NewFrame();
+        // The frame time from the menu's own clock, not the backend's: once a TAS session turns the rendering thread off,
+        // the menu draws on the game thread, where QueryPerformanceCounter answers the TAS's virtual clock. The backend
+        // then measured a negative or frozen frame (ImGui asserts "Need a positive DeltaTime!" in debug builds).
+        {
+            static clk::Ticks last = 0;
+            const clk::Ticks now = clk::Now();
+            const float dt = last ? static_cast<float>(clk::Seconds(now - last)) : 1.f / 60.f;
+            last = now;
+            ImGui::GetIO().DeltaTime = std::clamp(dt, 1e-5f, 0.25f);
+        }
         ImGui::NewFrame();
         ImGui::GetIO().MouseDrawCursor = gui::visible;
 #if MEMENU_GAME
@@ -412,7 +445,11 @@ namespace
         ImGui::EndFrame();
         ImGui::Render();
         g_menuVertices.store(static_cast<unsigned>(ImGui::GetDrawData()->TotalVtxCount), std::memory_order_relaxed);
-        ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+        {
+            PROF_ZONE("ImGui draw");
+            ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+        }
+        PROF_FRAME();
     }
 
     // The game also ends scenes on its own offscreen targets now and then (a 16x16 luminance target, ...). Only the
@@ -574,6 +611,35 @@ namespace
     // (D3DERR_DEVICELOST for as long as it runs, which is every time the menu is loaded after the game went
     // fullscreen), but a NULLREF device never touches the adapter. d3d9.dll uses one device class for every type, so
     // its vtable is the very one the game's HAL device uses (checked: all 119 entries are the same).
+#if !MEMENU_MINIMAL
+    // The adapter and display mode, for hw::Get() (the hardware cache): once, from the first dummy D3D9 object.
+    void ReportGpu(IDirect3D9* d3d)
+    {
+        static bool reported = false;
+        if (reported || !d3d) return;
+        reported = true;
+        hw::Gpu gpu;
+        gpu.adapters = d3d->GetAdapterCount();
+        D3DADAPTER_IDENTIFIER9 id{};
+        if (SUCCEEDED(d3d->GetAdapterIdentifier(D3DADAPTER_DEFAULT, 0, &id))) {
+            gpu.description = id.Description;
+            char driver[160];
+            std::snprintf(driver, sizeof driver, "%s %u.%u.%u.%u", id.Driver, HIWORD(id.DriverVersion.HighPart),
+                          LOWORD(id.DriverVersion.HighPart), HIWORD(id.DriverVersion.LowPart), LOWORD(id.DriverVersion.LowPart));
+            gpu.driver = driver;
+            gpu.vendorId = id.VendorId;
+            gpu.deviceId = id.DeviceId;
+        }
+        D3DDISPLAYMODE mode{};
+        if (SUCCEEDED(d3d->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &mode))) {
+            gpu.width = mode.Width;
+            gpu.height = mode.Height;
+            gpu.refreshHz = mode.RefreshRate;
+        }
+        hw::SetGpu(gpu);
+    }
+#endif
+
     HRESULT TryGetVTable(void** vtable, size_t count, bool verbose, D3DDEVTYPE type)
     {
         WNDCLASSEXW wc{sizeof(wc)};
@@ -591,6 +657,9 @@ namespace
         if (verbose) LogD3D9Environment(d3d);
 #else
         (void)verbose;
+#endif
+#if !MEMENU_MINIMAL
+        ReportGpu(d3d);
 #endif
         HRESULT hr = E_FAIL;
         if (d3d)

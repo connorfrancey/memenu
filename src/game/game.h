@@ -105,7 +105,13 @@ namespace game {
 
 	// Runs a console command as if typed in the game's console ("set Engine bEnableColorClear true", "open edge_p",
 	// "stat fps"). Game thread. False without a player controller to run it.
-	bool ConsoleCommand(const std::string& command);
+	// `output`: what the command printed (the engine's string output device: get, getall, obj list, ...). Game thread.
+	bool ConsoleCommand(const std::string& command, std::string* output = nullptr);
+
+	// `object` is in the script state `state` ("PlayerWalking"), or in one extending it. Use this, never the SDK's
+	// UObject::IsInState() / GetStateName(): through ProcessEvent they write no answer, and the SDK's IsInState has
+	// 1-byte bools where the engine has 4-byte UBOOLs, so it returned an uninitialised stack byte. Game thread.
+	bool IsInState(Classes::UObject* object, const char* state);
 
 	// Byte pattern scan over MirrorsEdge.exe ('x' = must match, '?' = any byte). nullptr if not found.
 	void* FindPattern(const char* pattern, const char* mask);

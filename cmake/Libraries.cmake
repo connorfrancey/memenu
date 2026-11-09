@@ -1,3 +1,5 @@
+include(${CMAKE_CURRENT_LIST_DIR}/Versions.cmake)   # Pinned versions (fmt, spdlog, UnrealLib, ...)
+
 # Libraries
 
 # -------------------------------------------------------------------------------------------------
@@ -57,13 +59,19 @@ else()
     set(_need_themes ON)
 endif()
 
-# spdlog
+# spdlog, on a separate fmt: UnrealLib links fmt::fmt too, and spdlog's bundled copy would define the same symbols
 if(_need_spdlog)
+CPMAddPackage(
+        NAME fmt
+        GITHUB_REPOSITORY fmtlib/fmt
+        GIT_TAG ${FMT_VERSION}
+        OPTIONS "FMT_INSTALL OFF" "FMT_TEST OFF" "FMT_DOC OFF" "FMT_MODULE OFF"
+)
 CPMAddPackage(
         NAME spdlog
         GITHUB_REPOSITORY gabime/spdlog
-        GIT_TAG v1.17.0
-        OPTIONS "SPDLOG_INSTALL OFF"
+        GIT_TAG ${SPDLOG_VERSION}
+        OPTIONS "SPDLOG_INSTALL OFF" "SPDLOG_FMT_EXTERNAL ON"
 )
 
 # zstd: compresses the previous session's log into logs/.old/ (log.cpp) and the TAS's memory snapshots
@@ -149,6 +157,35 @@ endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE imgui_filebrowser)
 endif()
 
+# Tracy: profiler client, only with MEMENU_TRACY (src/core/profile.h). Set up for a DLL injected into the game:
+#   TRACY_DELAYED_INIT, TRACY_MANUAL_LIFETIME  started and stopped by the menu (prof::Start/Stop), not by static
+#                                               constructors: those run in DllMain under the loader lock, and the
+#                                               profiler's threads must be gone before the DLL unloads
+#   TRACY_ON_DEMAND                             nothing is collected until the profiler connects
+#   TRACY_ONLY_LOCALHOST                        the game doesn't listen on the network
+#   TRACY_NO_CRASH_HANDLER                      the menu's own crash logger (diag.cpp) stays the one in charge
+#   TRACY_NO_SYSTEM_TRACING                     no ETW (needs admin, and traces the whole system)
+#   TRACY_NO_SAMPLING                           no call stack sampling (needs admin, 64-bit only)
+if(MEMENU_TRACY)
+CPMAddPackage(
+        NAME tracy
+        GITHUB_REPOSITORY wolfpld/tracy
+        GIT_TAG ${TRACY_VERSION}
+        SYSTEM YES
+        OPTIONS
+            "TRACY_ENABLE ON"
+            "TRACY_DELAYED_INIT ON"
+            "TRACY_MANUAL_LIFETIME ON"
+            "TRACY_ON_DEMAND ON"
+            "TRACY_ONLY_LOCALHOST ON"
+            "TRACY_NO_CRASH_HANDLER ON"
+            "TRACY_NO_SYSTEM_TRACING ON"
+            "TRACY_NO_SAMPLING ON"
+            "TRACY_STATIC ON"
+)
+target_link_libraries(${PROJECT_NAME} PRIVATE Tracy::TracyClient)
+endif()
+
 # Discord RPC
 #include(${CMAKE_SOURCE_DIR}/cmake/discord-rpc.cmake)
 
@@ -170,7 +207,8 @@ endif()
 option(MEMENU_SDK_DOCS "Add the SDK documentation target (needs Doxygen)" OFF)
 # Only the game layer uses the SDK: a build without game features (MEMENU_GAME OFF) doesn't download it.
 #
-# Patches (cmake/patches/, applied with git apply: the SDK's files are CRLF, which plain `patch` refuses):
+# Patches (cmake/patches/mmultiplayer-*.patch, applied by cmake/apply_patches.cmake: LF on every system, so Windows'
+# CRLF checkout and Linux's LF one take the same patches):
 #   mmultiplayer-fast-findobject.patch   UObject::FindObject compares the engine's name index before it builds full
 #                                        names; every SDK function looks itself up on its first call, and building
 #                                        the full name of all ~100k objects for that froze the game up to a second.
@@ -184,12 +222,50 @@ CPMAddPackage(
         GITHUB_REPOSITORY connorfrancey/mmultiplayer
         GIT_TAG 7b1eb25ddc0fc1ce498d024e7b2f9d1980b9eca3
         SOURCE_SUBDIR Client/sdk
-        PATCH_COMMAND "${GIT_EXECUTABLE}" apply --unsafe-paths
-            "${CMAKE_CURRENT_LIST_DIR}/patches/mmultiplayer-fast-findobject.patch"
-            "${CMAKE_CURRENT_LIST_DIR}/patches/mmultiplayer-fast-names.patch"
+        PATCH_COMMAND "${CMAKE_COMMAND}" -DPATCH_DIR=${CMAKE_CURRENT_LIST_DIR}/patches -DPREFIX=mmultiplayer-
+            -DWORK_DIR=<SOURCE_DIR> -DOUT_DIR=${CMAKE_BINARY_DIR}/patches -DGIT=${GIT_EXECUTABLE}
+            -P "${CMAKE_CURRENT_LIST_DIR}/apply_patches.cmake"
         OPTIONS
             "ME_SDK_BUILD_DOCS ${MEMENU_SDK_DOCS}"
 )
+endif()
+
+# UnrealLib: reads Unreal Engine 3 packages (.u/.upk/.me1), a C++ port of EliotVU/Unreal-Library. The Mirage runtime
+# (src/runtime/) reads the game's script packages with it inside the game, so every build with the game layer links it;
+# MEMENU_UNREALLIB adds its tests and status tool. Reuses the fmt/spdlog above and adds zlib.
+if(MEMENU_UNREALLIB OR MEMENU_GAME)
+CPMAddPackage(
+        NAME UnrealLib
+        GITHUB_REPOSITORY connorfrancey/UnrealLib
+        GIT_TAG ${UNREALLIB_GIT_TAG}
+        OPTIONS
+            "UNREALLIB_BUILD_TESTS OFF"
+            "UNREALLIB_BUILD_TOOLS OFF"
+            "UNREALLIB_BUILD_EXAMPLES OFF"
+)
+endif()
+
+# Lua 5.4: the language of Mirage mods (src/runtime/lua_vm.cpp). Built from the sources as a static library, compiled as
+# C++: a Lua error is then a C++ exception, so it unwinds the C++ frames between the error and the pcall (destructors
+# run) instead of longjmp-ing over them. Without the standalone interpreter/compiler and the amalgamation/test files.
+if(MEMENU_GAME)
+  CPMAddPackage(
+      NAME lua
+      GITHUB_REPOSITORY lua/lua
+      GIT_TAG ${LUA_VERSION}
+      DOWNLOAD_ONLY YES
+  )
+  if(lua_ADDED)
+    file(GLOB _lua_sources CONFIGURE_DEPENDS ${lua_SOURCE_DIR}/*.c)
+    list(FILTER _lua_sources EXCLUDE REGEX "/(lua|luac|onelua|ltests)[.]c$")
+    set_source_files_properties(${_lua_sources} PROPERTIES LANGUAGE CXX)
+    add_library(lua_static STATIC ${_lua_sources})
+    target_include_directories(lua_static SYSTEM PUBLIC ${lua_SOURCE_DIR})
+    if(MSVC)
+      target_compile_options(lua_static PRIVATE /TP /W0)     # C sources as C++; Lua's own code, not ours to warn about
+    endif()
+    add_library(lua::lua ALIAS lua_static)
+  endif()
 endif()
 
 # GoogleTest (only needed for the unit tests)
@@ -220,9 +296,6 @@ if(MEMENU_BUILD_BENCHMARKS)
 endif()
 
 if(MEMENU_DEV_TOOLS)
-# Ccache
-CPMAddPackage("gh:TheLartians/Ccache.cmake@1.2.5")
-
 # CPM Licenses
 CPMAddPackage(
         NAME CPMLicenses.cmake
@@ -250,7 +323,7 @@ endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE
         imgui imjson minhook d3d9 shell32 spdlog::spdlog zstd_compress nlohmann_json::nlohmann_json winmm)
 if(MEMENU_GAME)
-  target_link_libraries(${PROJECT_NAME} PRIVATE me_sdk)
+  target_link_libraries(${PROJECT_NAME} PRIVATE me_sdk UnrealLib::Linker lua::lua)
 endif()
 
 # -------------------------------------------------------------------------------------------------

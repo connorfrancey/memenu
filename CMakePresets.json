@@ -1,45 +1,121 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "x86-base",
       "hidden": true,
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/cmake-build-${presetName}",
-      "architecture": { "value": "x86", "strategy": "external" },
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "cl.exe" },
-      "vendor": { "jetbrains.com/clion": { "toolchain": "Visual Studio" } }
+      "architecture": {
+        "value": "x86",
+        "strategy": "external"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl.exe"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Visual Studio"
+        }
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "x86-debug",
       "displayName": "x86 Debug (MSVC)",
       "inherits": "x86-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "x86-release",
       "displayName": "x86 Release (MSVC)",
       "inherits": "x86-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "x86-minimal-debug",
       "displayName": "x86 Minimal Debug (MSVC, D3D9 hook + ImGui demo only)",
       "inherits": "x86-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "MEMENU_MINIMAL": "ON" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MEMENU_MINIMAL": "ON"
+      }
     },
     {
       "name": "x86-minimal-release",
       "displayName": "x86 Minimal Release (MSVC, D3D9 hook + ImGui demo only)",
       "inherits": "x86-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "MEMENU_MINIMAL": "ON" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MEMENU_MINIMAL": "ON"
+      }
+    },
+    {
+      "name": "linux-x86-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-${presetName}",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/clang-cl-xwin.cmake",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-x86-debug",
+      "displayName": "x86 Debug (Linux: clang-cl + xwin, tests under Wine)",
+      "inherits": "linux-x86-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "linux-x86-release",
+      "displayName": "x86 Release (Linux: clang-cl + xwin, tests under Wine)",
+      "inherits": "linux-x86-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "x86-debug",   "configurePreset": "x86-debug" },
-    { "name": "x86-release", "configurePreset": "x86-release" },
-    { "name": "x86-minimal-debug",   "configurePreset": "x86-minimal-debug" },
-    { "name": "x86-minimal-release", "configurePreset": "x86-minimal-release" }
+    {
+      "name": "x86-debug",
+      "configurePreset": "x86-debug"
+    },
+    {
+      "name": "x86-release",
+      "configurePreset": "x86-release"
+    },
+    {
+      "name": "x86-minimal-debug",
+      "configurePreset": "x86-minimal-debug"
+    },
+    {
+      "name": "x86-minimal-release",
+      "configurePreset": "x86-minimal-release"
+    },
+    {
+      "name": "linux-x86-debug",
+      "configurePreset": "linux-x86-debug"
+    },
+    {
+      "name": "linux-x86-release",
+      "configurePreset": "linux-x86-release"
+    }
   ]
 }

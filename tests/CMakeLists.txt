@@ -14,6 +14,10 @@ add_executable(memenu_tests
         test_input_layout.cpp
         test_settings.cpp
         test_keys.cpp
+        test_cache.cpp
+        test_cache2.cpp
+        test_shell.cpp
+        test_hud_template.cpp
         ${CMAKE_SOURCE_DIR}/src/render/mesh.cpp
         ${CMAKE_SOURCE_DIR}/src/render/static_scene.cpp
         ${CMAKE_SOURCE_DIR}/src/tas/replay.cpp
@@ -31,7 +35,14 @@ add_executable(memenu_tests
         ${CMAKE_SOURCE_DIR}/src/core/keys.cpp
         ${CMAKE_SOURCE_DIR}/src/core/scheduler.cpp
         ${CMAKE_SOURCE_DIR}/src/core/clock.cpp
-        ${CMAKE_SOURCE_DIR}/src/core/cache.cpp)
+        ${CMAKE_SOURCE_DIR}/src/core/cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/memory_cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/signature_cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/address_cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/string_cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/hardware.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/shell.cpp
+        ${CMAKE_SOURCE_DIR}/src/hud/template.cpp)
 target_include_directories(memenu_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(memenu_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         MEMENU_EXAMPLES_DIR="${CMAKE_SOURCE_DIR}/examples")
@@ -66,3 +77,30 @@ if(MSVC)
   target_compile_options(installer_tests PRIVATE /W4 /permissive- /utf-8)
 endif()
 gtest_discover_tests(installer_tests DISCOVERY_MODE PRE_TEST)
+
+# UnrealLib (cmake/Libraries.cmake): its own exe because the library is C++20 and memenu_tests builds as C++17.
+# Reading the game's packages uses the launcher's install detection (or UNREALLIB_MIRRORSEDGE_DIR); skipped without it.
+if(MEMENU_UNREALLIB)
+  add_executable(unreallib_tests
+          test_unreallib.cpp
+          ${CMAKE_SOURCE_DIR}/launcher/src/detect.cpp)
+  target_include_directories(unreallib_tests PRIVATE ${CMAKE_SOURCE_DIR}/launcher/src)
+  target_compile_definitions(unreallib_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(unreallib_tests PRIVATE GTest::gtest_main UnrealLib::UnrealLib shell32 advapi32)
+  if(MSVC)
+    target_compile_options(unreallib_tests PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  gtest_discover_tests(unreallib_tests DISCOVERY_MODE PRE_TEST)
+
+  # Status check (`memenu unreallib`): one check per module against the game's packages, logged with spdlog
+  add_executable(unreallib_status
+          unreallib_status.cpp
+          ${CMAKE_SOURCE_DIR}/launcher/src/detect.cpp)
+  target_include_directories(unreallib_status PRIVATE ${CMAKE_SOURCE_DIR}/launcher/src)
+  target_compile_definitions(unreallib_status PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(unreallib_status PRIVATE UnrealLib::UnrealLib spdlog::spdlog shell32 advapi32)
+  set_target_properties(unreallib_status PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})   # Where memenu looks
+  if(MSVC)
+    target_compile_options(unreallib_status PRIVATE /W4 /permissive- /utf-8)
+  endif()
+endif()

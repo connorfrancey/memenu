@@ -1,6 +1,11 @@
 #include "game.h"
+#include "game/object_cache.h"
+#include "game/object_ref.h"
 #include "game/uobject.h"
+#include "core/address_cache.h"
 #include "core/cache.h"
+#include "core/signature_cache.h"
+#include "paths.h"
 #include "unload.h"
 
 #include <Windows.h>
@@ -79,8 +84,9 @@ namespace {
 
     // ---- Pattern scan over the main executable's image --------------------------------------------------------------
     // Pattern/mask as used by mmultiplayer: 'x' = byte must match, '?' = wildcard.
-    // Within [from, to) of the image (offsets from its base), clamped to the image.
-    void* FindPatternRange(std::size_t from, std::size_t to, const char* pattern, const char* mask)
+    // Within [from, to) of the image (offsets from its base), clamped to the image. The scan itself: FindPatternRange
+    // goes through the signature cache first.
+    void* ScanRange(std::size_t from, std::size_t to, const char* pattern, const char* mask)
     {
         const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
         const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
@@ -110,9 +116,24 @@ namespace {
         return nullptr;
     }
 
+    // Remembered for this exe across starts (cache/signatures.json, bound in game::Init): see core/signature_cache.h.
+    void* FindPatternRange(std::size_t from, std::size_t to, const char* pattern, const char* mask)
+    {
+        return sig::Game().Find(pattern, mask, from, to, &ScanRange);
+    }
+
     void* FindPattern(const char* pattern, const char* mask)
     {
         return FindPatternRange(0, ~std::size_t{0}, pattern, mask);
+    }
+
+    // The menu's signature cache for this MirrorsEdge.exe, loaded from the last start when it was the same exe.
+    void BindSignatureCache()
+    {
+        const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        sig::Game().Bind(reinterpret_cast<std::uintptr_t>(base), nt->OptionalHeader.SizeOfImage, sig::IdentifyImage(base),
+                         paths::Dir().empty() ? std::filesystem::path{} : paths::Dir() / "cache" / "signatures.json");
     }
 
     // ---- Script events (UObject::ProcessEvent) ----------------------------------------------------------------------
@@ -185,7 +206,7 @@ namespace {
             for (int j = 0; j < n && !fn; ++j)
                 if (j != i && g_watches[j].name == g_watches[i].name) fn = g_watchFn[j].load();
             if (fn) { g_watchFn[i].store(fn); continue; }
-            fn = Classes::UObject::FindObject<Classes::UFunction>(g_watches[i].name);
+            fn = game::FindObject<Classes::UFunction>(g_watches[i].name);   // Cached, and not looked for again until a level load
             g_watchFn[i].store(fn);
             if (fn) spdlog::info("Script event: watching {}", g_watches[i].name);
             else    spdlog::warn("Script event: {} not found (looked again after the next level load)", g_watches[i].name);
@@ -206,6 +227,7 @@ namespace {
             spdlog::warn("ProcessEvent: the pattern ({}) and the vtable ({}) disagree, using the pattern", target, fromVtable);
         if (!target) target = fromVtable;
         if (!target) { spdlog::error("ProcessEvent not found: script events (speedrun auto splits) won't work"); return false; }
+        addr::Game().Set("ProcessEvent", reinterpret_cast<std::uintptr_t>(target));
         if (MH_CreateHook(target, reinterpret_cast<void*>(&ProcessEventHook), reinterpret_cast<void**>(&oProcessEvent)) != MH_OK ||
             MH_EnableHook(target) != MH_OK) {
             spdlog::error("Could not hook ProcessEvent: script events (speedrun auto splits) won't work");
@@ -548,6 +570,7 @@ bool game::CheckObjectLayout()
 bool game::Init()
 {
     void* ptr = nullptr;
+    BindSignatureCache();
 
     // These byte patterns identify the game's own code, so they only match the game version they were made for
     // (copied verbatim from mmultiplayer's engine.cpp).
@@ -558,6 +581,7 @@ bool game::Init()
     if (!ptr) { spdlog::error("GNames pattern not found: unsupported game version?"); return false; }
     Classes::FName::GNames = reinterpret_cast<decltype(Classes::FName::GNames)>(
         *reinterpret_cast<void**>(static_cast<std::uint8_t*>(ptr) + 2));
+    addr::Game().Set("GNames", reinterpret_cast<std::uintptr_t>(Classes::FName::GNames));
 
     ptr = FindPattern(
         "\x8B\x15\x00\x00\x00\x00\x8B\x0C\xB2\x8D\x44\x24\x30",
@@ -565,6 +589,7 @@ bool game::Init()
     if (!ptr) { spdlog::error("GObjects pattern not found: unsupported game version?"); return false; }
     Classes::UObject::GObjects = reinterpret_cast<decltype(Classes::UObject::GObjects)>(
         *reinterpret_cast<void**>(static_cast<std::uint8_t*>(ptr) + 2));
+    addr::Game().Set("GObjects", reinterpret_cast<std::uintptr_t>(Classes::UObject::GObjects));
 
     spdlog::info("SDK globals: GNames={} entries, GObjects={} objects",
                  Classes::FName::GetGlobalNames().Num(), Classes::UObject::GetGlobalObjects().Num());
@@ -579,6 +604,7 @@ bool game::Init()
         "\x6C\x24\x00\x00\xFF\x89",
         "???????xxxxxxxxx?xxxxxxxx????xxxxxx?xxxxxxxxxxxxxx??xx");
     if (!ptr) { spdlog::error("LevelLoad pattern not found"); return false; }
+    addr::Game().Set("LevelLoad", reinterpret_cast<std::uintptr_t>(ptr));
     if (!HookAt(ptr, reinterpret_cast<void*>(&LevelLoadHook), reinterpret_cast<void**>(&oLevelLoad), "LevelLoad")) return false;
 
     ptr = FindPattern(
@@ -586,6 +612,7 @@ bool game::Init()
         "\x00\x00\x00\x00\x8B\x15\x00\x00\x00\x00\x8B\xE8",
         "xxxxxxxxxx????xx????xx????xx");
     if (!ptr) { spdlog::error("Tick pattern not found"); return false; }
+    addr::Game().Set("Tick", reinterpret_cast<std::uintptr_t>(ptr));
     if (!HookAt(ptr, reinterpret_cast<void*>(&TickHook), reinterpret_cast<void**>(&oTick), "Tick")) return false;
 
     HookExtras();
@@ -612,6 +639,7 @@ void game::Shutdown()
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
+    sig::Game().Save();         // Patterns first found since startup (lazy hooks)
     g_blockInput = false;       // Let the tick hook hand the controller its look input back
     for (int i = 0; i < 40 && g_inputApplied; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     g_ready = false;
@@ -669,14 +697,38 @@ void game::OnPlayerDeath(DeathCallback callback)
 
 bool game::DeathHooked() { return g_deathHooked; }
 
-bool game::ConsoleCommand(const std::string& command)
+bool game::IsInState(Classes::UObject* object, const char* state)
+{
+    // Read from the object's state frame (FStateFrame::StateNode, 0x1C into it), then up the states it extends, like the
+    // engine's IsInState does. Calling Core.Object.IsInState through ProcessEvent writes no answer at all in this game
+    // (nor does GetStateName), so it can't be used.
+    constexpr int kStateFrame = 0x18;           // UObject::StateFrame
+    constexpr int kStateNode = 0x1C;            // FStateFrame::StateNode (checked: it must be a State)
+    if (!object) return false;
+    const auto* frame = layout::PtrAt<const std::uint8_t>(object, kStateFrame);
+    if (!frame) return false;
+    auto* node = layout::PtrAt<Classes::UStruct>(frame, kStateNode);
+    if (!node || !IsA(node, Classes::UState::StaticClass())) return false;
+    const int want = NameIndex(state);
+    if (want <= 0) return false;
+    for (int depth = 0; node && depth < 32; node = SuperOf(node), ++depth)
+        if (node->Name.Index == want) return true;
+    return false;
+}
+
+bool game::ConsoleCommand(const std::string& command, std::string* output)
 {
     auto* pc = Controller();
     if (!pc || command.empty()) return false;
     const std::wstring wide(command.begin(), command.end());    // Console commands are ASCII
     // The FString only borrows the buffer; the engine copies what it keeps. The returned string is the engine's (and
     // usually empty): left alone, freeing it would need the engine's allocator.
-    pc->ConsoleCommand(Classes::FString(wide.c_str()), false);
+    const Classes::FString out = pc->ConsoleCommand(Classes::FString(wide.c_str()), false);
+    if (output) {
+        output->clear();
+        if (out.IsValid())
+            for (const wchar_t* c = out.c_str(); *c; ++c) output->push_back(*c < 128 ? static_cast<char>(*c) : '?');
+    }
     spdlog::info("Console: {}", command);
     return true;
 }

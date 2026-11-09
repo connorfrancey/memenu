@@ -2,6 +2,9 @@
 
 An internal mod menu, trainer and TAS / macro tool for Mirror's Edge (2008, PC), written in C++.
 
+On the `mirage` branch it is becoming **Mirage**, a mod loader: mods written in Lua (or as native DLLs) on top of a
+live, reflected model of the engine, with the menu's own features as the first mods. See [Mirage](#mirage-the-mod-loader-in-progress).
+
 - [Installing](#installing)
 - [Using the menu](#using-the-menu)
   - [The basics](#the-basics)
@@ -17,6 +20,7 @@ An internal mod menu, trainer and TAS / macro tool for Mirror's Edge (2008, PC),
   - [Features and the staged build](#features-and-the-staged-build)
   - [Working with the game](#working-with-the-game)
   - [The TAS internals](#the-tas-internals)
+  - [Mirage: the mod loader (in progress)](#mirage-the-mod-loader-in-progress)
   - [Testing](#testing)
   - [Logs, diagnostics and developer mode](#logs-diagnostics-and-developer-mode)
   - [Releasing](#releasing)
@@ -523,6 +527,7 @@ when you changed something that touches the game.
 | `src/core/`            | module system, settings / controls, keybinds, scheduler, caches, notifications |
 | `src/features/<tab>/`  | one file per module, grouped by tab                                          |
 | `src/game/`            | game integration on top of the Mirror's Edge SDK: player, levels, flight, object lookups |
+| `src/runtime/`         | Mirage: UnrealLib packages, Lua VM, computed/live layouts, `mirage::call`     |
 | `src/tas/`             | TAS engine (`engine`), sessions (`tas`), the replay format (`replay`), scripted macros (`macro.h`) |
 | `src/render/`          | debug renderer and meshes (Collision View)                                   |
 | `src/minimal/`         | the bare hook used by the first stages of the staged build                   |
@@ -674,6 +679,40 @@ The `.merp` layout is documented at the top of `src/tas/replay.cpp`: magic `MERP
 (`HEAD`, `META`, `NAME`, `TIME`, `EVNT`, `SYNC`, `CAMK`, `EXTN`), then `END ` with an FNV-1a checksum. Unknown chunks are
 skipped, so new data can be added without breaking old readers. Bump `kVersion` only for changes old readers can't
 skip.
+
+### Mirage: the mod loader (in progress)
+
+Mirage turns the menu into a mod loader, in the spirit of Fabric (a loader plus hooks, everything else in mods) and
+Geode (a native runtime with a stable API, an in-game mod manager and tooling). The full plan, ten steps each ending in
+a checked milestone, is in [`doc/mirage-plan.md`](doc/mirage-plan.md).
+
+```
+MirrorsEdge.exe
+ └─ dinput8.dll ............ loader: loads mirage.dll
+     └─ mirage.dll ......... runtime: engine layer, reflection, hooks, events, VFS, mod manager UI
+         ├─ Lua 5.4 ....... one sandboxed state per Lua mod
+         ├─ mods\memenu\ ... the current features, as first-party mods
+         └─ mods\<id>\ ..... mod.json + main.lua and/or <id>.dll + content```
+
+- **Lua 5.4** (compiled as C++, so a Lua error unwinds C++ frames) is the main way to write a mod: one sandboxed state
+  per mod, no `io` / `os.execute` / `package.loadlib`, files only inside the mod's folder. Native DLL mods use the same
+  API through a stable, versioned C ABI.
+- **[UnrealLib](https://github.com/connorfrancey/UnrealLib)** reads the game's own packages (Core, Engine, TdGame) in
+  the process, so mods reach any property or function by name, without generated bindings.
+
+**Done so far** (all checked by self-tests in the real game, `memenu game-test`):
+
+1. **Groundwork:** C++20; UnrealLib and Lua linked into the DLL (`src/runtime/`). Core, Engine and TdGame are read in
+   about 0.07 s, 44 MB while loaded and nothing left after (self-test "Mirage runtime", which also runs 13 Lua sandbox
+   checks).
+2. **Live engine model:** memory layouts computed from the packages match the engine for all 13,481 classes, structs,
+   functions and states and 33,987 properties (self-test "Mirage layouts"). `mirage::call` lays out parameters from
+   the engine's own `UFunction` (4-byte UBOOLs, return value last) and runs native-index functions that `ProcessEvent`
+   silently refuses (self-test "Mirage calls"). That fixed SDK calls that never worked: `SetMove`, `SetRotation`,
+   `MoveSmooth`, `IsInState` and others.
+
+**Next:** an SDK generator from the packages, the mod format and ABI v1, the loader and mod lifecycle, hooks and
+events, content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
 
 ### Testing
 

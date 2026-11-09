@@ -88,13 +88,40 @@ namespace
         Refresh();
     }
 
+    // Installed: say so and offer to start the game right away.
+    void InstallAndOffer(HWND owner, const fs::path& dir)
+    {
+        std::wstring msg;
+        if (!install::Install(dir, msg)) {
+            MessageBoxW(owner, msg.c_str(), kTitle, MB_ICONERROR);
+            return;
+        }
+        msg += L"\n\nStart Mirror's Edge now?";
+        if (MessageBoxW(owner, msg.c_str(), kTitle, MB_YESNO | MB_ICONINFORMATION) == IDYES) install::Launch(dir);
+    }
+
+    // Asks whether to keep the settings (when there are any). False: cancelled.
+    bool AskUninstall(HWND owner, const fs::path& dir, bool& removeSettings)
+    {
+        removeSettings = false;
+        if (!install::Inspect(dir).hasSettings)
+            return MessageBoxW(owner, (L"Remove Mirror's Edge Menu from " + dir.wstring() + L"?").c_str(), kTitle,
+                               MB_OKCANCEL | MB_ICONQUESTION) == IDOK;
+        const int answer = MessageBoxW(owner,
+            (L"Remove Mirror's Edge Menu from " + dir.wstring() + L"?\n\n"
+             L"Your menu settings (config, themes, saved macros, logs) are in its folder:\n\n"
+             L"Yes: remove it and delete the settings.\nNo: remove it, keep the settings for next time.").c_str(),
+            kTitle, MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
+        if (answer == IDCANCEL) return false;
+        removeSettings = answer == IDYES;
+        return true;
+    }
+
     void DoInstall()
     {
         const auto dir = install::NormalizeGameDir(CurrentDir());
         if (!dir) return;
-        std::wstring msg;
-        const bool ok = install::Install(*dir, msg);
-        MessageBoxW(g_wnd, msg.c_str(), kTitle, ok ? MB_ICONINFORMATION : MB_ICONERROR);
+        InstallAndOffer(g_wnd, *dir);
         Refresh();
     }
 
@@ -103,14 +130,7 @@ namespace
         const auto dir = install::NormalizeGameDir(CurrentDir());
         if (!dir) return;
         bool removeSettings = false;
-        if (install::Inspect(*dir).hasSettings) {
-            const int answer = MessageBoxW(g_wnd,
-                L"Also delete your menu settings (config, themes, logs)?\n\n"
-                L"Yes: delete everything.\nNo: keep them for the next install.",
-                kTitle, MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
-            if (answer == IDCANCEL) return;
-            removeSettings = answer == IDYES;
-        }
+        if (!AskUninstall(g_wnd, *dir, removeSettings)) return;
         std::wstring msg;
         const bool ok = install::Uninstall(*dir, removeSettings, msg);
         MessageBoxW(g_wnd, msg.c_str(), kTitle, ok ? MB_ICONINFORMATION : MB_ICONERROR);
@@ -129,7 +149,7 @@ namespace
     void CreateControls()
     {
         const std::wstring version = L"Version " + Widen(install::Version()) +
-                                     L"  •  installs into the game folder, nothing else on your PC is changed";
+                                     L"  •  goes in the game folder; uninstall any time from Settings > Apps";
         Control(L"STATIC", L"Mirror's Edge Menu", 0, 16, 12, 488, 28, 0, g_titleFont);
         Control(L"STATIC", version.c_str(), 0, 16, 42, 488, 18, 0, g_font);
 
@@ -247,6 +267,13 @@ namespace
         if (!gameDir) return report(2, L"Mirror's Edge was not found. Pass the game folder on the command line.");
         if (install::Inspect(*gameDir).gameRunning)
             return report(3, L"Mirror's Edge is running. Close the game, then try again.");
+
+        // With a window (Settings > Apps runs `uninstall.exe --uninstall <dir>`): ask first, offer to play after
+        if (!quiet && doInstall) {
+            InstallAndOffer(nullptr, *gameDir);
+            return install::Inspect(*gameDir).installed ? 0 : 1;
+        }
+        if (!quiet && doUninstall && !AskUninstall(nullptr, *gameDir, removeSettings)) return 0;
 
         std::wstring msg;
         const bool ok = doInstall ? install::Install(*gameDir, msg) : install::Uninstall(*gameDir, removeSettings, msg);

@@ -35,6 +35,8 @@ constexpr std::uint32_t kTime = Tag("TIME");   // f32 dt per frame. Only written
 constexpr std::uint32_t kEvnt = Tag("EVNT");   // sparse inputs: u32 frame + Event, in frame order
 constexpr std::uint32_t kSync = Tag("SYNC");   // Sync per frame
 constexpr std::uint32_t kExtn = Tag("EXTN");   // key/value strings, free for anyone
+constexpr std::uint32_t kCamk = Tag("CAMK");   // camera keys: u32 count + CameraKey, sorted by frame
+constexpr std::uint32_t kMark = Tag("MARK");   // bookmarks: u32 count + (u32 frame, string name), sorted by frame
 constexpr std::uint32_t kEnd  = Tag("END ");
 
 constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
@@ -171,7 +173,35 @@ void Replay::Truncate(std::size_t frame)
     events.resize(frames[frame].first);
     frames.resize(frame);
     if (sync.size() > frame) sync.resize(frame);
+    camera.erase(std::remove_if(camera.begin(), camera.end(), [&](const CameraKey& k) { return k.frame >= frame; }),
+                 camera.end());
+    markers.erase(std::remove_if(markers.begin(), markers.end(), [&](const Marker& m) { return m.frame >= frame; }),
+                  markers.end());
     InvalidateSyncFrom(frame);
+}
+
+void Replay::SetMarker(std::uint32_t frame, std::string name)
+{
+    if (name.empty()) name = "Frame " + std::to_string(frame);
+    auto it = std::lower_bound(markers.begin(), markers.end(), frame,
+                               [](const Marker& m, std::uint32_t f) { return m.frame < f; });
+    if (it != markers.end() && it->frame == frame) it->name = std::move(name);
+    else markers.insert(it, Marker{frame, std::move(name)});
+}
+
+bool Replay::EraseMarker(std::uint32_t frame)
+{
+    const auto it = std::find_if(markers.begin(), markers.end(), [&](const Marker& m) { return m.frame == frame; });
+    if (it == markers.end()) return false;
+    markers.erase(it);
+    return true;
+}
+
+const Marker* Replay::MarkerAt(std::uint32_t frame) const
+{
+    for (const Marker& m : markers)
+        if (m.frame == frame) return &m;
+    return nullptr;
 }
 
 void Replay::InsertFrames(std::size_t at, std::size_t count, float dt)
@@ -182,6 +212,10 @@ void Replay::InsertFrames(std::size_t at, std::size_t count, float dt)
     f.first = static_cast<std::uint32_t>(at < frames.size() ? frames[at].first : events.size());
     frames.insert(frames.begin() + at, count, f);
     if (!sync.empty()) sync.insert(sync.begin() + std::min(at, sync.size()), count, Sync{});
+    for (CameraKey& k : camera)
+        if (k.frame >= at) k.frame += static_cast<std::uint32_t>(count);
+    for (Marker& m : markers)
+        if (m.frame >= at) m.frame += static_cast<std::uint32_t>(count);
     InvalidateSyncFrom(at);
 }
 
@@ -195,6 +229,20 @@ void Replay::EraseFrames(std::size_t at, std::size_t count)
     frames.erase(frames.begin() + at, frames.begin() + at + count);
     for (std::size_t i = at; i < frames.size(); ++i) frames[i].first -= evEnd - evBegin;
     if (sync.size() > at) sync.erase(sync.begin() + at, sync.begin() + std::min(sync.size(), at + count));
+    camera.erase(std::remove_if(camera.begin(), camera.end(),
+                                [&](const CameraKey& k) { return k.frame >= at && k.frame < at + count; }),
+                 camera.end());
+    for (CameraKey& k : camera)
+        if (k.frame >= at + count) k.frame -= static_cast<std::uint32_t>(count);
+    // A bookmark on an erased frame moves to the first frame after the cut (it still marks that point of the run)
+    for (Marker& m : markers)
+        if (m.frame >= at + count) m.frame -= static_cast<std::uint32_t>(count);
+        else if (m.frame >= at) m.frame = static_cast<std::uint32_t>(at);
+    for (std::size_t i = markers.size(); i-- > 1;)
+        if (markers[i].frame == markers[i - 1].frame) markers.erase(markers.begin() + static_cast<std::ptrdiff_t>(i));
+    if (!markers.empty() && markers.back().frame >= frames.size())
+        markers.erase(std::remove_if(markers.begin(), markers.end(), [&](const Marker& m) { return m.frame >= frames.size(); }),
+                      markers.end());
     InvalidateSyncFrom(at);
 }
 
@@ -278,6 +326,12 @@ std::uint64_t Replay::InputHash() const
             h = Fnv(&e.value2, sizeof e.value2, h);
         }
     }
+    for (const CameraKey& k : camera) {
+        h = Fnv(&k.frame, sizeof k.frame, h);
+        h = Fnv(&k.yaw, sizeof k.yaw, h);
+        h = Fnv(&k.pitch, sizeof k.pitch, h);
+        h = Fnv(&k.ease, sizeof k.ease, h);
+    }
     return h;
 }
 
@@ -334,6 +388,23 @@ bool Replay::Save(const std::filesystem::path& path, std::string* error) const
     if (!sync.empty()) {
         w.Begin(kSync);
         w.Raw(sync.data(), sync.size() * sizeof(Sync));
+        w.End();
+    }
+
+    if (!camera.empty()) {
+        w.Begin(kCamk);
+        w.Put(static_cast<std::uint32_t>(camera.size()));
+        w.Raw(camera.data(), camera.size() * sizeof(CameraKey));
+        w.End();
+    }
+
+    if (!markers.empty()) {
+        w.Begin(kMark);
+        w.Put(static_cast<std::uint32_t>(markers.size()));
+        for (const Marker& m : markers) {
+            w.Put(m.frame);
+            w.Str(m.name);
+        }
         w.End();
     }
 
@@ -452,6 +523,22 @@ bool Replay::Load(const std::filesystem::path& path, std::string* error)
             ok = size % sizeof(Sync) == 0;
             rep.sync.resize(size / sizeof(Sync));
             if (ok && !rep.sync.empty()) std::memcpy(rep.sync.data(), c.Here(), size);
+        } else if (tag == kCamk) {
+            std::uint32_t n = 0;
+            ok = c.Get(n) && c.Left() / sizeof(CameraKey) >= n;
+            for (std::uint32_t i = 0; ok && i < n; ++i) {
+                CameraKey k;
+                ok = c.Get(k) && static_cast<std::uint8_t>(k.ease) <= static_cast<std::uint8_t>(Ease::Hold);
+                rep.camera.push_back(k);
+            }
+        } else if (tag == kMark) {
+            std::uint32_t n = 0;
+            ok = c.Get(n);
+            for (std::uint32_t i = 0; ok && i < n; ++i) {
+                Marker m;
+                ok = c.Get(m.frame) && c.Str(m.name);
+                rep.markers.push_back(std::move(m));
+            }
         } else if (tag == kExtn) {
             std::uint32_t n = 0;
             ok = c.Get(n);
@@ -486,7 +573,18 @@ bool Replay::Load(const std::filesystem::path& path, std::string* error)
     std::uint32_t first = 0;
     for (Frame& f : rep.frames) { f.first = first; first += f.count; }
     if (!rep.sync.empty() && rep.sync.size() != frameCount) rep.sync.clear();
+    for (std::size_t i = 0; i < rep.camera.size(); ++i) {
+        if (rep.camera[i].frame >= frameCount || (i > 0 && rep.camera[i].frame <= rep.camera[i - 1].frame)) {
+            Fail(error, "camera keys out of order");
+            return false;
+        }
+    }
     rep.syncValidUntil = std::min<std::uint32_t>(rep.syncValidUntil, frameCount);
+    // Bookmarks are only notes: bad ones are dropped, not an error
+    std::vector<Marker> marks;
+    marks.swap(rep.markers);
+    for (Marker& m : marks)
+        if (m.frame < frameCount && !rep.MarkerAt(m.frame)) rep.SetMarker(m.frame, std::move(m.name));
 
     *this = std::move(rep);
     return true;
@@ -535,6 +633,18 @@ bool Replay::ExportJson(const std::filesystem::path& path, std::string* error) c
         }
     }
     j["inputs"] = std::move(inputs);
+
+    if (!camera.empty()) {
+        json keys = json::array();
+        for (const CameraKey& k : camera)
+            keys.push_back({{"frame", k.frame}, {"yaw", k.yaw}, {"pitch", k.pitch}, {"ease", EaseName(k.ease)}});
+        j["camera"] = std::move(keys);
+    }
+    if (!markers.empty()) {
+        json marks = json::array();
+        for (const Marker& m : markers) marks.push_back({{"frame", m.frame}, {"name", m.name}});
+        j["markers"] = std::move(marks);
+    }
 
     std::ofstream out(path, std::ios::trunc);
     if (!out) { Fail(error, "can't write " + path.string()); return false; }
@@ -622,6 +732,33 @@ bool Replay::ImportJson(const std::filesystem::path& path, std::string* error)
             rep.BeginFrame(dts[f]);
             for (; next < inputs.size() && inputs[next].frame == f; ++next) rep.AddEvent(inputs[next].e);
         }
+        if (j.contains("camera") && j["camera"].is_array()) {
+            for (const json& c : j["camera"]) {
+                if (!c.is_object() || !c.contains("frame")) { Fail(error, "every camera key needs \"frame\""); return false; }
+                CameraKey k;
+                k.frame = c["frame"].get<std::uint32_t>();
+                k.yaw = c.value("yaw", 0.f);
+                k.pitch = c.value("pitch", 0.f);
+                const std::string ease = c.value("ease", "smooth");
+                if (ease == "linear") k.ease = Ease::Linear;
+                else if (ease == "smooth") k.ease = Ease::Smooth;
+                else if (ease == "hold") k.ease = Ease::Hold;
+                else { Fail(error, "unknown ease \"" + ease + "\""); return false; }
+                if (k.frame >= frameCount) { Fail(error, "a camera key is past \"frames\""); return false; }
+                rep.camera.push_back(k);
+            }
+            std::stable_sort(rep.camera.begin(), rep.camera.end(),
+                             [](const CameraKey& a, const CameraKey& b) { return a.frame < b.frame; });
+            // One key per frame: the last one written wins
+            for (std::size_t i = rep.camera.size(); i-- > 1;)
+                if (rep.camera[i].frame == rep.camera[i - 1].frame) rep.camera.erase(rep.camera.begin() + i - 1);
+        }
+        if (j.contains("markers") && j["markers"].is_array())
+            for (const json& m : j["markers"]) {
+                if (!m.is_object() || !m.contains("frame")) continue;
+                const auto frame = m["frame"].get<std::uint32_t>();
+                if (frame < frameCount) rep.SetMarker(frame, m.value("name", std::string()));
+            }
         rep.syncValidUntil = 0;
         *this = std::move(rep);
         return true;
@@ -641,6 +778,16 @@ const char* KindName(EventKind kind)
         case EventKind::Axis:        return "axis";
     }
     return "?";
+}
+
+const char* EaseName(Ease ease)
+{
+    switch (ease) {
+        case Ease::Linear: return "linear";
+        case Ease::Smooth: return "smooth";
+        case Ease::Hold:   return "hold";
+    }
+    return "smooth";
 }
 
 const char* StartName(StartKind kind)

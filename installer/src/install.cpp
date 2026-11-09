@@ -5,7 +5,10 @@
 
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <shellapi.h>
 
+#include <cwctype>
+#include <ctime>
 #include <fstream>
 #include <iterator>
 #include <system_error>
@@ -23,6 +26,9 @@ namespace install
         constexpr const wchar_t* kMenuDir = L"memenu";
         constexpr const wchar_t* kMenuDll = L"medge_menu.dll";
         constexpr char kMarker[] = "memenu-loader:";
+        constexpr const wchar_t* kUninstaller = L"uninstall.exe";
+        bool g_registerApp = true;      // SetAppRegistration
+        constexpr const wchar_t* kAppKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MirrorsEdgeMenu";
 
         std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
@@ -96,13 +102,110 @@ namespace install
         {
             std::error_code ec;
             if (!fs::is_directory(menuDir, ec)) return false;
-            for (const auto& e : fs::directory_iterator(menuDir, ec))
-                if (_wcsicmp(e.path().filename().c_str(), kMenuDll) != 0) return true;
+            for (const auto& e : fs::directory_iterator(menuDir, ec)) {
+                const std::wstring name = e.path().filename().wstring();   // Kept: filename() is a temporary
+                if (_wcsicmp(name.c_str(), kMenuDll) != 0 && _wcsicmp(name.c_str(), kUninstaller) != 0) return true;
+            }
             return false;
+        }
+
+        fs::path SelfPath()
+        {
+            wchar_t buf[MAX_PATH * 2]{};
+            GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+            return buf;
+        }
+
+        bool SamePath(const fs::path& a, const fs::path& b)
+        {
+            std::error_code ec;
+            return fs::equivalent(a, b, ec);
+        }
+
+        void SetString(HKEY key, const wchar_t* name, const std::wstring& value)
+        {
+            RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
+                           static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+        }
+
+        void SetDword(HKEY key, const wchar_t* name, DWORD value)
+        {
+            RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof value);
+        }
+
+        std::uintmax_t FileSize(const fs::path& p)
+        {
+            std::error_code ec;
+            const auto n = fs::file_size(p, ec);
+            return ec ? 0 : n;
+        }
+
+        // Windows' list of installed apps (Settings > Apps, Programs and Features): "Mirror's Edge Menu", with
+        // uninstall.exe (a copy of this installer) as its uninstaller.
+        bool RegisterApp(const fs::path& gameDir, std::wstring& error)
+        {
+            const fs::path menuDir = gameDir / kMenuDir;
+            const fs::path uninstaller = menuDir / kUninstaller;
+            const fs::path self = SelfPath();
+            if (!SamePath(self, uninstaller) && !CopyFileW(self.c_str(), uninstaller.c_str(), FALSE)) {
+                error = L"cannot copy the uninstaller to " + uninstaller.wstring() + L": " + ErrorText(GetLastError());
+                return false;
+            }
+
+            HKEY key = nullptr;
+            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, kAppKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) !=
+                ERROR_SUCCESS) {
+                error = L"cannot add Mirror's Edge Menu to the installed apps (registry)";
+                return false;
+            }
+            const std::wstring quoted = L"\"" + uninstaller.wstring() + L"\"";
+            const std::wstring dir = L" \"" + gameDir.wstring() + L"\"";
+            wchar_t date[16]{};
+            const std::time_t now = std::time(nullptr);
+            std::tm tm{};
+            localtime_s(&tm, &now);
+            std::wcsftime(date, std::size(date), L"%Y%m%d", &tm);
+            const auto kb = static_cast<DWORD>((FileSize(menuDir / kMenuDll) + FileSize(gameDir / kLoader) +
+                                                FileSize(uninstaller)) / 1024);
+
+            SetString(key, L"DisplayName", L"Mirror's Edge Menu");
+            SetString(key, L"DisplayVersion", Widen(Version()));
+            SetString(key, L"Publisher", L"medge-menu");
+            SetString(key, L"DisplayIcon", (gameDir / kGameExe).wstring() + L",0");
+            SetString(key, L"InstallLocation", menuDir.wstring());
+            SetString(key, L"InstallDate", date);
+            SetString(key, L"UninstallString", quoted + L" --uninstall" + dir);
+            SetString(key, L"QuietUninstallString", quoted + L" --uninstall" + dir + L" --quiet");
+            SetString(key, L"URLInfoAbout", L"https://github.com/connorfrancey/memenu");
+            SetString(key, L"Comments", L"Trainer, TAS and tools menu for Mirror's Edge. Installed in " + gameDir.wstring());
+            SetDword(key, L"EstimatedSize", kb);
+            SetDword(key, L"NoModify", 1);
+            SetDword(key, L"NoRepair", 1);
+            RegCloseKey(key);
+            return true;
+        }
+
+        void UnregisterApp() { RegDeleteKeyW(HKEY_LOCAL_MACHINE, kAppKey); }
+
+        // A running exe can't delete itself: a hidden cmd waits for it to exit, then deletes it (and the folder,
+        // if nothing else is left in it).
+        void DeleteAfterExit(const fs::path& exe, const fs::path& dir)
+        {
+            std::wstring cmd = L"cmd.exe /d /c ping -n 3 127.0.0.1 >nul & del /f /q \"" + exe.wstring() + L"\" & rmdir \"" +
+                               dir.wstring() + L"\"";
+            STARTUPINFOW si{sizeof(si)};
+            PROCESS_INFORMATION pi{};
+            if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr,
+                               nullptr, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
         }
     }
 
     const char* Version() { return MEMENU_VERSION; }
+
+    void SetAppRegistration(bool on) { g_registerApp = on; }
 
     std::optional<fs::path> NormalizeGameDir(const fs::path& picked)
     {
@@ -168,11 +271,28 @@ namespace install
             message = L"Install failed: " + error;
             return false;
         }
+        // Listed in Windows' installed apps. Not being able to is no reason to undo the install: say so instead.
+        std::wstring appNote;
+        if (g_registerApp && !RegisterApp(gameDir, error))
+            appNote = L"\n\n(" + error + L". Uninstall by running this installer again.)";
 
         message = std::wstring(s.installed ? L"Updated" : L"Installed") + L" Mirror's Edge Menu " + Widen(Version()) +
                   L".\n\nStart Mirror's Edge the way you always do (Steam, EA app, shortcut). The menu loads with the "
-                  L"game: press INSERT to open it, END to unload it." + note;
+                  L"game: press INSERT to open it, END to unload it.\n\nTo uninstall: Windows Settings > Apps > "
+                  L"Mirror's Edge Menu, or run this installer again." + note + appNote;
         return true;
+    }
+
+    void Launch(const fs::path& gameDir)
+    {
+        std::wstring lower = gameDir.wstring();
+        for (wchar_t& c : lower) c = static_cast<wchar_t>(std::towlower(c));
+        const std::wstring target = lower.find(L"\\steamapps\\") != std::wstring::npos
+                                        ? L"steam://rungameid/" + std::to_wstring(detect::kSteamAppId)
+                                        : (gameDir / kGameExe).wstring();
+        // Through Explorer: it runs as the user, so the game doesn't inherit the installer's admin rights.
+        const std::wstring args = L"\"" + target + L"\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
     }
 
     bool Uninstall(const fs::path& gameDir, bool removeSettings, std::wstring& message)
@@ -189,9 +309,30 @@ namespace install
         if (fs::exists(gameDir / kBackup, ec) && !fs::exists(loader, ec)) fs::rename(gameDir / kBackup, loader, ec);
 
         const fs::path menuDir = gameDir / kMenuDir;
-        if (removeSettings) fs::remove_all(menuDir, ec);
-        else fs::remove(menuDir / kMenuDll, ec);
-        if (ec) { message = L"Some files could not be removed from " + menuDir.wstring() + L": " + Widen(ec.message()); return false; }
+        const fs::path uninstaller = menuDir / kUninstaller;
+        const bool runningFromThere = SamePath(SelfPath(), uninstaller);
+        std::wstring failed;
+        const auto remove = [&](const fs::path& p) {
+            std::error_code e;
+            fs::remove_all(p, e);
+            if (e && failed.empty()) failed = p.filename().wstring() + L": " + Widen(e.message());
+        };
+        if (removeSettings) {
+            std::vector<fs::path> entries;      // listed first: not deleted while the folder is being read
+            for (const auto& entry : fs::directory_iterator(menuDir, ec)) entries.push_back(entry.path());
+            for (const fs::path& entry : entries)
+                if (!(runningFromThere && SamePath(entry, uninstaller))) remove(entry);
+        } else {
+            remove(menuDir / kMenuDll);
+            if (!runningFromThere) remove(uninstaller);
+        }
+        if (g_registerApp) UnregisterApp();
+        if (runningFromThere) DeleteAfterExit(uninstaller, menuDir);   // this exe: once it has exited
+        else if (removeSettings) fs::remove(menuDir, ec);
+        if (!failed.empty()) {
+            message = L"Some files could not be removed from " + menuDir.wstring() + L" (" + failed + L")";
+            return false;
+        }
 
         message = removeSettings ? L"Mirror's Edge Menu was removed, with its settings."
                                  : L"Mirror's Edge Menu was removed. Your settings were kept in " + menuDir.wstring() + L".";

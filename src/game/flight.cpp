@@ -1,6 +1,7 @@
 #include "flight.h"
 #include "flight_math.h"
 #include "game.h"
+#include "runtime/engine_calls.h"
 
 #include <Windows.h>
 
@@ -39,7 +40,7 @@ namespace flight
         {
             pawn->StopSlideEffect();
             pawn->StopAllCustomAnimations(0.0f);
-            pawn->SetMove(Classes::EMovement::MOVE_Walking, false, false);
+            mirage::engine::SetMove(pawn, Classes::EMovement::MOVE_Walking);
 
             g_state.active = true;
             g_state.mode = mode;
@@ -176,7 +177,7 @@ namespace flight
             delta.X = dx;
             delta.Y = dy;
             delta.Z = dz;
-            pawn->MoveSmooth(delta);
+            mirage::engine::MoveSmooth(pawn, delta);     // A native index: the SDK's call never ran
         }
     }
 

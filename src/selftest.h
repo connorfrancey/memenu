@@ -26,8 +26,53 @@
 //   perf        what the menu costs per tick and per frame (from the scheduler and caches)
 //   unload      hooks removed and the menu unloaded cleanly (written by dllmain after the unload)
 // Module states and settings are put back as they were before the test.
+//
+// Developer mode can also run it from the menu (the Test module, features/debug/self_test.cpp): Start() runs the
+// chosen tests on a thread of their own, in the game as it is, without unloading or closing anything afterwards.
+#include <cstdint>
+#include <set>
+#include <string>
+#include <vector>
+
 namespace selftest {
     bool Requested();   // Reads (and deletes) the `selftest` file. Call once, after logging::Init
     void Run();         // Menu thread, after the hooks are installed. Returns when done (or when unload is requested)
     void Finish(bool unloadedCleanly);   // After hooks::Uninstall: final step, writes the result, closes the game
+
+    // ---- Runs from the menu (developer mode) ----------------------------------------------------------------------------
+    struct RunOptions {
+        std::set<std::string> only;     // Feature test and module names; empty = everything (like `memenu game-test`)
+        bool loadLevel = false;         // false: test where the player is now (a level must be loaded)
+        std::string map = "edge_p";     // With loadLevel: which level, and where in it (see `checkpoint=` above)
+        int checkpoint = 2;
+        unsigned ticks = 10;            // Engine ticks (and frames) each module stays on
+        bool fast = true;               // The 62 fps cap off while testing (put back afterwards)
+    };
+    struct TestInfo {
+        std::string name;
+        bool optIn;                     // Only runs when picked by name (measurements, not checks)
+    };
+    std::vector<TestInfo> FeatureTests();   // The feature tests this build has, in run order
+
+    bool Start(RunOptions options);     // Render thread (a click). False while a run is going
+    void Stop();                        // Ends the run at the next wait; settings are put back
+    bool Running();
+    void Shutdown();                    // Menu thread, at unload, before the hooks go: stops a run and waits for it
+
+    struct StepView {
+        enum class State { Running, Passed, Failed } state = State::Running;
+        std::string name;
+        double seconds = 0.0;
+        std::vector<std::string> problems, notes;
+    };
+    struct Progress {
+        bool running = false;
+        bool stopped = false;           // The last run was stopped (Stop, or unload) before it finished
+        int run = 0;                    // Runs started this session (0: none yet)
+        int planned = 0;                // Steps the run expects (an estimate: for a progress bar)
+        double seconds = 0.0;           // Of the current run, or the last one
+        std::uint64_t firstLogId = 0;   // Log lines after this one belong to the run (logging::CopySince)
+        std::vector<StepView> steps;
+    };
+    Progress Snapshot();                // Any thread
 }

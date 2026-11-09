@@ -47,13 +47,18 @@ namespace ctl {
 		void Show(float width);
 
 		// What `slot` 0 (key) and 1 (keyAlt) do for this control, or nullptr if it has no such binding.
-		virtual const char *BindLabel(int slot) const { (void)slot; return nullptr; }
+		// The labels the control was made with (Checkbox: "Toggle", Slider: "Increase" / "Decrease", ...).
+		virtual const char *BindLabel(int slot) const { return slot == 0 ? binds_.key : slot == 1 ? binds_.keyAlt : nullptr; }
 		bool Bindable() const { return BindLabel(0) || BindLabel(1); }
 		// A bound key was pressed. Shows a short on-screen message with the new value.
 		void Press(int slot);
 
 		// Controls with a value are saved in the config
 		virtual bool Persistent() const { return false; }
+		// ... and can go back to the value they were made with (right click: Reset to default)
+		virtual bool Resettable() const { return false; }
+		virtual bool IsDefault() const { return true; }
+		virtual void ResetToDefault() {}
 		virtual void Save(nlohmann::ordered_json &out) const { (void)out; }
 		virtual void Load(const nlohmann::ordered_json &in) { (void)in; }
 
@@ -84,16 +89,20 @@ namespace ctl {
 		void Set(T v) { value_ = Clamp(std::move(v)); }
 
 		bool Persistent() const override { return true; }
+		bool Resettable() const override { return true; }
+		bool IsDefault() const override { return value_ == Clamp(default_); }
+		void ResetToDefault() override { Set(default_); }
 		void Save(nlohmann::ordered_json& out) const override;
 		void Load(const nlohmann::ordered_json& in) override;
 
 	protected:
 		Value(Module* owner, std::string name, T value, std::string tooltip, Binds binds = {})
-			: Setting(owner, std::move(name), std::move(tooltip), binds), value_(std::move(value)) {}
+			: Setting(owner, std::move(name), std::move(tooltip), binds), value_(value), default_(std::move(value)) {}
 
 		virtual T Clamp(T v) const { return v; }    // Not called by this constructor: derived ones clamp their default
 
 		T value_;
+		T default_;     // As made (clamped when compared / reset)
 	};
 
 	// Save/Load live in setting.cpp, for these types only.
@@ -101,6 +110,7 @@ namespace ctl {
 	extern template class Value<int>;
 	extern template class Value<float>;
 	extern template class Value<std::array<float, 4>>;
+	extern template class Value<std::string>;
 
 	// ---- Value Controls --------------------------------------------------------------------------------------------------
 	class Checkbox final : public Value<bool> {
@@ -179,6 +189,16 @@ namespace ctl {
 		std::string Fire(int slot) override;
 	};
 
+	// A line of text: a box to type it in, saved like the others. Also a way to
+	// remember a choice by name (a file picked from a list): hide it with VisibleIf and Set() it.
+	class Text final : public Value<std::string> {
+	public:
+		Text(Module* owner, std::string name, std::string value = {}, std::string tooltip = {});
+
+	protected:
+		void Draw(float width) override;
+	};
+
 	// ---- Input ------------------------------------------------------------------------------------------------------
 	// A key the module polls (hold-to-boost, up/down while flying). Bound with the button itself. The value is the
 	// virtual-key code.
@@ -186,7 +206,9 @@ namespace ctl {
 	public:
 		KeyHold(Module* owner, std::string name, int vk = 0, std::string tooltip = {});
 
-		bool Down() const;                    // Currently held?
+		bool Down() const;                    // Currently held? (with the modifiers it was bound with)
+		int& Binding() { return value_; }     // For the bind buttons (core/bindings.h)
+		bool Resettable() const override { return false; }   // Its button clears it with a right click already
 
 	protected:
 		void Draw(float width) override;
@@ -216,6 +238,17 @@ namespace ctl {
 	class Separator final : public Setting {
 	public:
 		explicit Separator(Module* owner, std::string title = {});    // Empty: a plain line
+
+	protected:
+		void Draw(float width) override;
+	};
+
+	// A header that folds the controls after it away. Its open state is saved; the controls it holds are the ones that
+	// call `VisibleIf(section)` (Section converts to bool, so `[this] { return section && other; }` works too).
+	class Section final : public Value<bool> {
+	public:
+		Section(Module* owner, std::string title, bool open = true);
+		bool Resettable() const override { return false; }   // Open or closed is layout, not a setting
 
 	protected:
 		void Draw(float width) override;

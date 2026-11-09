@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <intrin.h>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -35,9 +36,11 @@ double  g_realSecondsPerCycle = 0.0;
 
 FrameHandler g_frameHandler = nullptr;
 InputFilter g_inputFilter = nullptr;
+InputMonitor g_inputMonitor = nullptr;
 
 // Virtual clock (game thread)
 std::atomic<bool> g_virtual{false};   // read by every thread that asks for the time
+std::atomic<bool> g_suspended{false}; // SuspendVirtualClock
 long long g_virtualTicks = 0;         // counter value at the start of this frame
 long long g_frameTicks = 0;           // length of this frame in ticks
 long long g_calls = 0;                // QueryPerformanceCounter calls this frame
@@ -69,15 +72,19 @@ srand_t g_srand = nullptr;
 
 bool OnGameThreadVirtual()
 {
-    return g_virtual.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_gameThread.load(std::memory_order_relaxed);
+    return g_virtual.load(std::memory_order_relaxed) && !g_suspended.load(std::memory_order_relaxed) &&
+           GetCurrentThreadId() == g_gameThread.load(std::memory_order_relaxed);
 }
 
 // ---- hooks ------------------------------------------------------------------------------------------------------------
 // The engine's frame timing (mtas: "UpdateEngine"). Takes no arguments; ecx/edx are passed through untouched in case it
 // is a member function.
+std::uintptr_t g_callerStack = 0;     // the game thread's stack pointer where the engine called the frame timing
+
 void __fastcall TimeHook(void* ecx, void* edx)
 {
     g_gameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_callerStack = reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
     if (g_frameHandler && g_frameHandler()) return;
     oTime(ecx, edx);
 }
@@ -136,6 +143,16 @@ int __fastcall InputKeyHook(void* self, void* /*edx*/, void* viewport, int contr
             in.controllerId = controllerId;
             if (g_inputFilter(in)) return 0;
         }
+        if (g_inputMonitor) {
+            RawInput in;
+            in.nameIndex = nameIndex;
+            in.nameNumber = nameNumber;
+            in.event = event;
+            in.value = amount;
+            in.gamepad = gamepad != 0;
+            in.controllerId = controllerId;
+            g_inputMonitor(in);
+        }
     }
     return oInputKey(self, viewport, controllerId, nameIndex, nameNumber, event, amount, gamepad);
 }
@@ -156,6 +173,17 @@ int __fastcall InputAxisHook(void* self, void* /*edx*/, void* viewport, int cont
             in.gamepad = gamepad != 0;
             in.controllerId = controllerId;
             if (g_inputFilter(in)) return 0;
+        }
+        if (g_inputMonitor) {
+            RawInput in;
+            in.nameIndex = nameIndex;
+            in.nameNumber = nameNumber;
+            in.axis = true;
+            in.value = delta;
+            in.value2 = deltaTime;
+            in.gamepad = gamepad != 0;
+            in.controllerId = controllerId;
+            g_inputMonitor(in);
         }
     }
     return oInputAxis(self, viewport, controllerId, nameIndex, nameNumber, delta, deltaTime, gamepad);
@@ -281,6 +309,8 @@ bool Init()
 
 bool Available() { return g_available; }
 
+std::uintptr_t CallerStack() { return g_callerStack; }
+
 bool IsGameThread() { return GetCurrentThreadId() == g_gameThread.load(std::memory_order_relaxed); }
 
 void SetFrameHandler(FrameHandler handler) { g_frameHandler = handler; }
@@ -319,7 +349,10 @@ double RealSeconds()
     return static_cast<double>(t.QuadPart) / static_cast<double>(f.QuadPart ? f.QuadPart : 1);
 }
 
+void SuspendVirtualClock(bool suspend) { g_suspended = suspend; }
+
 void SetInputFilter(InputFilter filter) { g_inputFilter = filter; }
+void SetInputMonitor(InputMonitor monitor) { g_inputMonitor = monitor; }
 
 bool Inject(const RawInput& in)
 {
@@ -327,6 +360,7 @@ bool Inject(const RawInput& in)
     void* viewport = nullptr;
     if (!InputTarget(client, viewport)) return false;
 
+    if (g_inputMonitor) g_inputMonitor(in);
     g_injecting = true;
     if (in.axis)
         oInputAxis(client, viewport, in.controllerId, in.nameIndex, in.nameNumber, in.value, in.value2, in.gamepad);

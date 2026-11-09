@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -265,4 +266,74 @@ TEST(Replay, ImportRejectsBadJson)
     EXPECT_FALSE(r.ImportJson(path, &error));
     std::filesystem::remove(path);
     EXPECT_NE(error.find("sideways"), std::string::npos);
+}
+
+// The example macros in examples/replays/ load, survive a .merp round trip and leave no key pressed at the end.
+TEST(Replay, ExamplesLoad)
+{
+    const std::filesystem::path folder = MEMENU_EXAMPLES_DIR "/replays";
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+        if (entry.path().extension() != ".json") continue;
+        SCOPED_TRACE(entry.path().filename().string());
+        ++count;
+
+        Replay r;
+        std::string error;
+        ASSERT_TRUE(r.ImportJson(entry.path(), &error)) << error;
+        EXPECT_FALSE(r.description.empty());
+        EXPECT_GT(r.FrameCount(), 0u);
+        ExpectConsistent(r);
+
+        std::vector<std::string> held;
+        for (const Event& e : r.events) {
+            const std::string& key = r.Name(e.name);
+            if (e.kind == EventKind::Pressed) held.push_back(key);
+            if (e.kind == EventKind::Released) held.erase(std::remove(held.begin(), held.end(), key), held.end());
+        }
+        EXPECT_TRUE(held.empty()) << "still pressed at the end: " << held.front();
+
+        const auto path = TempFile("example.merp");
+        Replay back;
+        ASSERT_TRUE(r.Save(path, &error)) << error;
+        ASSERT_TRUE(back.Load(path, &error)) << error;
+        std::filesystem::remove(path);
+        EXPECT_EQ(back.InputHash(), r.InputHash());
+    }
+    EXPECT_GT(count, 0u) << "no examples in " << folder.string();
+}
+
+TEST(Replay, MarkersSaveAndFollowEdits)
+{
+    Replay r = RunAndJump();
+    r.SetMarker(30, "before the jump");
+    r.SetMarker(10, "");                       // unnamed: "Frame 10"
+    r.SetMarker(30, "jump");                   // the same frame: renamed
+    ASSERT_EQ(r.markers.size(), 2u);
+    EXPECT_EQ(r.markers[0].name, "Frame 10");  // sorted by frame
+    EXPECT_EQ(r.markers[1].name, "jump");
+
+    const auto merp = std::filesystem::temp_directory_path() / "memenu_markers.merp";
+    const auto json = std::filesystem::temp_directory_path() / "memenu_markers.json";
+    ASSERT_TRUE(r.Save(merp, nullptr));
+    ASSERT_TRUE(r.ExportJson(json, nullptr));
+    for (const auto& path : {merp, json}) {
+        Replay back;
+        ASSERT_TRUE(path.extension() == ".json" ? back.ImportJson(path, nullptr) : back.Load(path, nullptr));
+        ASSERT_EQ(back.markers.size(), 2u) << path;
+        EXPECT_EQ(back.markers[1].frame, 30u);
+        EXPECT_EQ(back.markers[1].name, "jump");
+        std::filesystem::remove(path);
+    }
+    EXPECT_EQ(r.InputHash(), RunAndJump().InputHash());   // Bookmarks don't change how it plays
+
+    r.InsertFrames(5, 3, 1.f / 60.f);          // Both move 3 later
+    EXPECT_EQ(r.markers[0].frame, 13u);
+    EXPECT_EQ(r.markers[1].frame, 33u);
+    r.EraseFrames(30, 5);                      // The jump's frame is cut: it moves to the cut
+    EXPECT_EQ(r.markers[1].frame, 30u);
+    r.Truncate(20);                            // Past the end: gone
+    ASSERT_EQ(r.markers.size(), 1u);
+    EXPECT_TRUE(r.EraseMarker(13));
+    EXPECT_FALSE(r.EraseMarker(13));
 }

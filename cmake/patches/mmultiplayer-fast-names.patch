@@ -1,0 +1,108 @@
+diff --git a/Client/sdk/ME_Basic.hpp b/Client/sdk/ME_Basic.hpp
+index f58a72d..037f565 100644
+--- a/Client/sdk/ME_Basic.hpp
++++ b/Client/sdk/ME_Basic.hpp
+@@ -107,13 +107,18 @@ struct FString : private TArray<wchar_t>
+ 		return Data;
+ 	}
+ 
++	// ASCII narrowed with a loop, like FNameEntry::GetName (no std::locale per call)
+ 	std::string ToString() const
+ 	{
+ 		auto length = std::wcslen(Data);
+ 
+ 		std::string str(length, '\0');
+ 
+-		std::use_facet<std::ctype<wchar_t>>(std::locale()).narrow(Data, Data + length, '?', &str[0]);
++		for (std::size_t i = 0; i < length; ++i)
++		{
++			const wchar_t c = Data[i];
++			str[i] = c < 0x80 ? static_cast<char>(c) : '?';
++		}
+ 
+ 		return str;
+ 	}
+@@ -173,16 +178,30 @@ public:
+ 		return WideName;
+ 	}
+ 
++	// Engine names are ASCII: narrowed with a loop. The std::locale this used to build on every call made each name
++	// read cost microseconds, and the menu reads thousands (classes, keys, actors).
+ 	std::string GetName() const
+ 	{
+ 		auto length = std::wcslen(WideName);
+ 
+ 		std::string str(length, '\0');
+ 
+-		std::use_facet<std::ctype<wchar_t>>(std::locale()).narrow(WideName, WideName + length, '?', &str[0]);
++		for (std::size_t i = 0; i < length; ++i)
++		{
++			const wchar_t c = WideName[i];
++			str[i] = c < 0x80 ? static_cast<char>(c) : '?';
++		}
+ 
+ 		return str;
+ 	}
++
++	// The name equals `ascii`, compared in place (no string is built).
++	bool Equals(const char* ascii) const
++	{
++		std::size_t k = 0;
++		while (ascii[k] != '\0' && WideName[k] == static_cast<wchar_t>(static_cast<unsigned char>(ascii[k]))) ++k;
++		return ascii[k] == '\0' && WideName[k] == L'\0';
++	}
+ };
+ 
+ struct FName
+@@ -202,34 +221,39 @@ struct FName
+ 	{
+ 	};
+ 
++	// Looks the name up in the engine's name table. Names found before are remembered (a name keeps its index for the
++	// whole session); the table is walked comparing in place, without building a string per entry.
+ 	FName(const char* nameToFind)
+ 		: Index(0),
+ 		  Number(0)
+ 	{
+-		static std::set<size_t> cache;
++		struct Cache
++		{
++			std::set<std::pair<std::string, int32_t>> found;
++		};
++		static Cache cache;
+ 
+-		for (auto i : cache)
++		const auto at = cache.found.lower_bound({nameToFind, INT32_MIN});
++		if (at != cache.found.end() && at->first == nameToFind)
+ 		{
+-			if (GetGlobalNames()[i]->GetName() == nameToFind)
++			auto entry = GetGlobalNames()[at->second];
++			if (entry != nullptr && entry->Equals(nameToFind))
+ 			{
+-				Index = i;
+-				
++				Index = at->second;
+ 				return;
+ 			}
+ 		}
+ 
+ 		for (auto i = 0u; i < GetGlobalNames().Num(); ++i)
+ 		{
+-			if (GetGlobalNames()[i] != nullptr)
++			auto entry = GetGlobalNames()[i];
++			if (entry != nullptr && entry->Equals(nameToFind))
+ 			{
+-				if (GetGlobalNames()[i]->GetName() == nameToFind)
+-				{
+-					cache.insert(i);
++				cache.found.insert({nameToFind, static_cast<int32_t>(i)});
+ 
+-					Index = i;
++				Index = i;
+ 
+-					return;
+-				}
++				return;
+ 			}
+ 		}
+ 	};

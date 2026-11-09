@@ -20,6 +20,9 @@ bool Init();                    // after game::Init(). False: a pattern is missi
 bool Available();
 
 bool IsGameThread();
+// Where the engine's own frames start on the game thread's stack during this frame's timing call (the address of the
+// hook's return address): everything above it is the engine's main loop, the same every frame.
+std::uintptr_t CallerStack();
 
 // ---- frame timing ---------------------------------------------------------------------------------------------------
 // Called on the game thread at the start of every engine frame, before the engine ticks. Return true when the session
@@ -33,6 +36,9 @@ void UseVirtualClock(bool on);
 void SetFrameTime(double seconds, double dt);
 // Real seconds from the unhooked performance counter.
 double RealSeconds();
+// While suspended, the game thread reads the real clocks again (the virtual clock and the engine's time are kept). For
+// work done between frames while a session is paused, e.g. drawing the menu: ImGui times itself with the counter.
+void SuspendVirtualClock(bool suspend);
 
 // ---- input --------------------------------------------------------------------------------------------------------------
 struct RawInput {
@@ -50,6 +56,11 @@ void SetInputFilter(InputFilter filter);
 
 // Hands an input to the engine as if it came from the keyboard/mouse/gamepad. False: the viewport isn't known yet.
 bool Inject(const RawInput& input);
+
+// Sees every input the engine actually gets: real input that the filter let through, and every injected one (a TAS
+// recording's deferred input, a playback's). What the game does is what this sees. Game thread.
+using InputMonitor = void (*)(const RawInput& input);
+void SetInputMonitor(InputMonitor monitor);
 
 // ---- misc -----------------------------------------------------------------------------------------------------------------
 void SeedRand(std::uint32_t seed);          // the game thread's rand() state (msvcr80)

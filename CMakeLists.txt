@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.2)
 project(medge_menu LANGUAGES C CXX)
-set(MEMENU_VERSION "2.0.1-dev")   # Shown by the installer, stamped into the loader
+set(MEMENU_VERSION "2.0.2-dev")   # Shown by the installer, stamped into the loader
 
 # -------------------------------------------------------------------------------------------------
 # Platform Guards (Mirror's Edge is a 32-bit Windows process)
@@ -13,7 +13,7 @@ endif()
 
 # -------------------------------------------------------------------------------------------------
 # Global Settings (must come before dependencies so they inherit them)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -24,11 +24,23 @@ option(MEMENU_BUILD_TESTS     "Build the GoogleTest unit tests (memenu_tests)" O
 option(MEMENU_BUILD_INSTALLER "Build the dinput8.dll loader and memenu_installer.exe" OFF)
 option(MEMENU_BUILD_LAUNCHER  "Build medge_launcher.exe (injects the DLL into a running game)" OFF)
 option(MEMENU_BUILD_TESTHOST  "Build memenu_testhost.exe (loads the DLL into a D3D9 test app: memenu verbose-build)" OFF)
-# Dev tooling packages (Ccache, CPMLicenses, Format.cmake): not needed to build the DLL
-option(MEMENU_DEV_TOOLS       "Fetch Ccache.cmake, CPMLicenses.cmake and Format.cmake" OFF)
+option(MEMENU_UNREALLIB       "Build UnrealLib's tests and status tool (unreallib_tests). The DLL links UnrealLib whenever it has the game layer" ${MEMENU_BUILD_TESTS})
+# Developer mode (`memenu --dev`): the DLL switches its stored developer mode on at every start, which shows the Test
+# module (in-game self-tests). A normal build keeps what the menu stored (Misc > Developer Mode).
+option(MEMENU_DEV_MODE        "Developer build: developer mode on at every start (Test module)" OFF)
+option(MEMENU_BUILD_BENCHMARKS "Build the nanobench benchmarks (memenu_bench: memenu bench)" OFF)
+# Dev tooling packages (CPMLicenses, Format.cmake): not needed to build the DLL
+option(MEMENU_DEV_TOOLS       "Fetch CPMLicenses.cmake and Format.cmake" OFF)
+# ccache (https://ccache.dev): reuses compiled objects across rebuilds, clean builds and build folders. Needs ccache
+# on PATH (or CCACHE_PROGRAM). With MSVC, debug info goes into each object (/Z7) instead of a shared compiler PDB
+# (/Zi), which ccache can't cache; the linker still writes the DLL's PDB, so debugging is the same.
+option(MEMENU_CCACHE          "Compile through ccache (needs ccache installed)" OFF)
 # Performance optimizations (src/core/optimizations.h): caches, cached object/name lookups, the scheduler's intervals,
 # skipping and budget. Optional: OFF (`memenu build --no-optimizations`) does the work every time, nothing else changes.
 option(MEMENU_OPTIMIZATIONS   "Build the performance optimizations (caches, scheduler intervals/budget)" ON)
+# Tracy profiler (`memenu build --tracy`): zones on the scheduler, every module's OnTick/OnRender and the menu's frame.
+# The client only collects while the Tracy profiler is connected (on demand) and only listens on localhost.
+option(MEMENU_TRACY           "Build with the Tracy profiler client (connect with the Tracy profiler, same version)" OFF)
 # Staged build (`memenu minimal --stage N`, presets x86-minimal-*): stage 0 is only the D3D9 hook and ImGui's demo
 # window (links only MinHook, ImGui and d3d9); each stage adds back a layer or a group of features, least likely to
 # break the game first, up to the whole trainer. The stages are listed in cmake/Features.cmake.
@@ -37,6 +49,9 @@ set(MEMENU_MINIMAL_STAGE 0 CACHE STRING "Staged build: how far to go (0 = D3D9 h
 
 # CMake 4 dropped support for cmake_minimum_required < 3.5; this lets older dependencies configure
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
+# ccache: before CPM and every target, so the dependencies are cached too
+include(cmake/Ccache.cmake)
 
 # Use CPM.cmake
 include(cmake/CPM.cmake)
@@ -59,15 +74,19 @@ file(GLOB_RECURSE HEADER_FILES CONFIGURE_DEPENDS
 # Only the always-built files stay from the glob: core, menu, hooks, config, themes and features/tabs.cpp.
 set(_feature_files ${SOURCE_FILES})
 list(FILTER _feature_files INCLUDE REGEX "/src/features/[^/]+/")
-list(FILTER SOURCE_FILES EXCLUDE REGEX "/src/(features/[^/]+|tas|game|render)/")
+list(FILTER SOURCE_FILES EXCLUDE REGEX "/src/(features/[^/]+|tas|game|render|speedrun|runtime)/")
 foreach(file IN LISTS _feature_files)   # A new module file has to be listed there, or it would silently not build
   if(NOT file IN_LIST MEMENU_ALL_FEATURE_SOURCES)
     message(FATAL_ERROR "${file} is not listed in cmake/Features.cmake: add a memenu_feature() for it")
   endif()
 endforeach()
 list(APPEND SOURCE_FILES ${MEMENU_FEATURE_SOURCES})
+if(MEMENU_GAME)   # The Mirage runtime (src/runtime/): UnrealLib and Lua, linked with the game layer
+  file(GLOB_RECURSE _runtime_sources CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/*.cpp)
+  list(APPEND SOURCE_FILES ${_runtime_sources})
+endif()
 if(NOT MEMENU_GAME)   # Keep the IDE tree to what is built
-  list(FILTER HEADER_FILES EXCLUDE REGEX "/src/(tas|game)/")
+  list(FILTER HEADER_FILES EXCLUDE REGEX "/src/(tas|game|runtime)/")
 endif()
 if(MEMENU_BARE)    # Staged build before the menu: hooks.cpp + src/minimal/ (its own DllMain and gui::)
   set(SOURCE_FILES ${PROJECT_SOURCE_DIR}/src/hooks.cpp ${PROJECT_SOURCE_DIR}/src/minimal/minimal.cpp)
@@ -94,10 +113,20 @@ memenu_add_build_info(${PROJECT_NAME})
 
 source_group(TREE ${PROJECT_SOURCE_DIR}/src FILES ${HEADER_FILES} ${SOURCE_FILES})
 
+# The example macros (examples/replays/) built into the DLL: the TAS writes them to replays/ on first start
+if("tas" IN_LIST MEMENU_ENABLED_FEATURES)
+  include(cmake/Examples.cmake)
+  memenu_embed_examples(_examples_cpp)
+  target_sources(${PROJECT_NAME} PRIVATE ${_examples_cpp})
+  source_group("Generated" FILES ${_examples_cpp})
+endif()
+
 target_include_directories(${PROJECT_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
   MEMENU_GAME=$<BOOL:${MEMENU_GAME}>
   MEMENU_OPTIMIZATIONS=$<BOOL:${MEMENU_OPTIMIZATIONS}>
+  MEMENU_DEV_MODE=$<BOOL:${MEMENU_DEV_MODE}>
+  MEMENU_TRACY=$<AND:$<BOOL:${MEMENU_TRACY}>,$<NOT:$<BOOL:${MEMENU_BARE}>>>   # Staged stages 0-2 never link it
   MEMENU_MINIMAL=$<BOOL:${MEMENU_BARE}>     # The code's "minimal": no menu, src/minimal/ instead (stages 0-2)
   MEMENU_MINIMAL_STAGE=$<IF:$<BOOL:${MEMENU_BARE}>,${MEMENU_STAGE},0>)
 foreach(feature IN LISTS MEMENU_ENABLED_FEATURES)    # MEMENU_FEATURE_<NAME>=0/1 in the code
@@ -136,6 +165,12 @@ endif()
 
 include(cmake/Libraries.cmake)
 
+# The menu's font built into the DLL (hooks.cpp loads it): after the libraries, it comes from imgui's sources
+include(cmake/Fonts.cmake)
+memenu_embed_font(_font_cpp)
+target_sources(${PROJECT_NAME} PRIVATE ${_font_cpp})
+source_group("Generated" FILES ${_font_cpp})
+
 # -------------------------------------------------------------------------------------------------
 # Loader (dinput8.dll proxy next to the game exe) and its installer: the normal way to use the menu
 if(MEMENU_BUILD_INSTALLER)
@@ -158,4 +193,10 @@ endif()
 if(MEMENU_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# -------------------------------------------------------------------------------------------------
+# Benchmarks (nanobench)
+if(MEMENU_BUILD_BENCHMARKS)
+  add_subdirectory(bench)
 endif()

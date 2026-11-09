@@ -15,6 +15,12 @@ struct IDirect3DSurface9;
 // The game thread publishes an immutable Scene plus the camera; the render thread draws it. Preferably inside the
 // game's frame, when the engine resolves its scene color (StretchRect) while the world's depth buffer is still bound, so
 // the world hides the volumes behind it. When no such resolve is seen it falls back to an overlay without depth.
+//
+// The view: the engine renders on its own thread, a frame or so behind the game thread, so a camera copied from the game
+// is not quite the one of the frame on screen (the volumes swim when you turn). The renderer looks for the engine's own
+// view-projection matrix among the vertex shader constants it sets (OnVertexShaderConstants), by matching them against
+// the camera for a second, and from then on draws with the frame's own matrix: exact position, FOV, aspect and depth.
+// The game camera is the fallback.
 namespace debugrender {
     enum class Depth { Scene, Overlay };            // Tested against the world's depth / always on top
     enum class Path { None, InScene, Overlay };     // How the last frame was drawn
@@ -25,6 +31,7 @@ namespace debugrender {
         float fovOffset = 0.f;          // Degrees added to the camera FOV
         float aspect = 0.f;             // 0 = from the viewport
         float nearPlane = 10.f;         // Used when the engine's near plane is unknown
+        float staticOpacity = 0.25f;    // Faces of the static geometry layer (SetStatic)
     };
 
     struct Scene {
@@ -38,9 +45,10 @@ namespace debugrender {
     struct Stats {
         bool drawn = false;
         Path path = Path::None;
-        bool viewFromDevice = false;
+        bool viewFromDevice = false;    // The engine's own matrix (shader constants or device transform)
         float nearUsed = 0.f;
         std::size_t triangles = 0, lines = 0, shapes = 0, labels = 0;
+        std::size_t staticTriangles = 0, staticLines = 0;
         double buildMs = 0.0;
         bool sceneHookSeen = false;
         bool overlayFallback = false;
@@ -52,10 +60,18 @@ namespace debugrender {
     void SetCamera(const rmath::Camera& camera);
     void SetEngineNear(float nearPlane);            // 0 = unknown
     void SetScene(std::shared_ptr<const Scene> scene);  // nullptr clears
+    // Small geometry that moves (pawn cylinders), replaced every tick and drawn with the scene. Empty clears.
+    void SetDynamic(rmesh::MeshData mesh);
+    // World geometry (static meshes), built off the game thread and replaced now and then. Drawn with the scene, its
+    // faces at Style::staticOpacity. nullptr clears.
+    void SetStatic(std::shared_ptr<const rmesh::MeshData> mesh);
     std::shared_ptr<const Scene> CurrentScene();
+    rmath::Camera CurrentCamera();                  // The camera last set with SetCamera
 
     // ---- Render thread ----------------------------------------------------------------------------------------------
     void OnStretchRect(IDirect3DDevice9* dev, IDirect3DSurface9* src, IDirect3DSurface9* dst);  // Before the real call
+    // IDirect3DDevice9::SetVertexShaderConstantF, before the real call: `count` float4 registers from `start`.
+    void OnVertexShaderConstants(unsigned start, const float* data, unsigned count);
     void BeginFrame(IDirect3DDevice9* dev);         // EndScene, before Render
     void Render(IDirect3DDevice9* dev);             // EndScene: overlay path
     void EndFrame();                                // After the frame was presented

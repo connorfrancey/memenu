@@ -3,14 +3,18 @@
 
 #include "config.h"
 #include "core/clock.h"
+#include "core/hardware.h"
 #include "core/module.h"
+#include "core/profile.h"
 #include "core/scheduler.h"
+#include "core/signature_cache.h"
 #include "diag.h"
 #include "failsafe.h"
 #include "hooks.h"
 #include "log.h"
 #include "paths.h"
 #include "selftest.h"
+#include "core/devmode.h"
 #include "test_mode.h"
 #include "unload.h"
 #if MEMENU_GAME
@@ -48,15 +52,20 @@ static void Run(HMODULE module)
     });
     unload::Requested();   // Creates the unload event before anything can go wrong
     const bool selfTest = selftest::Requested();   // `selftest` file next to the DLL: see selftest.h
+    if (selfTest) diag::LogGameCrashesUntil(~0ull);    // Every crash, the game's too, with its stack
+    if (selfTest) config::SetAutoSave(false);      // The test changes settings: never into the player's config
 
     STARTUP_STEP(clk::Init());                // Before anything measures time (scheduler, caches)
+    prof::Start();                            // Tracy builds only: profiler threads (stopped after the hooks are gone)
     STARTUP_STEP(theme::Init());              // themes/ folder + built-in theme files
     STARTUP_STEP(modules::Init());            // Every module registered with MEM_MODULE
     STARTUP_STEP(modules::ApplyDefaults());   // Modules flagged enabledByDefault
     STARTUP_STEP(config::Load());             // Saved state overrides the defaults
+    devmode::ApplyBuild();                    // A developer build (memenu --dev) switches developer mode on
     STARTUP_STEP(sched::Init());              // Run order of the modules' OnTick
 
     const bool installed = STARTUP_STEP(hooks::Install());
+    spdlog::info("Hardware: {}", hw::Get().Summary());   // After the hooks: they add the GPU
     if (installed)
     {
 #if MEMENU_GAME
@@ -79,6 +88,7 @@ static void Run(HMODULE module)
         spdlog::info("Built without game integration (no game features enabled): menu only");
 #endif
 
+        sig::Game().Save();   // The pattern scans of startup: the next start skips them
         spdlog::info("Startup finished in {} ms; waiting for the game to draw a frame (EndScene)",
                      GetTickCount64() - attachedAt);
 
@@ -98,11 +108,15 @@ static void Run(HMODULE module)
             }
         }
         spdlog::info("Unload requested: unloading (EndScene ran {} times)", hooks::EndSceneCalls());
+        selftest::Shutdown();   // A run started from the Test module: stopped, settings put back (needs the hooks)
 
         config::Save();         // Save before DisableAll so the enabled state is kept
         modules::DisableAll();  // Modules queue their cleanup on the game thread...
 #if MEMENU_GAME
         game::Shutdown();       // ...which we wait for before the hooks go away
+#endif
+#if MEMENU_FEATURE_TAS
+        tas::Shutdown();        // The snapshot workers
 #endif
         hooks::Uninstall();
         if (selfTest) selftest::Finish(true);
@@ -114,9 +128,42 @@ static void Run(HMODULE module)
         if (selfTest) selftest::Finish(false);
     }
 
+    prof::Stop();           // After the hooks: nothing records zones any more
     spdlog::info("Unloading");
     testmode::Uninstall();
     diag::RemoveCrashLogger();
+}
+
+// One menu per game process. Two copies (the installed one from the game's loader plus an injected build) both hook
+// the frame timing, input and D3D9: neither TAS works and both menus fight over the mouse. The launcher's "already
+// loaded" check can't catch two copies arriving at the same moment, so the first one to get here owns the process.
+// False when another copy holds the process. `claim` is closed at unload (nullptr if the mutex couldn't be created at
+// all: then nothing is guarded, and this copy runs anyway).
+static bool ClaimProcess(HANDLE& claim)
+{
+    wchar_t name[64];
+    swprintf_s(name, L"Local\\MirrorsEdgeMenu-%lu", GetCurrentProcessId());
+    claim = CreateMutexW(nullptr, FALSE, name);
+    if (claim && GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(claim);
+        claim = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Unloads this copy if another one owns the process (not inline in MainThread: __try can't share it with objects).
+static HANDLE ClaimOrLeave(HMODULE module)
+{
+    HANDLE claim = nullptr;
+    if (ClaimProcess(claim)) return claim;
+    spdlog::error("Another copy of the menu is already running in this game: this one ({}) does nothing and unloads. "
+                  "Use one copy: the installed one, or an injected build with the installed one disabled",
+                  diag::ModulePath(module));
+    OutputDebugStringW(L"MirrorsEdgeMenu: another copy is already running in this process; not starting\n");
+    logging::Shutdown();
+    FreeLibraryAndExitThread(module, 0);
 }
 
 static DWORD WINAPI MainThread(LPVOID param)
@@ -124,6 +171,8 @@ static DWORD WINAPI MainThread(LPVOID param)
     const auto module = static_cast<HMODULE>(param);
     paths::Init(module);
     logging::Init();
+    HANDLE claim = ClaimOrLeave(module);
+
     failsafe::Start([](const char* message) {   // First: it must work even if anything after this hangs
         spdlog::critical("{}", message);
         spdlog::default_logger()->flush();
@@ -137,6 +186,7 @@ static DWORD WINAPI MainThread(LPVOID param)
 #endif
     failsafe::Stop();
     logging::Shutdown();
+    if (claim) CloseHandle(claim);   // Last: a copy injected after this unload may run
     FreeLibraryAndExitThread(module, 0);
 }
 

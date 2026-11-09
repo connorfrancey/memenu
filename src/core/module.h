@@ -41,6 +41,9 @@ public:
 	int Order() const { return order_; }
 	
 	virtual bool IsAction() const { return false; }
+	// Left out of the menu, the search, the hotkey list and key presses while true (developer-only modules while
+	// developer mode is off). Its saved state and settings are kept. Any thread.
+	virtual bool Hidden() const { return false; }
 	bool Enabled() const { return enabled_; }
 	void SetEnabled(bool on);					// Calls OnEnable/OnDisable, and switches off the rest of its group
 	void Toggle();								// Action modules run OnTrigger instead
@@ -122,6 +125,9 @@ namespace modules
 	void Tick();				// Game thread: runs the scheduler (OnTick of the enabled modules that are due)
 	void Render();				// Render thread: OnRender of enabled modules
 	void OnKey(int vk);			// Module hotkeys and control key bindings
+	// Keys another part of the menu is using right now (a TAS session's controls): OnKey ignores them, so pausing a
+	// TAS with F5 doesn't also switch on the module bound to F5. Any thread; replaces the previous set.
+	void SetReservedKeys(std::vector<int> keys);
 
 	// ---- Lookup --------------------------------------------------------------------------------------------------------------------
 	std::vector<std::unique_ptr<Tab>>& Tabs();

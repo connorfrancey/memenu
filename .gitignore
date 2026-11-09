@@ -1,7 +1,7 @@
 # Build output
 cmake-build-*/
 build/
-dist/
+/dist/
 
 # Python tooling (uv)
 .venv/

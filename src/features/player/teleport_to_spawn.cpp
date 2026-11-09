@@ -2,6 +2,7 @@
 #include "core/notify.h"
 #include "game/game.h"
 #include "game/player_state.h"
+#include "runtime/engine_calls.h"
 
 #include <ME_SDK.hpp>
 #include <spdlog/spdlog.h>
@@ -39,8 +40,9 @@ public:
                          start->Location.Y, start->Location.Z);
             Classes::FRotator rot{};
             rot.Yaw = start->Rotation.Yaw;
-            pc->SetRotation(rot);
-            pawn->SetRotation(rot);
+            // Through mirage::engine: SetRotation has a native index, which ProcessEvent refuses (the SDK's call never ran)
+            mirage::engine::SetRotation(pc, rot);
+            mirage::engine::SetRotation(pawn, rot);
             notify::Push("Teleported to the level start");
         });
     }

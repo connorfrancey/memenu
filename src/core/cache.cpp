@@ -41,7 +41,8 @@ namespace cache
 		for (const Stats& s : Registry()) 
 		{
 			out.push_back({s.name, s.scope, s.hits.load(std::memory_order_relaxed), s.misses.load(std::memory_order_relaxed),
-							s.invalidations.load(std::memory_order_relaxed),
+							s.invalidations.load(std::memory_order_relaxed), s.evictions.load(std::memory_order_relaxed),
+							s.entries.load(std::memory_order_relaxed),
 							clk::Seconds(s.computeTicks.load(std::memory_order_relaxed))});
 		}
 		return out;
@@ -55,6 +56,8 @@ namespace cache
 			case Scope::Level: return "level";
 			case Scope::Timed: return "timed";
 			case Scope::Manual: return "manual";
+			case Scope::Lru: return "lru";
+			case Scope::Persistent: return "on disk";
 		}
 		return "?";
 	}

@@ -1,6 +1,12 @@
 #include "game.h"
+#include "game/object_cache.h"
+#include "game/object_ref.h"
 #include "game/uobject.h"
+#include "core/address_cache.h"
 #include "core/cache.h"
+#include "core/signature_cache.h"
+#include "paths.h"
+#include "unload.h"
 
 #include <Windows.h>
 
@@ -8,14 +14,16 @@
 #include <spdlog/spdlog.h>
 #include <ME_SDK.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
-
 
 namespace {
     std::atomic<bool> g_ready{false};
@@ -30,12 +38,14 @@ namespace {
     std::atomic<unsigned long long> g_ticks{0};
     std::atomic<bool> g_hasPawn{false};
     std::atomic<int> g_health{0}, g_maxHealth{0};
+    std::atomic<void*> g_playerPawn{nullptr};   // For hooks that run for every pawn: is this the player?
 
     std::mutex g_mutex;                         // Guards the two vectors below
     std::vector<game::TickCallback> g_tickCallbacks;
     std::vector<std::function<void()>> g_queue;
     std::vector<game::LevelLoadCallback> g_levelLoadCallbacks;
-    std::vector<game::StateChangeCallback> g_stateChangeCallbacks;   // Not called yet: no hook for it
+    std::vector<void (*)()> g_stateRestoredCallbacks;
+    std::vector<game::StateChangeCallback> g_stateChangeCallbacks;   // Run by the state handler hook
 
     // The local player's world and controller, game thread only. Kept between ticks while their slots in the object
     // list still hold them (checked once per tick, without touching the objects: see ValidateCache), dropped when a
@@ -74,15 +84,17 @@ namespace {
 
     // ---- Pattern scan over the main executable's image --------------------------------------------------------------
     // Pattern/mask as used by mmultiplayer: 'x' = byte must match, '?' = wildcard.
-    void* FindPattern(const char* pattern, const char* mask)
+    // Within [from, to) of the image (offsets from its base), clamped to the image. The scan itself: FindPatternRange
+    // goes through the signature cache first.
+    void* ScanRange(std::size_t from, std::size_t to, const char* pattern, const char* mask)
     {
         const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
         const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
         const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-        const std::size_t imageSize = nt->OptionalHeader.SizeOfImage;
+        const std::size_t imageSize = std::min<std::size_t>(nt->OptionalHeader.SizeOfImage, to);
         const std::size_t len = std::strlen(mask);
 
-        for (std::size_t off = 0; off + len <= imageSize;) {
+        for (std::size_t off = from; off + len <= imageSize;) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(base + off, &mbi, sizeof mbi)) break;
 
@@ -91,7 +103,8 @@ namespace {
             const bool readable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
 
             if (readable) {
-                for (std::size_t i = off; i + len <= regionEnd; ++i) {
+                const std::size_t end = std::min(regionEnd, imageSize);
+                for (std::size_t i = off; i + len <= end; ++i) {
                     bool match = true;
                     for (std::size_t j = 0; j < len && match; ++j)
                         match = mask[j] != 'x' || base[i + j] == static_cast<std::uint8_t>(pattern[j]);
@@ -101,6 +114,128 @@ namespace {
             off = regionEnd;
         }
         return nullptr;
+    }
+
+    // Remembered for this exe across starts (cache/signatures.json, bound in game::Init): see core/signature_cache.h.
+    void* FindPatternRange(std::size_t from, std::size_t to, const char* pattern, const char* mask)
+    {
+        return sig::Game().Find(pattern, mask, from, to, &ScanRange);
+    }
+
+    void* FindPattern(const char* pattern, const char* mask)
+    {
+        return FindPatternRange(0, ~std::size_t{0}, pattern, mask);
+    }
+
+    // The menu's signature cache for this MirrorsEdge.exe, loaded from the last start when it was the same exe.
+    void BindSignatureCache()
+    {
+        const auto base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        sig::Game().Bind(reinterpret_cast<std::uintptr_t>(base), nt->OptionalHeader.SizeOfImage, sig::IdentifyImage(base),
+                         paths::Dir().empty() ? std::filesystem::path{} : paths::Dir() / "cache" / "signatures.json");
+    }
+
+    // ---- Script events (UObject::ProcessEvent) ----------------------------------------------------------------------
+    // ProcessEvent runs thousands of times a frame, so the hook only compares the called function against a few cached
+    // pointers. The watch list only grows: an entry is written in full before the count that covers it is published.
+    constexpr int kMaxWatches = 64;
+    enum class WatchKind { Before, After, Block };
+    struct Watch
+    {
+        std::string name;
+        WatchKind kind = WatchKind::Before;
+        game::ScriptEventCallback callback = nullptr;
+        game::ScriptEventFilter filter = nullptr;
+    };
+    Watch g_watches[kMaxWatches];
+    std::atomic<Classes::UFunction*> g_watchFn[kMaxWatches];
+    std::atomic<int> g_watchCount{0};
+    std::atomic<bool> g_watchLookup{false};     // Some function is still to be looked up (game thread, next tick)
+    std::atomic<unsigned long long> g_scriptEvents{0};
+    bool g_processEventHooked = false;          // Under g_mutex
+    int (__thiscall *oProcessEvent)(Classes::UObject*, Classes::UFunction*, void*, void*) = nullptr;
+
+    // A watch's callback, kept from throwing into the engine. Returns the filter's answer (false for the others).
+    bool RunWatch(const Watch& w, Classes::UObject* self, void* params)
+    {
+        try {
+            if (w.kind == WatchKind::Block) return w.filter(self, params);
+            w.callback(self, params);
+        } catch (const std::exception& e) {
+            spdlog::error("Script event {}: {}", w.name, e.what());
+        } catch (...) {
+            spdlog::error("Script event {}: unknown exception", w.name);
+        }
+        return false;
+    }
+
+    int __fastcall ProcessEventHook(Classes::UObject* self, void* /*edx*/, Classes::UFunction* fn, void* params, void* result)
+    {
+        const int n = g_watchCount.load(std::memory_order_acquire);
+        bool watched = false, skip = false, hasAfter = false;
+        for (int i = 0; i < n; ++i) {
+            if (!fn || fn != g_watchFn[i].load(std::memory_order_relaxed)) continue;
+            watched = true;
+            const Watch& w = g_watches[i];
+            if (w.kind == WatchKind::After) { hasAfter = true; continue; }
+            if (RunWatch(w, self, params)) skip = true;
+        }
+        if (!watched) return oProcessEvent(self, fn, params, result);
+        g_scriptEvents.fetch_add(1, std::memory_order_relaxed);
+        if (skip) return 0;     // A filter took the call: the engine never sees it
+
+        const int ret = oProcessEvent(self, fn, params, result);
+        if (hasAfter)
+            for (int i = 0; i < n; ++i)
+                if (fn == g_watchFn[i].load(std::memory_order_relaxed) && g_watches[i].kind == WatchKind::After)
+                    RunWatch(g_watches[i], self, params);
+        return ret;
+    }
+
+    // Game thread. A full object walk per function (SDK FindObject compares full names): only done when something new
+    // is watched, and after a level load for the ones that weren't found.
+    void LookUpWatches()
+    {
+        if (!g_watchLookup.exchange(false)) return;
+        const int n = g_watchCount.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            if (g_watchFn[i].load()) continue;
+            // Another watch on the same function already found it: no second object walk
+            Classes::UFunction* fn = nullptr;
+            for (int j = 0; j < n && !fn; ++j)
+                if (j != i && g_watches[j].name == g_watches[i].name) fn = g_watchFn[j].load();
+            if (fn) { g_watchFn[i].store(fn); continue; }
+            fn = game::FindObject<Classes::UFunction>(g_watches[i].name);   // Cached, and not looked for again until a level load
+            g_watchFn[i].store(fn);
+            if (fn) spdlog::info("Script event: watching {}", g_watches[i].name);
+            else    spdlog::warn("Script event: {} not found (looked again after the next level load)", g_watches[i].name);
+        }
+    }
+
+    // Under g_mutex.
+    bool HookProcessEvent()
+    {
+        if (g_processEventHooked) return true;
+        // mmultiplayer's pattern for UObject::ProcessEvent; the SDK calls it as virtual function 61, the fallback.
+        void* target = FindPattern("\x56\x8B\xF1\x8B\x0D\x00\x00\x00\x00\x85\xC9\x74\x09", "xxxxx????xxxx");
+        void* fromVtable = nullptr;
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        for (std::size_t i = 0; i < objects.Num() && !fromVtable; ++i)
+            if (const auto* o = objects.GetByIndex(i)) fromVtable = (*reinterpret_cast<void* const* const*>(o))[61];
+        if (target && fromVtable && target != fromVtable)
+            spdlog::warn("ProcessEvent: the pattern ({}) and the vtable ({}) disagree, using the pattern", target, fromVtable);
+        if (!target) target = fromVtable;
+        if (!target) { spdlog::error("ProcessEvent not found: script events (speedrun auto splits) won't work"); return false; }
+        addr::Game().Set("ProcessEvent", reinterpret_cast<std::uintptr_t>(target));
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&ProcessEventHook), reinterpret_cast<void**>(&oProcessEvent)) != MH_OK ||
+            MH_EnableHook(target) != MH_OK) {
+            spdlog::error("Could not hook ProcessEvent: script events (speedrun auto splits) won't work");
+            return false;
+        }
+        g_processEventHooked = true;
+        spdlog::info("ProcessEvent hooked");
+        return true;
     }
 
     // ---- Hooks ------------------------------------------------------------------------------------------------------
@@ -175,6 +310,7 @@ namespace {
 
             DrainQueue();
             ApplyInputBlock();
+            LookUpWatches();
 
             std::vector<game::TickCallback> callbacks;
             {
@@ -183,6 +319,7 @@ namespace {
             }
             for (auto cb : callbacks) cb(delta);
 
+            g_playerPawn.store(game::Pawn(), std::memory_order_relaxed);
             if (g_ticks % 15 == 0) UpdateStatus();
         }
         oTick(scales, arg, delta);
@@ -205,6 +342,7 @@ namespace {
     int __fastcall LevelLoadHook(void* self, void* /*edx*/, void** levelInfo, unsigned long long arg)
     {
         g_loading = true;
+        g_playerPawn = nullptr;
         DropCache();
         cache::NextLevel();
 
@@ -216,8 +354,110 @@ namespace {
         for (auto cb : callbacks) cb(false);
         const int ret = oLevelLoad(self, levelInfo, arg);
         g_loading = false;
+        for (int i = 0, n = g_watchCount.load(); i < n; ++i)
+            if (!g_watchFn[i].load()) g_watchLookup = true;     // Its package may have come with the level
         for (auto cb : callbacks) cb(true);
         return ret;
+    }
+
+    // ---- The player's move state handler (mmultiplayer trainer's "StateHandler") ---------------------------------------
+    // A pawn's per-tick movement state function: (delta, changedState), changedState non-zero on the tick a new state
+    // begins. It runs for every pawn, so the hook only compares the pawn against the player's, kept by the tick hook.
+    std::atomic<bool> g_stateHooked{false}, g_deathHooked{false};
+    std::atomic<unsigned> g_deaths{0};
+    std::vector<game::DeathCallback> g_deathCallbacks;      // Under g_mutex
+    void (__thiscall *oStateHandler)(void*, float, int) = nullptr;
+    int (*oPreDeath)() = nullptr;
+    int (*oPostDeath)() = nullptr;
+
+    void __fastcall StateHandlerHook(void* pawn, void* /*edx*/, float delta, int changedState)
+    {
+        if (changedState && pawn && pawn == g_playerPawn.load(std::memory_order_relaxed)) {
+            std::vector<game::StateChangeCallback> callbacks;
+            {
+                std::lock_guard lock(g_mutex);
+                callbacks = g_stateChangeCallbacks;
+            }
+            bool skip = false;
+            for (auto cb : callbacks) {
+                try { skip |= cb(); }
+                catch (...) { spdlog::error("Player state change callback threw"); }
+            }
+            if (skip) return;
+        }
+        oStateHandler(pawn, delta, changedState);
+    }
+
+    void RunDeathCallbacks(bool after)
+    {
+        std::vector<game::DeathCallback> callbacks;
+        {
+            std::lock_guard lock(g_mutex);
+            callbacks = g_deathCallbacks;
+        }
+        for (auto cb : callbacks) {
+            try { cb(after); }
+            catch (...) { spdlog::error("Death callback threw"); }
+        }
+    }
+
+    int PreDeathHook()
+    {
+        ++g_deaths;
+        spdlog::info("Player died");
+        RunDeathCallbacks(false);
+        return oPreDeath();
+    }
+
+    int PostDeathHook()
+    {
+        const int ret = oPostDeath();
+        RunDeathCallbacks(true);
+        return ret;
+    }
+
+    bool HookAt(void* target, void* detour, void** original, const char* what);
+
+    // Optional hooks: without them the menu works, only the features built on them don't (they say so in the log).
+    void HookExtras()
+    {
+        // mmultiplayer trainer's pattern. `movzx edx, byte [ecx+68h]` in it reads Actor.Physics: ecx is the pawn.
+        if (void* p = FindPattern("\xF3\x0F\x10\x05\x00\x00\x00\x00\x83\xEC\x0C\x0F\x2F\x44\x24\x00\x56"
+                                  "\x0F\x87\x00\x00\x00\x00\x8B\x44\x24\x18\x83\xF8\x07\x0F\x8F\x00\x00"
+                                  "\x00\x00\x0F\xB6\x51\x68\x81\xA1\x00\x00\x00\x00\x00\x00\x00\x00",
+                                  "xxxx????xxxxxxx?xxx????xxxxxxxxx????xxxxxx????????")) {
+            g_stateHooked = HookAt(p, reinterpret_cast<void*>(&StateHandlerHook), reinterpret_cast<void**>(&oStateHandler),
+                                   "the player state handler");
+        } else {
+            spdlog::warn("Player state handler not found: Strang will not work");
+        }
+
+        // mmultiplayer's death hooks: an anchor, then the two small functions within 4 KB after it
+        void* anchor = FindPattern("\x8D\x4C\x24\x10\xE8\x00\x00\x00\x00\x8B\x4C\x24\x14\x85\xC9\x7C"
+                                   "\x1E\x3B\xCF\x0F\x8D\x00\x00\x00\x00\x8B\x04\x8E\x8B\x40\x08\x25"
+                                   "\x00\x00\x00\x00\x33\xD2\x0B\xC2\x75\xD6\xE9\x00\x00\x00\x00",
+                                   "xxxxx????xxxxxxxxxxxx????xxxxxxx????xxxxxxx????");
+        void* pre = anchor ? game::FindPatternIn(anchor, 0x1000,
+                                                 "\xC7\x05\x00\x00\x00\x00\x00\x00\x00\x00\xB8\x00\x00\x00\x00\xC3"
+                                                 "\xB8\x00\x00\x00\x00\xC3",
+                                                 "xx????????x????xx????x")
+                           : nullptr;
+        void* post = pre ? game::FindPatternIn(pre, 0x1000,
+                                               "\x8B\x0D\x00\x00\x00\x00\xC7\x05\x00\x00\x00\x00\x00\x00\x00\x00"
+                                               "\x8B\x01\x8B\x90\x00\x00\x00\x00\xFF\xD2\xB8\x00\x00\x00\x00\xC3"
+                                               "\x8B\xC1\xC7\x00\x00\x00\x00\x00\xC3",
+                                               "??????xx????????xxxx????xxx????xxxxx????x")
+                         : nullptr;
+        if (pre && post) {
+            g_deathHooked = HookAt(pre, reinterpret_cast<void*>(&PreDeathHook), reinterpret_cast<void**>(&oPreDeath),
+                                   "PreDeath") &&
+                            HookAt(post, reinterpret_cast<void*>(&PostDeathHook), reinterpret_cast<void**>(&oPostDeath),
+                                   "PostDeath");
+        } else {
+            spdlog::warn("Death functions not found (anchor {}, pre {}, post {}): no death events", anchor, pre, post);
+        }
+        spdlog::info("Extra hooks: player state handler {}, death {}", g_stateHooked ? "on" : "off",
+                     g_deathHooked ? "on" : "off");
     }
 
     bool HookAt(void* target, void* detour, void** original, const char* what)
@@ -227,6 +467,76 @@ namespace {
             return false;
         }
         return true;
+    }
+}
+
+// ---- Early injection ------------------------------------------------------------------------------------------------
+// Every SDK StaticClass() and function wrapper looks its object up once and keeps the answer in a static, a null one too.
+// A loader that injects the menu before the game has loaded its script packages (TinyModInjector on Linux/Proton does:
+// 1.6k names instead of ~43k) would make those lookups find nothing for the whole session: no player, no IsA, no SDK
+// calls. So game::Init waits for TdGame's classes before anything asks for one.
+namespace {
+    // Index of `name` in the engine's name table, -1 if it isn't there (yet). No allocation, no lock: it runs inside the
+    // guarded walk below.
+    int RawNameIndex(const wchar_t* name)
+    {
+        const auto& names = Classes::FName::GetGlobalNames();
+        for (std::size_t i = 0; i < names.Num(); ++i) {
+            const Classes::FNameEntry* e = names[i];
+            if (e && std::wcscmp(e->GetWideName(), name) == 0) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    // A UClass named TdPlayerPawn (an object of that name whose own class is "Class"). Reads the game's name and object
+    // lists while the game is still loading them (they can grow under us).
+    bool HasPawnClass()
+    {
+        const int pawn = RawNameIndex(L"TdPlayerPawn"), cls = RawNameIndex(L"Class");
+        if (pawn < 0 || cls < 0) return false;
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        for (std::size_t i = 0; i < objects.Num(); ++i) {
+            const Classes::UObject* o = objects.GetByIndex(i);
+            if (o && o->Name.Index == pawn && o->Class && o->Class->Name.Index == cls) return true;
+        }
+        return false;
+    }
+
+    // The MSVC build guards the walk: a list reallocated mid-read is a miss, tried again 100 ms later.
+    bool ScriptClassesLoaded()
+    {
+#ifdef _MSC_VER
+        __try { return HasPawnClass(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+        return HasPawnClass();
+#endif
+    }
+
+    // Returns false if the menu is asked to unload meanwhile, or the classes never turn up.
+    bool WaitForScriptClasses()
+    {
+        if (ScriptClassesLoaded()) return true;
+        spdlog::info("Game: the menu was loaded before the game's script classes ({} names so far): waiting for them",
+                     Classes::FName::GetGlobalNames().Num());
+        constexpr ULONGLONG kTimeoutMs = 180000;
+        const ULONGLONG start = GetTickCount64();
+        while (GetTickCount64() - start < kTimeoutMs) {
+            if (unload::Requested()) {
+                SetEvent(unload::Event());     // Requested() took the END press: the menu's main loop must still see it
+                return false;
+            }
+            Sleep(100);
+            if (ScriptClassesLoaded()) {
+                Sleep(500);     // Its package is still being linked: let the rest of its classes come in
+                spdlog::info("Game: script classes loaded after {} ms ({} names, {} objects)", GetTickCount64() - start,
+                             Classes::FName::GetGlobalNames().Num(), Classes::UObject::GetGlobalObjects().Num());
+                return true;
+            }
+        }
+        spdlog::error("Game: TdGame's classes did not load within {} s: game features will not work",
+                      kTimeoutMs / 1000);
+        return false;
     }
 }
 
@@ -260,6 +570,7 @@ bool game::CheckObjectLayout()
 bool game::Init()
 {
     void* ptr = nullptr;
+    BindSignatureCache();
 
     // These byte patterns identify the game's own code, so they only match the game version they were made for
     // (copied verbatim from mmultiplayer's engine.cpp).
@@ -270,6 +581,7 @@ bool game::Init()
     if (!ptr) { spdlog::error("GNames pattern not found: unsupported game version?"); return false; }
     Classes::FName::GNames = reinterpret_cast<decltype(Classes::FName::GNames)>(
         *reinterpret_cast<void**>(static_cast<std::uint8_t*>(ptr) + 2));
+    addr::Game().Set("GNames", reinterpret_cast<std::uintptr_t>(Classes::FName::GNames));
 
     ptr = FindPattern(
         "\x8B\x15\x00\x00\x00\x00\x8B\x0C\xB2\x8D\x44\x24\x30",
@@ -277,9 +589,12 @@ bool game::Init()
     if (!ptr) { spdlog::error("GObjects pattern not found: unsupported game version?"); return false; }
     Classes::UObject::GObjects = reinterpret_cast<decltype(Classes::UObject::GObjects)>(
         *reinterpret_cast<void**>(static_cast<std::uint8_t*>(ptr) + 2));
+    addr::Game().Set("GObjects", reinterpret_cast<std::uintptr_t>(Classes::UObject::GObjects));
 
     spdlog::info("SDK globals: GNames={} entries, GObjects={} objects",
                  Classes::FName::GetGlobalNames().Num(), Classes::UObject::GetGlobalObjects().Num());
+    // Before the first StaticClass() (CheckObjectLayout is one): see WaitForScriptClasses
+    if (!WaitForScriptClasses()) return false;
     CheckObjectLayout();   // Only logs: the menu and most features work without class reflection
 
     ptr = FindPattern(
@@ -289,6 +604,7 @@ bool game::Init()
         "\x6C\x24\x00\x00\xFF\x89",
         "???????xxxxxxxxx?xxxxxxxx????xxxxxx?xxxxxxxxxxxxxx??xx");
     if (!ptr) { spdlog::error("LevelLoad pattern not found"); return false; }
+    addr::Game().Set("LevelLoad", reinterpret_cast<std::uintptr_t>(ptr));
     if (!HookAt(ptr, reinterpret_cast<void*>(&LevelLoadHook), reinterpret_cast<void**>(&oLevelLoad), "LevelLoad")) return false;
 
     ptr = FindPattern(
@@ -296,9 +612,18 @@ bool game::Init()
         "\x00\x00\x00\x00\x8B\x15\x00\x00\x00\x00\x8B\xE8",
         "xxxxxxxxxx????xx????xx????xx");
     if (!ptr) { spdlog::error("Tick pattern not found"); return false; }
+    addr::Game().Set("Tick", reinterpret_cast<std::uintptr_t>(ptr));
     if (!HookAt(ptr, reinterpret_cast<void*>(&TickHook), reinterpret_cast<void**>(&oTick), "Tick")) return false;
 
+    HookExtras();
     g_ready = true;
+    {
+        // Hooked now, while the menu loads: finding ProcessEvent scans the game's code (~150 ms in a debug build), which
+        // the first module to watch a script event otherwise paid in the middle of play. The TAS and the speedrun timer
+        // watch events from startup anyway.
+        std::lock_guard lock(g_mutex);
+        HookProcessEvent();
+    }
     spdlog::info("Game integration ready");
     return true;
 }
@@ -314,6 +639,7 @@ void game::Shutdown()
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
+    sig::Game().Save();         // Patterns first found since startup (lazy hooks)
     g_blockInput = false;       // Let the tick hook hand the controller its look input back
     for (int i = 0; i < 40 && g_inputApplied; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     g_ready = false;
@@ -335,16 +661,145 @@ void game::OnLevelLoad(LevelLoadCallback callback)
     g_levelLoadCallbacks.push_back(callback);
 }
 
+void game::OnStateRestored(void (*callback)())
+{
+    std::lock_guard lock(g_mutex);
+    g_stateRestoredCallbacks.push_back(callback);
+}
+
+void game::StateRestored()
+{
+    // Like a level load for whatever remembers game objects: the player, the caches
+    g_playerPawn = nullptr;
+    DropCache();
+    cache::NextLevel();
+    std::vector<void (*)()> callbacks;
+    {
+        std::lock_guard lock(g_mutex);
+        callbacks = g_stateRestoredCallbacks;
+    }
+    for (auto fn : callbacks) fn();
+}
+
 void game::OnPlayerStateChange(StateChangeCallback callback)
 {
-    // TODO: hook the player's move state handler (mmultiplayer's trainer has the pattern). Until then nothing calls these.
-    static bool warned = false;
-    if (!warned) {
-        warned = true;
-        spdlog::warn("Player state change hook is not implemented: tools that rely on it (Strang) do nothing");
-    }
-    std::lock_guard lock(g_mutex);
+    std::lock_guard lock(g_mutex);      // Kept even before Init: the hook is installed there (HookExtras)
     g_stateChangeCallbacks.push_back(callback);
+}
+
+bool game::PlayerStateHooked() { return g_stateHooked; }
+
+void game::OnPlayerDeath(DeathCallback callback)
+{
+    std::lock_guard lock(g_mutex);
+    g_deathCallbacks.push_back(callback);
+}
+
+bool game::DeathHooked() { return g_deathHooked; }
+
+bool game::IsInState(Classes::UObject* object, const char* state)
+{
+    // Read from the object's state frame (FStateFrame::StateNode, 0x1C into it), then up the states it extends, like the
+    // engine's IsInState does. Calling Core.Object.IsInState through ProcessEvent writes no answer at all in this game
+    // (nor does GetStateName), so it can't be used.
+    constexpr int kStateFrame = 0x18;           // UObject::StateFrame
+    constexpr int kStateNode = 0x1C;            // FStateFrame::StateNode (checked: it must be a State)
+    if (!object) return false;
+    const auto* frame = layout::PtrAt<const std::uint8_t>(object, kStateFrame);
+    if (!frame) return false;
+    auto* node = layout::PtrAt<Classes::UStruct>(frame, kStateNode);
+    if (!node || !IsA(node, Classes::UState::StaticClass())) return false;
+    const int want = NameIndex(state);
+    if (want <= 0) return false;
+    for (int depth = 0; node && depth < 32; node = SuperOf(node), ++depth)
+        if (node->Name.Index == want) return true;
+    return false;
+}
+
+bool game::ConsoleCommand(const std::string& command, std::string* output)
+{
+    auto* pc = Controller();
+    if (!pc || command.empty()) return false;
+    const std::wstring wide(command.begin(), command.end());    // Console commands are ASCII
+    // The FString only borrows the buffer; the engine copies what it keeps. The returned string is the engine's (and
+    // usually empty): left alone, freeing it would need the engine's allocator.
+    const Classes::FString out = pc->ConsoleCommand(Classes::FString(wide.c_str()), false);
+    if (output) {
+        output->clear();
+        if (out.IsValid())
+            for (const wchar_t* c = out.c_str(); *c; ++c) output->push_back(*c < 128 ? static_cast<char>(*c) : '?');
+    }
+    spdlog::info("Console: {}", command);
+    return true;
+}
+
+void* game::FindPatternIn(const void* start, std::size_t size, const char* pattern, const char* mask)
+{
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const auto from = reinterpret_cast<std::uintptr_t>(start);
+    if (from < base) return nullptr;
+    return FindPatternRange(from - base, from - base + size, pattern, mask);
+}
+
+namespace {
+    bool AddWatch(const char* fullName, Watch w)
+    {
+        if (!g_ready || !fullName) return false;
+        std::lock_guard lock(g_mutex);
+        if (!HookProcessEvent()) return false;
+        const int n = g_watchCount.load();
+        if (n >= kMaxWatches) { spdlog::error("Script event {}: too many watched already", fullName); return false; }
+        w.name = fullName;
+        g_watches[n] = std::move(w);
+        g_watchFn[n].store(nullptr);
+        g_watchCount.store(n + 1, std::memory_order_release);   // Published last: the hook only reads complete entries
+        g_watchLookup = true;
+        return true;
+    }
+}
+
+bool game::OnScriptEvent(const char* fullName, ScriptEventCallback callback, bool after)
+{
+    if (!callback) return false;
+    Watch w;
+    w.kind = after ? WatchKind::After : WatchKind::Before;
+    w.callback = callback;
+    return AddWatch(fullName, std::move(w));
+}
+
+bool game::BlockScriptEvent(const char* fullName, ScriptEventFilter filter)
+{
+    if (!filter) return false;
+    Watch w;
+    w.kind = WatchKind::Block;
+    w.filter = filter;
+    return AddWatch(fullName, std::move(w));
+}
+
+bool game::ScriptEventsReady()
+{
+    {
+        std::lock_guard lock(g_mutex);
+        if (!g_processEventHooked) return false;
+    }
+    const int n = g_watchCount.load();
+    for (int i = 0; i < n; ++i)
+        if (!g_watchFn[i].load()) return false;
+    return n > 0;
+}
+
+bool game::BlockingLoad()
+{
+    const auto* world = World();
+    return world && world->bRequestedBlockOnAsyncLoading;
+}
+
+std::string game::MapName()
+{
+    Classes::UObject* o = World();      // The persistent level's package: follow Outer up from the WorldInfo
+    if (!o) return {};
+    for (int guard = 0; o->Outer && guard < 16; ++guard) o = o->Outer;
+    return o->GetName();
 }
 
 void* game::FindPattern(const char* pattern, const char* mask)
@@ -375,6 +830,8 @@ game::Status game::GetStatus()
     s.maxHealth = g_maxHealth;
     s.ticks = g_ticks;
     s.objectScans = g_scans;
+    s.deaths = g_deaths;
+    s.scriptEvents = g_scriptEvents;
     return s;
 }
 

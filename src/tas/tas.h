@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
 // Macro / TAS / replay sessions (see engine.h for how the game is driven).
 //
@@ -24,7 +25,7 @@
 namespace tas {
 
 enum class Mode { Idle, Recording, Playing };
-enum class AtEnd { Stop = 0, Pause = 1, Record = 2 };   // what playback does after the last frame
+enum class AtEnd { Stop = 0, Pause = 1, Record = 2, Loop = 3 };   // what playback does after the last frame
 
 // What a recording does when the player dies (like Geometry Dash bots: practice mode keeps only the good attempt).
 //   Nothing   keep recording (the death and respawn become part of the run)
@@ -34,17 +35,49 @@ enum class AtEnd { Stop = 0, Pause = 1, Record = 2 };   // what playback does af
 // Restart and Rewind need a level start: a macro that starts "now" can't go back, it keeps recording.
 enum class OnDeath { Nothing = 0, Restart = 1, Rewind = 2 };
 
+// When a playback stops matching the recording:
+//   Pause     stop there (take over to record a fix from that frame)
+//   Correct   if the player is in the same move and less than Options::correctMax units away, put them back on the
+//             recorded position and velocity and go on. Counted (Status::corrections): a corrected run isn't verified
+//   Continue  note it and go on
+enum class OnDesync { Pause = 0, Correct = 1, Continue = 2 };
+
 struct Options {
     float recordHz = 60.f;            // time step for new recordings; 0 = real time
     float realtimeCap = 62.f;         // real-time recordings: frame rate cap (0 = none). The game's own cap is 62
     float speed = 1.f;                // pacing of fixed-step frames (playback and recording): 1 = real time, 0 = max
-    bool pauseOnDesync = true;
+    OnDesync onDesync = OnDesync::Pause;
+    float correctMax = 64.f;          // OnDesync::Correct: the furthest (game units) a correction moves the player
+    bool matchRecording = true;       // playback: use the recording's streaming setting, mouse sensitivity and key
+                                      // bindings (see Preflight)
+    std::string gameplayMods;         // the modules on now that change the game ("God Mode, No Clip"), saved with
+                                      // recordings
     bool blockStreaming = true;       // load streamed sublevels in the frame they are requested (deterministic)
     bool seekWithoutRendering = false;
     AtEnd atEnd = AtEnd::Pause;
     OnDeath onDeath = OnDeath::Rewind;
     float rewindSeconds = 2.f;        // how far Rewind (on death, or its key) goes back
-    int keyPause = 0, keyAdvance = 0, keyTakeOver = 0, keyStop = 0, keyRewind = 0;   // virtual-key codes, polled while a session runs
+    int keyPause = 0, keyAdvance = 0, keyTakeOver = 0, keyStop = 0, keyRewind = 0,   // virtual-key codes, polled while
+        keyRestart = 0;                                                                // a session runs
+    // Polled while idle (and the menu is closed): start a recording with the start below, or play the macro
+    int keyRecord = 0, keyPlay = 0;
+    int keyBookmark = 0;              // while a session runs: a bookmark on the current frame
+    // Navigation (also idle with the menu closed): one frame back (replays up to the frame before, paused there; while
+    // recording, the take is kept and plays back to there: take over to redo the frame), and the previous / next
+    // bookmark.
+    int keyFrameBack = 0, keyPrevBookmark = 0, keyNextBookmark = 0;
+    // A bookmark "Split: <level>" on the frame a level is completed, recording and playing (a playback moves it to where
+    // the level is completed now). See tas/splits.h.
+    bool autoSplits = true;
+    // Memory snapshots (tas/snapshot.h): a keyframe of the game's whole state every `keyframeInterval` frames while a
+    // session runs. Going back (Go to, frame back, rewind, restart) puts the nearest keyframe back and runs the few frames
+    // after it, instead of loading the level and running the whole replay again. A playback that reaches a keyframe
+    // again is compared with it and put back to it exactly: within a session nothing can desync.
+    bool snapshots = true;
+    int keyframeInterval = 6;
+    int snapshotBudgetMB = 2048;      // past it, keyframes far from where the session is are thinned out
+    StartKind recordStart = StartKind::Checkpoint;
+    std::string recordCommand, recordMap, recordCheckpoint;
 };
 
 struct Status {
@@ -57,12 +90,36 @@ struct Status {
     std::size_t frames = 0;           // frames in the replay
     double time = 0.0;                // game seconds into the run
     long long desyncFrame = -1;       // first frame whose state didn't match, -1 = none
+    std::string desyncInfo;           // what didn't match there ("velocity off by 0.002")
+    std::size_t corrections = 0;      // frames OnDesync::Correct put the player back on (this playback)
     std::size_t syncChecked = 0;      // frames compared and matching this playback
     bool verified = false;            // the last playback matched the recording on every recorded frame
     std::string message;              // last thing that happened
+    // Memory snapshots (see Options::snapshots)
+    bool snapshots = false;           // keyframes are kept for this session
+    std::string snapshotsOff;         // why not (unavailable, turned off, a level load...)
+    std::size_t keyframes = 0;
+    std::uint64_t snapshotBytes = 0;
+    double captureMs = 0.0, restoreMs = 0.0, snapshotBeginMs = 0.0;
+    std::size_t snapped = 0;          // keyframes reached again that differed and were put back (this session)
+    std::size_t snappedPages = 0;
+    Sync player;                      // the player at the start of `frame` (while paused: as it is now)
 };
 
+// What differs from when the current macro was recorded (the game, its settings, the menu's modules). `fixed`: playback
+// makes it match by itself (Options::matchRecording).
+struct Issue {
+    enum class Level { Info, Warning, Problem } level = Level::Info;
+    std::string text;
+    bool fixed = false;
+};
+std::vector<Issue> Preflight();
+// Forgets the recorded player states: the next playback records them again and is the new reference (e.g. after a
+// game update, once it plays the way it should).
+void ResetSync();
+
 bool Init();                          // after game::Init()
+void Shutdown();                      // at unload, after game::Shutdown(): background threads end
 bool Available();
 
 void SetOptions(const Options& options);
@@ -72,12 +129,20 @@ Status GetStatus();
 // Starts a new recording (the current replay is replaced).
 void Record(StartKind start, const std::string& command, const std::string& map, const std::string& checkpoint);
 void Play();                          // the current replay from its start
+// Recording: start the recording over from the same start (same level / command, or from here for a macro).
+// Playing: play again from the start.
+void Restart();
 void Stop();
 void TogglePause();
 void Advance(int frames = 1);         // run this many frames, then pause
 void TakeOver();                      // while playing: drop the rest and continue recording from this frame
 void Goto(std::size_t frame);         // play (from the start if needed, as fast as possible) up to `frame`, then pause
+void FrameBack(int frames = 1);       // Goto the frame `frames` before the current one
+// Goto the bookmark before (step -1) or after (+1) the current frame.
+void GotoBookmark(int step);
 void Rewind();                        // while recording: go back Options::rewindSeconds and pause there (practice mode)
+// A camera key on `frame` with the player camera's look direction right now (replacing a key there).
+void KeyCameraFromView(std::uint32_t frame);
 
 // ---- the replay ----------------------------------------------------------------------------------------------------------
 // Runs `fn` with the replay locked. Keep it short: the game thread waits for it at the start of each frame.
@@ -86,6 +151,12 @@ void WithReplay(const std::function<void(Replay&)>& fn);
 bool LoadFile(const std::filesystem::path& path, std::string* error);
 bool SaveFile(const std::filesystem::path& path, std::string* error);
 void Clear();                         // stop, and start over with an empty replay
-std::filesystem::path Folder();       // replays/ next to the DLL
+std::filesystem::path Folder();       // replays/ next to the DLL (Init() writes the example macros there once)
+// Every recording is also saved here when it stops, the newest kAutosaves kept: a take is never lost to a crash, a new
+// recording or a forgotten Save.
+std::filesystem::path AutosaveFolder();
+constexpr int kAutosaves = 10;
+// The macro in memory has inputs, camera keys or bookmarks that weren't saved or loaded as they are now.
+bool Unsaved();
 
 } // namespace tas

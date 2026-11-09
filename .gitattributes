@@ -1,3 +1,5 @@
 *.patch -text
 *.sh text eol=lf
 *.bat text eol=crlf
+# setup.cmd is a cmd + bash polyglot: bash needs LF (cmd copes, see the comment at its top)
+setup.cmd text eol=lf

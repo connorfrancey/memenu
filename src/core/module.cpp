@@ -1,9 +1,12 @@
 #include "core/module.h"
 #include "core/clock.h"
+#include "core/profile.h"
+#include "core/keys.h"
 #include "core/notify.h"
 #include "core/scheduler.h"
 
 #include <algorithm>
+#include <mutex>
 #include <spdlog/spdlog.h>
 
 // ---- Module --------------------------------------------------------------------------------------------------------------
@@ -126,23 +129,58 @@ void modules::Render()
 {
     for (auto& m : g_modules) {
         if (!m->Enabled()) continue;
+        PROF_ZONE_NAMED(m->Name().c_str(), m->Name().size());
         const clk::Ticks t0 = clk::Now();
         m->OnRender();
         sched::RecordRender(*m, clk::Micros(clk::Now() - t0));
     }
 }
 
+namespace {
+std::mutex g_reservedMutex;
+std::vector<int> g_reserved;
+}
+
+void modules::SetReservedKeys(std::vector<int> keys)
+{
+    std::lock_guard lock(g_reservedMutex);
+    g_reserved = std::move(keys);
+}
+
 void modules::OnKey(int vk)
 {
+    const int mods = keys::HeldMods();
+    {
+        std::lock_guard lock(g_reservedMutex);
+        for (int r : g_reserved)
+            if (keys::Fires(r, vk, mods)) return;
+    }
+    // Only the bindings asking for the most modifiers fire: Ctrl+F5 doesn't also do what F5 does.
+    int best = -1;
+    const auto consider = [&](int binding) {
+        if (keys::Fires(binding, vk, mods)) best = std::max(best, keys::Specificity(binding));
+    };
     for (auto& m : g_modules) {
-        if (m->key == vk) {
+        if (m->Hidden()) continue;
+        consider(m->key);
+        for (ctl::Setting* s : m->Settings()) {
+            consider(s->key);
+            consider(s->keyAlt);
+        }
+    }
+    if (best < 0) return;
+    const auto fires = [&](int binding) { return keys::Fires(binding, vk, mods) && keys::Specificity(binding) == best; };
+
+    for (auto& m : g_modules) {
+        if (m->Hidden()) continue;
+        if (fires(m->key)) {
             m->Toggle();
             if (!m->IsAction()) notify::Push(m->Name() + ": " + (m->Enabled() ? "ON" : "OFF"));
         }
         // Control keys work whether or not the module is on: that is what makes "bind a key to this slider" useful.
         for (ctl::Setting* s : m->Settings()) {
-            if (s->key == vk) s->Press(0);
-            if (s->keyAlt == vk) s->Press(1);
+            if (fires(s->key)) s->Press(0);
+            if (fires(s->keyAlt)) s->Press(1);
         }
     }
 }

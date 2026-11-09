@@ -1,4 +1,6 @@
+#include "core/address_cache.h"
 #include "core/cache.h"
+#include "core/hardware.h"
 #include "core/clock.h"
 #include "core/module.h"
 #include "core/optimizations.h"
@@ -66,6 +68,7 @@ private:
     struct Snapshot {
         std::vector<sched::EntryView> entries;
         std::vector<cache::StatsView> caches;
+        std::vector<addr::Cache::View> addresses;
         sched::TickView ticks;
         std::vector<float> workMs, intervalMs;
     };
@@ -76,6 +79,7 @@ private:
             Snapshot s;
             s.entries = sched::Snapshot();
             s.caches = cache::Snapshot();
+            s.addresses = addr::Game().Snapshot();
             s.ticks = sched::Ticks();
             sched::History(s.workMs, s.intervalMs);
             return s;
@@ -138,6 +142,10 @@ private:
 
     void DrawOverview(const Snapshot& d)
     {
+        const hw::Info& machine = hw::Get();        // Cached: queried once
+        ImGui::TextDisabled("%s, %u threads, %llu MB RAM%s%s", machine.cpu.brand.c_str(), machine.cpu.logical,
+                            static_cast<unsigned long long>(machine.memory.totalMb), machine.gpu.known ? ", " : "",
+                            machine.gpu.description.c_str());
         float avg, worst;
         std::array<float, kFrames> ordered;
         FrameStats(avg, worst, ordered);
@@ -268,7 +276,10 @@ private:
 
     void DrawCaches(const Snapshot& d)
     {
-        if (!ImGui::BeginTable("caches", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY))
+        const float addressesHeight = d.addresses.empty() ? 0.f
+            : ImGui::GetFrameHeightWithSpacing() * static_cast<float>(std::min<std::size_t>(d.addresses.size(), 8) + 2);
+        if (!ImGui::BeginTable("caches", 8, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY,
+                               {0.f, -addressesHeight}))
             return;
         ImGui::TableSetupScrollFreeze(1, 1);
         ImGui::TableSetupColumn("Cache", ImGuiTableColumnFlags_WidthStretch);
@@ -277,6 +288,8 @@ private:
         ImGui::TableSetupColumn("Misses");
         ImGui::TableSetupColumn("Hit rate");
         ImGui::TableSetupColumn("Time computing");
+        ImGui::TableSetupColumn("Entries");
+        ImGui::TableSetupColumn("Evicted");
         ImGui::TableHeadersRow();
         for (const auto& c : d.caches) {
             const auto total = c.hits + c.misses;
@@ -289,6 +302,36 @@ private:
             if (total) ImGui::Text("%.1f%%", 100.0 * static_cast<double>(c.hits) / static_cast<double>(total));
             else ImGui::TextDisabled("-");
             ImGui::TableNextColumn(); ImGui::Text("%.2f ms", c.computeSeconds * 1000.0);
+            ImGui::TableNextColumn(); ImGui::Text("%llu", static_cast<unsigned long long>(c.entries));
+            ImGui::TableNextColumn();
+            if (c.evictions) ImGui::Text("%llu", static_cast<unsigned long long>(c.evictions));
+            else ImGui::TextDisabled("-");
+        }
+        ImGui::EndTable();
+        DrawAddresses(d);
+    }
+
+    // The game's named addresses (addr::Game()): engine globals and hooked functions, resolved at startup.
+    void DrawAddresses(const Snapshot& d)
+    {
+        if (d.addresses.empty()) return;
+        ImGui::SeparatorText("Resolved addresses");
+        if (!ImGui::BeginTable("addresses", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY))
+            return;
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Address");
+        ImGui::TableSetupColumn("Scope");
+        ImGui::TableSetupColumn("Resolved");
+        ImGui::TableHeadersRow();
+        for (const auto& a : d.addresses) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(a.name.c_str());
+            ImGui::TableNextColumn();
+            if (a.address) ImGui::Text("0x%08llX", static_cast<unsigned long long>(a.address));
+            else ImGui::TextDisabled("unresolved");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(cache::ScopeName(a.scope));
+            ImGui::TableNextColumn(); ImGui::Text("%llux", static_cast<unsigned long long>(a.resolves));
         }
         ImGui::EndTable();
     }

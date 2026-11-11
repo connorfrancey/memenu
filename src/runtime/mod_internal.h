@@ -100,5 +100,6 @@ namespace mirage::mods::detail
 	bool Enter(MirageMod& mod, const std::string& what, const std::string& where, void (*fn)(void*), void* arg);
 	// Its hooks and subscriptions off (unload, reload, crash): mod_game.cpp
 	void RemoveGameHooks(MirageMod& mod);
+	void ReleaseScripts(MirageMod& mod);	// Its script patches undone, its open scripts closed (mod_script.cpp)
 }
 

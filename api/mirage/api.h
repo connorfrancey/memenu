@@ -144,6 +144,29 @@ typedef struct MirageEvent {
 } MirageEvent;
 typedef void(MIRAGE_CALL* MirageEventFn)(void* user, const MirageEvent* event);
 
+/* ---- Script patching (step 8) ---------------------------------------------------------------------------------------
+ * A loaded UnrealScript function's bytecode, opened as a tree of tokens (script_open), edited (script_set, script_add,
+ * script_set_children) and put in place of the function's own code (script_apply): the game's VM runs it, no native
+ * detour. Jump targets and skip sizes are recomputed from the tree. script_restore, or the mod's unload, puts the
+ * original back. Game thread. script_dump lists the tokens (with their indices) to find what to change. */
+typedef struct MirageScript MirageScript;          /* A function's bytecode, open for editing (owned by the mod) */
+typedef struct MirageToken {
+    uint32_t size;              /* sizeof(MirageToken): set it before script_get / script_set / script_add */
+    int32_t kind;               /* The token's kind: script_kind("FloatConst"), script_kind_name(kind) */
+    int32_t native_index;       /* NativeFunction: the native's index (171: float * float, 174: float + float) */
+    int32_t int_value;          /* IntConst */
+    float floats[3];            /* FloatConst: floats[0]; VectorConst */
+    int32_t ints[3];            /* RotationConst */
+    MirageObject* object;       /* The object operand: a variable's property, a function, a class (NULL: none) */
+    MirageObject* object2;      /* A second one (StructMember's struct, Context's property) */
+    char name[64];              /* The name operand (VirtualFunction's function, NameConst); written: an existing name */
+    uint16_t word, word2;       /* Skips and jump targets as decoded (script_apply recomputes them) */
+    uint8_t byte_value, byte_value2, reserved[2];   /* ByteConst / IntConstByte, cast type, flags */
+    int32_t target;             /* A jump added by the mod: the token it goes to (-1: as decoded, -2: the script's end) */
+    uint32_t memory_offset;     /* Where it was in the code when opened (read only; 0 for an added token) */
+    char text[256];             /* StringConst / UnicodeStringConst, UTF-8 */
+} MirageToken;
+
 /* The runtime's functions. Only grows; `size` says how much of it this runtime has. */
 typedef struct MirageApi {
     uint32_t size;                  /* sizeof(MirageApi) of the runtime */
@@ -170,6 +193,7 @@ typedef struct MirageApi {
                                                   const char* tooltip);
     MirageSetting*(MIRAGE_CALL* setting_slider)(MirageModule* module, const char* name, float value, float min,
                                                 float max, const char* format, const char* tooltip);
+    /* min and max are clamped to +-(INT32_MAX / 2), the most an int slider takes */
     MirageSetting*(MIRAGE_CALL* setting_slider_int)(MirageModule* module, const char* name, int32_t value, int32_t min,
                                                     int32_t max, const char* tooltip);
     MirageSetting*(MIRAGE_CALL* setting_text)(MirageModule* module, const char* name, const char* value,
@@ -251,6 +275,23 @@ typedef struct MirageApi {
     void(MIRAGE_CALL* detour_remove)(MirageDetour* detour);
     /* A byte pattern in the game's code ('x' in `mask` must match, '?' is any byte), NULL if not found */
     void*(MIRAGE_CALL* find_pattern)(const char* pattern, const char* mask);
+
+    /* ---- Script patching (step 8; see MirageToken). Game thread. -------------------------------------------------
+     * Token indices are 0-based; script_children / script_set_children with index -1 are the top-level statements. */
+    MirageScript*(MIRAGE_CALL* script_open)(MirageMod* mod, const char* function);   /* NULL: none, or no script */
+    void(MIRAGE_CALL* script_close)(MirageScript* script);
+    int32_t(MIRAGE_CALL* script_count)(MirageScript* script);                        /* Tokens */
+    int32_t(MIRAGE_CALL* script_get)(MirageScript* script, int32_t index, MirageToken* out);       /* 0: no such */
+    int32_t(MIRAGE_CALL* script_set)(MirageScript* script, int32_t index, const MirageToken* in);  /* 0: not set */
+    int32_t(MIRAGE_CALL* script_add)(MirageScript* script, const MirageToken* in);   /* Its index, -1 if refused */
+    /* Copies up to `capacity` indices and returns how many there are (-1: no such token) */
+    int32_t(MIRAGE_CALL* script_children)(MirageScript* script, int32_t index, int32_t* out, int32_t capacity);
+    int32_t(MIRAGE_CALL* script_set_children)(MirageScript* script, int32_t index, const int32_t* children, int32_t count);
+    int32_t(MIRAGE_CALL* script_apply)(MirageScript* script);        /* 1: in place (the log says why not) */
+    int32_t(MIRAGE_CALL* script_restore)(MirageMod* mod, const char* function);      /* 1: it was patched */
+    uint32_t(MIRAGE_CALL* script_dump)(MirageScript* script, char* buffer, uint32_t capacity);    /* Full length */
+    int32_t(MIRAGE_CALL* script_kind)(const char* name);            /* -1: no such kind */
+    const char*(MIRAGE_CALL* script_kind_name)(int32_t kind);        /* "Bad" if none */
 } MirageApi;
 
 /* The runtime has `field` (a mod built against a newer header, running on an older runtime) */

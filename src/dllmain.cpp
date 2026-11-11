@@ -30,6 +30,7 @@
 #include "runtime/mods.h"
 #include "runtime/reflect.h"
 #include "runtime/texture_overlays.h"
+#include "runtime/script_patch.h"
 #endif
 #if MEMENU_FEATURE_TAS
 #include "tas/tas.h"
@@ -174,6 +175,7 @@ static void Run(HMODULE module)
         mirage::hooks::RemoveAll();  // Functions back to their own code before this DLL goes
         mirage::detours::RemoveAll();   // Mods' detours, before MinHook is shut down
         mirage::textures::Shutdown();   // Its worker, and the package file redirects (MinHook too)
+        mirage::scripts::RestoreAll();  // Patched functions back to their own bytecode
 #endif
         hooks::Uninstall();
 #if MEMENU_GAME

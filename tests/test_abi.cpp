@@ -86,6 +86,22 @@ MIRAGE_AT(object_is_a, 208);
 MIRAGE_AT(detour_create, 212);
 MIRAGE_AT(detour_remove, 216);
 MIRAGE_AT(find_pattern, 220);
+// Step 8: script patching
+MIRAGE_AT(script_open, 224);
+MIRAGE_AT(script_close, 228);
+MIRAGE_AT(script_count, 232);
+MIRAGE_AT(script_get, 236);
+MIRAGE_AT(script_set, 240);
+MIRAGE_AT(script_add, 244);
+MIRAGE_AT(script_children, 248);
+MIRAGE_AT(script_set_children, 252);
+MIRAGE_AT(script_apply, 256);
+MIRAGE_AT(script_restore, 260);
+MIRAGE_AT(script_dump, 264);
+MIRAGE_AT(script_kind, 268);
+MIRAGE_AT(script_kind_name, 272);
+static_assert(sizeof(MirageToken) == 384 && offsetof(MirageToken, name) == 48 && offsetof(MirageToken, target) == 120 &&
+              offsetof(MirageToken, text) == 128, "MirageToken moved");
 // Size of ABI v1's table: a later version only makes it larger
 static_assert(sizeof(MirageApi) >= 224);
 static_assert(sizeof(MirageValue) == 272 && offsetof(MirageValue, text) == 16);

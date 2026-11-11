@@ -24,6 +24,7 @@
 #include "runtime/fhooks.h"
 #include "runtime/file_redirect.h"
 #include "runtime/texture_overlays.h"
+#include "runtime/script_patch.h"
 #include "runtime/reflect.h"
 #include "runtime/layout.h"
 #include "runtime/lua_vm.h"
@@ -204,7 +205,13 @@ void WriteResult(bool finished)
         std::ofstream out(tmp, std::ios::trunc);
         out << root.dump(2);
     }
-    MoveFileExA(tmp.c_str(), path.string().c_str(), MOVEFILE_REPLACE_EXISTING);
+    // `memenu game-test` reads the file several times a second: a replace while it is open fails, so try again (the
+    // last write, finished = true, once got lost that way and the run waited for nothing)
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (MoveFileExA(tmp.c_str(), path.string().c_str(), MOVEFILE_REPLACE_EXISTING)) return;
+        Sleep(25);
+    }
+    spdlog::warn("Self-test: {} couldn't be written ({})", path.string(), GetLastError());
 }
 
 // ---- Waiting --------------------------------------------------------------------------------------------------------
@@ -3553,6 +3560,100 @@ void TestMirageTextures()
     End(s);
 }
 
+#if MEMENU_FEATURE_TAS
+// Mirage step 8: a script patch from a Lua mod (examples/mods/higher-jumps). On, TdMove_Jump.StartMove's bytecode
+// multiplies the jump's upward speed by 1.5: a standing jump goes about 2.25 times as high, with no native detour.
+// Off, the function's own bytecode is back and the jump is as before.
+void TestMirageScriptPatch()
+{
+    Step& s = Begin("Mirage script patch");
+    Probe p(s);
+    Module* m = modules::Find("Higher Jumps");
+    if (!m) {
+        p.Problem("the Higher Jumps module (examples/mods/higher-jumps) is missing");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    Classes::UStruct* fn = nullptr;
+    OnGameThread([&] { fn = mirage::scripts::Find("TdGame.TdMove_Jump.StartMove"); });
+    if (!fn) {
+        p.Problem("TdGame.TdMove_Jump.StartMove wasn't found");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    const auto patched = [&] {
+        bool on = false;
+        OnGameThread([&] { on = mirage::scripts::Patched(fn); });
+        return on;
+    };
+    const auto set = [&](bool on) {
+        OnRenderThread([m, on] { m->SetEnabled(on); });
+        WaitTicks(10);      // The mod patches or restores on its next tick
+    };
+    // A standing jump, by TAS macro: how high the player gets above where it started
+    std::string jumpKey;
+    OnGameThread([&] { jumpKey = KeyFor(game::Controller(), "GBA_Jump", "SpaceBar"); });
+    const auto jump = [&]() -> float {
+        WaitGrounded();
+        float startZ = 0.f, topZ = 0.f;
+        bool ok = false;
+        OnGameThread([&] {
+            if (auto* pawn = game::Pawn()) startZ = topZ = pawn->Location.Z, ok = true;
+        });
+        if (!ok) return -1.f;
+        tas::Macro mac(60.f);
+        mac.Describe("memenu self-test: standing jump").Wait(5).Hold(jumpKey, 2).Wait(80);
+        tas::Replay saved;
+        tas::WithReplay([&](tas::Replay& r) { saved = r; r = mac.Build(); });
+        tas::Play();
+        bool started = false;
+        const ULONGLONG deadline = GetTickCount64() + 20000;
+        while (GetTickCount64() < deadline && !g_aborted) {
+            const tas::Status st = tas::GetStatus();
+            if (st.mode == tas::Mode::Playing) started = true;
+            if (started && (st.mode != tas::Mode::Playing || st.frame >= st.frames)) break;
+            OnGameThread([&] {
+                if (auto* pawn = game::Pawn()) topZ = std::max(topZ, pawn->Location.Z);
+            }, 0.5);
+        }
+        tas::Stop();
+        WaitFor(5.0, [] { return tas::GetStatus().mode == tas::Mode::Idle; });
+        tas::WithReplay([&](tas::Replay& r) { r = saved; });
+        WaitGrounded();
+        return started ? topZ - startZ : -1.f;
+    };
+
+    OnGameThread([] { player_state::Save(); });
+    set(false);
+    if (patched()) p.Problem("off: the function is still patched");
+    const float before = jump();
+    set(true);
+    if (!patched()) p.Problem("on: the function wasn't patched (the mod's log says why)");
+    const float on = jump();
+    set(false);
+    if (patched()) p.Problem("off again: the function is still patched");
+    const float after = jump();
+    OnGameThread([] { player_state::Load(); });
+    WaitGrounded();
+
+    char line[200];
+    std::snprintf(line, sizeof line, "standing jump: %.0f units high, %.0f with the patch (x%.2f), %.0f after it",
+                  before, on, before > 0 ? on / before : 0.0, after);
+    s.notes.push_back(line);
+    if (before <= 10.f) p.Problem("the player didn't jump (" + std::to_string(before) + " units)");
+    else {
+        if (on < before * 1.6f) p.Problem("with the patch the jump isn't higher enough: " + std::to_string(on) + " vs " + std::to_string(before));
+        if (std::abs(after - before) > before * 0.15f)
+            p.Problem("after the patch the jump is " + std::to_string(after) + ", not the " + std::to_string(before) + " of before");
+    }
+    set(true);      // As the player would have it
+    p.Check(1, true);
+    End(s);
+}
+#endif
+
 // Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
 // what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
 // hot reload ten times in a row (Lua and native, settings and state kept, no memory left behind), and the file watcher.
@@ -3972,6 +4073,9 @@ const Named* FeatureList()
         {"Mirage hooks from mods", &TestMirageModHooks, false},
         {"Mirage content", &TestMirageContent, false},
         {"Mirage textures", &TestMirageTextures, false},
+#if MEMENU_FEATURE_TAS
+        {"Mirage script patch", &TestMirageScriptPatch, true},
+#endif
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},

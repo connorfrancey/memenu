@@ -16,7 +16,7 @@ set(SPDLOG_VERSION v1.17.0)
 set(TOML_VERSION v4.4.0)
 
 # UnrealLib - https://github.com/connorfrancey/UnrealLib
-set(UNREALLIB_GIT_TAG 91dcb10774b6cfe7a181478ebd97d439bf339e6f)   # main, M0-M9
+set(UNREALLIB_GIT_TAG 0ed8ae933e11924b6e60108931d4ef6879b44cdb)   # branch bytecode-encoder: encode_script, assemble_script (step 8)
 set(LUA_VERSION v5.4.8)   # Mod scripting (src/runtime/lua_vm.cpp): built from source, as C++
 
 # Tracy profiler client - https://github.com/wolfpld/tracy

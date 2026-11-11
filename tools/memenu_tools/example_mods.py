@@ -60,7 +60,7 @@ def for_self_test(tc: Toolchain) -> tuple[list[Path] | None, str]:
         native.append(folder)
         built.append(what)
     lua = [d for d in sorted(TEST_MODS.iterdir()) if d.is_dir() and (d / "main.lua").exists()]
-    mods = [*native, EXAMPLES / "hello-lua", EXAMPLES / "high-steps", EXAMPLES / "retexture", *lua]
+    mods = [*native, EXAMPLES / "hello-lua", EXAMPLES / "high-steps", EXAMPLES / "retexture", EXAMPLES / "higher-jumps", *lua]
     return mods, f"{', '.join(built)}, {len(lua) + 1} Lua mods, high-steps and retexture (content)"
 
 

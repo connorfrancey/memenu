@@ -33,6 +33,21 @@ namespace mirage::mods::game_api
 	MirageDetour* MIRAGE_CALL DetourCreate(MirageMod* mod, void* target, void* detour, int32_t priority, void** original);
 	void MIRAGE_CALL DetourRemove(MirageDetour* detour);
 	void* MIRAGE_CALL FindPattern(const char* pattern, const char* mask);
+
+	// Script patching (step 8): runtime/mod_script.cpp
+	MirageScript* MIRAGE_CALL ScriptOpen(MirageMod* mod, const char* function);
+	void MIRAGE_CALL ScriptClose(MirageScript* script);
+	int32_t MIRAGE_CALL ScriptCount(MirageScript* script);
+	int32_t MIRAGE_CALL ScriptGet(MirageScript* script, int32_t index, MirageToken* out);
+	int32_t MIRAGE_CALL ScriptSet(MirageScript* script, int32_t index, const MirageToken* in);
+	int32_t MIRAGE_CALL ScriptAdd(MirageScript* script, const MirageToken* in);
+	int32_t MIRAGE_CALL ScriptChildren(MirageScript* script, int32_t index, int32_t* out, int32_t capacity);
+	int32_t MIRAGE_CALL ScriptSetChildren(MirageScript* script, int32_t index, const int32_t* children, int32_t count);
+	int32_t MIRAGE_CALL ScriptApply(MirageScript* script);
+	int32_t MIRAGE_CALL ScriptRestore(MirageMod* mod, const char* function);
+	uint32_t MIRAGE_CALL ScriptDump(MirageScript* script, char* buffer, uint32_t capacity);
+	int32_t MIRAGE_CALL ScriptKind(const char* name);
+	const char* MIRAGE_CALL ScriptKindName(int32_t kind);
 }
 
 namespace mirage::mods

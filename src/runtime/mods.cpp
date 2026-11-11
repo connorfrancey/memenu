@@ -478,6 +478,10 @@ namespace mirage::mods
 		MirageSetting* MIRAGE_CALL SettingSliderInt(MirageModule* m, const char* name, int32_t value, int32_t min,
 													int32_t max, const char* tooltip)
 		{
+			// ImGui's int sliders take at most half of int32's range (it asserts otherwise): 1 << 30 is one too many
+			constexpr int32_t kLimit = INT32_MAX / 2;
+			min = std::clamp(min, -kLimit, kLimit);
+			max = std::clamp(max, -kLimit, kLimit);
 			if (!(min < max)) return nullptr;
 			return MakeSetting<ctl::SliderInt>(m, name, int(value), int(min), int(max), std::string("%d"), 0,
 											   std::string(Str(tooltip)));
@@ -646,6 +650,9 @@ namespace mirage::mods
 			game_api::PlayerPawn, game_api::PlayerController, game_api::WorldInfo, game_api::ObjectFind,
 			game_api::ObjectGet, game_api::ObjectSet, game_api::ObjectName, game_api::ObjectClassName, game_api::ObjectIsA,
 			game_api::DetourCreate, game_api::DetourRemove, game_api::FindPattern,
+			game_api::ScriptOpen, game_api::ScriptClose, game_api::ScriptCount, game_api::ScriptGet, game_api::ScriptSet,
+			game_api::ScriptAdd, game_api::ScriptChildren, game_api::ScriptSetChildren, game_api::ScriptApply,
+			game_api::ScriptRestore, game_api::ScriptDump, game_api::ScriptKind, game_api::ScriptKindName,
 		};
 
 		// ---- Loading -----------------------------------------------------------------------------------------------

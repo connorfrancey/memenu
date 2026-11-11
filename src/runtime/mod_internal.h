@@ -30,6 +30,10 @@ namespace mirage::mods
 	struct HookRecord;
 	struct Subscription;
 }
+namespace mirage::content
+{
+	class Set;
+}
 
 // The runtime's record of a mod: what api.h calls MirageMod. Lives until the menu unloads (its modules point at it).
 struct MirageMod
@@ -59,6 +63,9 @@ struct MirageMod
 	std::vector<std::unique_ptr<mirage::mods::HookRecord>> hooks;
 	std::vector<std::shared_ptr<mirage::mods::Subscription>> subscriptions;
 	std::vector<int> detours;							// mirage::detours ids, removed with its hooks
+	// Its content (step 7): what its content folders change, and the module that turns it on and off
+	std::shared_ptr<mirage::content::Set> content;
+	Module* contentModule = nullptr;
 };
 
 namespace mirage::mods

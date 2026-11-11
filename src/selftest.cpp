@@ -16,6 +16,7 @@
 #include "game/game.h"
 #include "game/uobject.h"
 #include "game/levels.h"
+#include "game/object_cache.h"
 #include "game/player_state.h"
 #include "game/save_library.h"
 #include "runtime/call.h"
@@ -3406,6 +3407,73 @@ void TestMirageModHooks()
     End(s);
 }
 
+// Mirage step 7: a content mod (examples/mods/high-steps, data only) overrides a default property. Its module turns it
+// on and off: on, the class's default object and the player's pawn have the mod's value, and a respawned pawn gets it;
+// off, the exact original is back, on the pawn now and on the next one. No game file is written.
+void TestMirageContent()
+{
+    Step& s = Begin("Mirage content");
+    Probe p(s);
+    Module* m = modules::Find("High Steps");
+    if (!m) {
+        p.Problem("the High Steps module (examples/mods/high-steps) is missing");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    // MaxStepHeight of the default object and of the pawn the player has now
+    const auto readSteps = [&](float& cdo, float& pawn, void** which) {
+        OnGameThread([&] {
+            auto* d = game::FindObject<Classes::UObject>("TdPlayerPawn TdGame.Default__TdPlayerPawn");
+            auto* pw = game::Pawn();
+            cdo = d ? mirage::reflect::GetFloat(mirage::reflect::Resolve(d->Class, d, "MaxStepHeight")) : -1.f;
+            pawn = pw ? pw->MaxStepHeight : -1.f;
+            if (which) *which = pw;
+        });
+    };
+    const auto set = [&](bool on) {
+        OnRenderThread([m, on] { m->SetEnabled(on); });
+        WaitTicks(3);       // Applied / put back on the game thread
+    };
+    const auto respawn = [&] {
+        void* before = nullptr;
+        float c = 0, pw = 0;
+        readSteps(c, pw, &before);
+        OnGameThread([] { levels::RestartFromLastCheckpoint(); });
+        void* after = before;
+        WaitFor(30.0, [&] { readSteps(c, pw, &after); return after && after != before; });
+        WaitTicks(10);      // Not WaitPlayerReady: after a restart the controller's bFrozen stays set (engine leftover)
+        return after != before;
+    };
+
+    set(false);
+    float cdo = 0, pawn = 0;
+    readSteps(cdo, pawn, nullptr);
+    const float original = cdo;
+    if (pawn != original) p.Problem("off: the pawn's MaxStepHeight " + std::to_string(pawn) + " isn't the default " + std::to_string(original));
+
+    set(true);
+    readSteps(cdo, pawn, nullptr);
+    if (cdo != 105.f || pawn != 105.f)
+        p.Problem("on: MaxStepHeight is " + std::to_string(cdo) + " (default object) and " + std::to_string(pawn) + " (pawn), not 105");
+    if (!respawn()) p.Problem("the player wasn't respawned");
+    readSteps(cdo, pawn, nullptr);
+    if (pawn != 105.f) p.Problem("on: a respawned pawn has MaxStepHeight " + std::to_string(pawn) + ", not 105");
+
+    set(false);
+    readSteps(cdo, pawn, nullptr);
+    if (cdo != original || pawn != original)
+        p.Problem("off: MaxStepHeight is " + std::to_string(cdo) + " / " + std::to_string(pawn) + ", not the original " + std::to_string(original));
+    respawn();
+    readSteps(cdo, pawn, nullptr);
+    if (pawn != original) p.Problem("off: a respawned pawn has " + std::to_string(pawn) + ", not the original " + std::to_string(original));
+    s.notes.push_back("MaxStepHeight " + std::to_string(original) + " -> 105 with the mod on, back to " + std::to_string(pawn) + " off");
+
+    set(true);      // As the player would have it
+    p.Check(1, true);
+    End(s);
+}
+
 // Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
 // what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
 // hot reload ten times in a row (Lua and native, settings and state kept, no memory left behind), and the file watcher.
@@ -3823,6 +3891,7 @@ const Named* FeatureList()
         {"Mirage mods", &TestMirageMods, false},
         {"Mirage lifecycle", &TestMirageLifecycle, false},
         {"Mirage hooks from mods", &TestMirageModHooks, false},
+        {"Mirage content", &TestMirageContent, false},
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},

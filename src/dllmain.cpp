@@ -22,6 +22,7 @@
 #if MEMENU_GAME
 #include "game/game.h"
 #include "game/levels.h"
+#include "runtime/content.h"
 #include "runtime/detours.h"
 #include "runtime/fhooks.h"
 #include "runtime/mod_game.h"
@@ -102,6 +103,7 @@ static void Run(HMODULE module)
                 levelLoaded = true;
                 mirage::reflect::ClearCache();   // Classes of the old level's packages are gone
                 mirage::hooks::Retry();          // Functions hooked before they were loaded, or gone with the level
+                mirage::content::ReapplyAll();   // Content mods' overrides on the level's objects
             });
             game::OnTick([](float seconds) {
                 if (levelLoaded && !worldLoaded.exchange(true)) mirage::mods::LoadPhase(mirage::mods::Phase::World);

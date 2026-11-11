@@ -2,6 +2,8 @@
 
 #include "core/module.h"
 #include "core/setting.h"
+#include "game/game.h"
+#include "runtime/content.h"
 #include "runtime/manifest.h"
 #include "runtime/mod_lua.h"
 #include "runtime/resolve.h"
@@ -263,6 +265,36 @@ namespace mirage::mods
 			if (m->Enabled()) m->SetEnabled(false);
 		detail::RemoveGameHooks(*mod_);
 	}
+
+	// A content mod's switch: its overrides on (applied on the game thread) or off (put back as they were)
+	class ContentModule final : public Module
+	{
+	public:
+		ContentModule(MirageMod* mod, const std::string& name)
+			: Module(name, "Mods", mod->manifest.description.empty() ? "What this mod changes in the game" : mod->manifest.description, 50),
+			  mod_(mod)
+		{
+			enabledByDefault = true;
+		}
+		bool Hidden() const override
+		{
+			const State st = mod_->state.load();
+			return st != State::Active && st != State::Loading;
+		}
+		void OnEnable() override
+		{
+			auto set = mod_->content;
+			if (set) game::RunOnGameThread([set] { content::Apply(*set); });
+		}
+		void OnDisable() override
+		{
+			auto set = mod_->content;
+			if (set) game::RunOnGameThread([set] { if (content::Applied(*set)) content::Restore(*set); });
+		}
+
+	private:
+		MirageMod* mod_;
+	};
 
 	bool detail::Running(const MirageMod& mod)
 	{
@@ -646,6 +678,7 @@ namespace mirage::mods
 		void UnloadCode(MirageMod& mod)
 		{
 			detail::RemoveGameHooks(mod);	// Before its code goes
+			if (mod.content && content::Applied(*mod.content)) content::Restore(*mod.content);
 			mod.lua.reset();
 			if (mod.unload) {
 				Fault f;
@@ -726,6 +759,37 @@ namespace mirage::mods
 				mod.pending.clear();
 				mod.problem = problem;
 				return problem;
+			}
+			// Its content: read again on every load (a reload picks up edited files)
+			if (!mod.manifest.content.empty()) {
+				std::vector<std::filesystem::path> folders;
+				for (const auto& c : mod.manifest.content) folders.push_back(mod.manifest.dir / FromUtf8(c));
+				std::vector<std::string> problems;
+				auto set = content::Load(mod.id, folders, problems);
+				for (const auto& w : problems) {
+					spdlog::warn("[mod {}] content: {}", mod.id, w);
+					mod.warnings.push_back("content: " + w);
+				}
+				const bool on = mod.contentModule && mod.contentModule->Enabled();
+				if (mod.content) {
+					if (content::Applied(*mod.content)) content::Restore(*mod.content);
+					content::Unregister(*mod.content);
+				}
+				mod.content = content::Empty(*set) ? nullptr : set;
+				if (mod.content) {
+					content::Register(mod.content);
+					if (!mod.contentModule) {
+						std::string name = mod.manifest.name;
+						if (modules::NameTaken(name) || std::any_of(mod.pending.begin(), mod.pending.end(), [&](const auto& m) { return m->Name() == name; }))
+							name += " (content)";
+						auto module = std::make_unique<ContentModule>(&mod, name);
+						mod.contentModule = module.get();
+						mod.pending.push_back(std::move(module));
+					} else if (on) {
+						auto applied = mod.content;
+						game::RunOnGameThread([applied] { content::Apply(*applied); });
+					}
+				}
 			}
 			for (const SettingDecl& d : mod.manifest.settings)
 				if (!mod.declared.count(d.key)) {

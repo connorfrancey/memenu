@@ -1,0 +1,7 @@
+id = "high-steps"
+name = "High Steps"
+version = "1.0.0"
+description = "A content example: the player steps up ledges three times higher. No code, just data"
+authors = ["Mirror's Edge Menu"]
+mirage = "^0.1"
+content = ["content"]

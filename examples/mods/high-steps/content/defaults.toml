@@ -1,0 +1,7 @@
+# Property overrides, applied while the mod's module is on and put back when it is turned off. One table per object,
+# by path; its properties by name (dotted for a struct's members).
+
+# The player's pawn class: every pawn the game makes from now on gets this
+["TdGame.Default__TdPlayerPawn"]
+MaxStepHeight = 105.0     # The game's is 35: steps and small ledges up to three times higher are walked up
+instances = true          # ... and the pawn the player has right now too

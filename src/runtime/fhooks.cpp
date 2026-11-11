@@ -422,6 +422,14 @@ namespace mirage::hooks
 		return ok;
 	}
 
+	double UnhookedLookupNanoseconds(int rounds)
+	{
+		volatile int sink = 0;
+		const clk::Ticks start = clk::Now();
+		for (int i = 0; i < rounds; ++i) sink = sink + TableFind(0x10000000u + static_cast<std::uintptr_t>(i) * 0x40u);
+		return clk::Micros(clk::Now() - start) * 1000.0 / rounds;
+	}
+
 	Stats GetStats()
 	{
 		std::lock_guard lock(g_lock);

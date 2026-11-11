@@ -72,4 +72,7 @@ namespace mirage::hooks
 		int functions = 0, hooks = 0;		// Hooked now
 	};
 	Stats GetStats();
+	// What the ProcessInternal detour adds to a call of a function nobody hooks: its table lookup, timed over `rounds`
+	// lookups of functions that aren't in the table (nanoseconds each). Any thread.
+	double UnhookedLookupNanoseconds(int rounds = 1000000);
 }

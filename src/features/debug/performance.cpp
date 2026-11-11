@@ -6,6 +6,9 @@
 #include "core/optimizations.h"
 #include "core/scheduler.h"
 #include "gui.h"
+#if MEMENU_GAME
+#include "runtime/fhooks.h"
+#endif
 
 #include <Windows.h>
 #include <psapi.h>
@@ -188,6 +191,16 @@ private:
         const Memory& m = memory_.Get(&ReadMemory);
         ImGui::Text("Memory: %.1f MB working set (peak %.1f), %.1f MB private, %lu page faults", m.workingSetMb, m.peakMb,
                     m.privateMb, m.pageFaults);
+#if MEMENU_GAME
+        {   // Mirage function hooks: what hooking costs, around the hooked functions' own time
+            const mirage::hooks::Stats h = mirage::hooks::GetStats();
+            if (h.calls)
+                ImGui::Text("Function hooks: %d hooks on %d functions, %llu calls, %.2f us each around the original",
+                            h.hooks, h.functions, static_cast<unsigned long long>(h.calls), h.microseconds / static_cast<double>(h.calls));
+            else
+                ImGui::TextDisabled("Function hooks: %d hooks on %d functions, no calls yet", h.hooks, h.functions);
+        }
+#endif
 
         // Most expensive modules at a glance
         std::vector<const sched::EntryView*> top;

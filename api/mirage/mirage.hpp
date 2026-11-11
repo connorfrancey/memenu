@@ -20,6 +20,7 @@
 
 #include "mirage/api.h"
 
+#include <functional>
 #include <memory>
 #include <type_traits>
 #include <string>
@@ -249,6 +250,195 @@ namespace mirage
 		int Key() const { return handle_ ? Api().setting_get_int(handle_) : 0; }
 	};
 
+	// ---- Game values (step 6): what object_get / call_get return, as C++ types ---------------------------------------
+	class Object;
+	namespace detail
+	{
+		template <class T>
+		T FromValue(const MirageValue& v);
+		template <class T>
+		MirageValue ToValue(const T& x)
+		{
+			MirageValue v{};
+			if constexpr (std::is_same_v<T, bool>) {
+				v.type = MIRAGE_VALUE_BOOL;
+				v.i = x ? 1 : 0;
+			} else if constexpr (std::is_integral_v<T> || std::is_enum_v<T>) {
+				v.type = MIRAGE_VALUE_INT;
+				v.i = static_cast<int32_t>(x);
+			} else if constexpr (std::is_floating_point_v<T>) {
+				v.type = MIRAGE_VALUE_FLOAT;
+				v.f = static_cast<float>(x);
+			} else if constexpr (std::is_same_v<T, std::string>) {
+				v.type = MIRAGE_VALUE_TEXT;
+				const std::size_t n = x.size() < sizeof v.text - 1 ? x.size() : sizeof v.text - 1;
+				for (std::size_t i = 0; i < n; ++i) v.text[i] = x[i];
+			} else {
+				static_assert(std::is_same_v<T, Object>, "a bool, number, std::string or mirage::Object");
+				v.type = MIRAGE_VALUE_OBJECT;
+				v.o = x.Handle();
+			}
+			return v;
+		}
+	}
+
+	// A game object: an Actor, a Controller, ... Not owned: look it up again rather than keep it across ticks.
+	//     mirage::Object pawn = mirage::Object::Pawn();
+	//     if (pawn) pawn.Set("Location.Z", pawn.Get<float>("Location.Z") + 100.f);
+	class Object
+	{
+	public:
+		Object() = default;
+		explicit Object(MirageObject* o) : o_(o) {}
+		static Object Pawn() { return Object(Api().player_pawn()); }
+		static Object Controller() { return Object(Api().player_controller()); }
+		static Object World() { return Object(Api().world_info()); }
+		static Object Find(const std::string& fullName) { return Object(Api().object_find(fullName.c_str())); }
+
+		explicit operator bool() const { return o_ != nullptr; }
+		bool operator==(const Object& other) const { return o_ == other.o_; }
+		MirageObject* Handle() const { return o_; }
+
+		// A property, or a member of a struct in it ("Location.Z"): T is bool, a number, std::string or Object.
+		// Missing or of another kind: T{}.
+		template <class T>
+		T Get(const std::string& path) const
+		{
+			MirageValue v{};
+			if (!o_ || !Api().object_get(o_, path.c_str(), &v)) return T{};
+			return detail::FromValue<T>(v);
+		}
+		template <class T>
+		bool Set(const std::string& path, const T& x) const
+		{
+			const MirageValue v = detail::ToValue(x);
+			return o_ && Api().object_set(o_, path.c_str(), &v) != 0;
+		}
+		std::string Name() const { return Text(Api().object_name); }
+		std::string ClassName() const { return Text(Api().object_class_name); }
+		bool IsA(const std::string& className) const { return o_ && Api().object_is_a(o_, className.c_str()) != 0; }
+
+	private:
+		std::string Text(uint32_t(MIRAGE_CALL* fn)(MirageObject*, char*, uint32_t)) const
+		{
+			char buffer[256];
+			if (!o_) return {};
+			fn(o_, buffer, sizeof buffer);
+			return buffer;
+		}
+		MirageObject* o_ = nullptr;
+	};
+
+	namespace detail
+	{
+		template <class T>
+		T FromValue(const MirageValue& v)
+		{
+			if constexpr (std::is_same_v<T, bool>) {
+				return v.i != 0;
+			} else if constexpr (std::is_integral_v<T> || std::is_enum_v<T>) {
+				return static_cast<T>(v.type == MIRAGE_VALUE_FLOAT ? static_cast<int32_t>(v.f) : v.i);
+			} else if constexpr (std::is_floating_point_v<T>) {
+				return static_cast<T>(v.type == MIRAGE_VALUE_FLOAT ? v.f : static_cast<float>(v.i));
+			} else if constexpr (std::is_same_v<T, std::string>) {
+				return std::string(v.text);
+			} else {
+				static_assert(std::is_same_v<T, Object>, "a bool, number, std::string or mirage::Object");
+				return Object(v.o);
+			}
+		}
+	}
+
+	// A call of a game function, in a hook: its object, its parameters ("NewLocation.Z", "ReturnValue")
+	class Call
+	{
+	public:
+		explicit Call(MirageCall* c) : c_(c) {}
+		Object Self() const { return Object(Api().call_object(c_)); }
+		std::string Function() const { return Api().call_function(c_); }
+		void Skip() const { Api().call_skip(c_); }
+		template <class T>
+		T Get(const std::string& path) const
+		{
+			MirageValue v{};
+			if (!Api().call_get(c_, path.c_str(), &v)) return T{};
+			return detail::FromValue<T>(v);
+		}
+		template <class T>
+		bool Set(const std::string& path, const T& x) const
+		{
+			const MirageValue v = detail::ToValue(x);
+			return Api().call_set(c_, path.c_str(), &v) != 0;
+		}
+
+	private:
+		MirageCall* c_;
+	};
+
+	// ---- Events and hooks (step 6). Removed when the mod unloads; Remove() takes one off earlier. --------------------
+	class Hooked
+	{
+	public:
+		virtual ~Hooked() = default;
+		virtual void Remove() = 0;
+	};
+	namespace detail
+	{
+		inline std::vector<std::unique_ptr<Hooked>>& Callbacks()
+		{
+			static std::vector<std::unique_ptr<Hooked>> c;
+			return c;
+		}
+		struct EventCallback final : Hooked
+		{
+			std::function<void(const MirageEvent&)> fn;
+			MirageSubscription* sub = nullptr;
+			void Remove() override
+			{
+				if (sub) ::mirage::Api().event_unsubscribe(sub);
+				sub = nullptr;
+			}
+		};
+		struct HookCallback final : Hooked
+		{
+			std::function<void(Call&)> fn;
+			MirageHook* hook = nullptr;
+			void Remove() override
+			{
+				if (hook) ::mirage::Api().hook_remove(hook);
+				hook = nullptr;
+			}
+		};
+	}
+
+	// MIRAGE_EVENT_TICK, _LEVEL_LOAD, _DEATH, _PLAYER_STATE, _KEY (api.h says what comes with each). nullptr if it fails.
+	inline Hooked* On(int32_t event, std::function<void(const MirageEvent&)> fn)
+	{
+		auto c = std::make_unique<detail::EventCallback>();
+		c->fn = std::move(fn);
+		c->sub = Api().event_subscribe(Mod(), event, [](void* u, const MirageEvent* e) {
+			static_cast<detail::EventCallback*>(u)->fn(*e);
+		}, c.get());
+		if (!c->sub) return nullptr;
+		detail::Callbacks().push_back(std::move(c));
+		return detail::Callbacks().back().get();
+	}
+
+	// A game function by path ("Engine.Actor.SetLocation"); when: MIRAGE_HOOK_BEFORE / _AFTER / _REPLACE; higher
+	// priority runs first. nullptr if it can't be hooked (the log says why).
+	inline Hooked* Hook(const std::string& function, int32_t when, int32_t priority, std::function<void(Call&)> fn)
+	{
+		auto c = std::make_unique<detail::HookCallback>();
+		c->fn = std::move(fn);
+		c->hook = Api().hook_function(Mod(), function.c_str(), when, priority, [](void* u, MirageCall* call) {
+			Call wrapped(call);
+			static_cast<detail::HookCallback*>(u)->fn(wrapped);
+		}, c.get());
+		if (!c->hook) return nullptr;
+		detail::Callbacks().push_back(std::move(c));
+		return detail::Callbacks().back().get();
+	}
+
 	// ---- Registration ----------------------------------------------------------------------------------------------
 	namespace detail
 	{
@@ -271,7 +461,11 @@ namespace mirage
 			for (Factory make : Factories()) Instances().push_back(make());
 			return 0;
 		}
-		inline void Unload() { Instances().clear(); }
+		inline void Unload()
+		{
+			Instances().clear();
+			Callbacks().clear();		// The runtime took the hooks off already
+		}
 	}
 }
 

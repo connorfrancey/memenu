@@ -24,36 +24,8 @@
 #include <sstream>
 #include <typeinfo>
 
-namespace mirage::mods
-{
-	class ModModule;
-	enum class State : int { NotLoaded, Loading, Active, Detached, Failed, Crashed };
-}
-
-// The runtime's record of a mod: what api.h calls MirageMod. Lives until the menu unloads (its modules point at it).
-struct MirageMod
-{
-	mirage::mods::Manifest manifest;
-	std::string id, version, dir;						// Kept as C strings for the API
-	std::atomic<mirage::mods::State> state{mirage::mods::State::NotLoaded};
-	std::atomic<int> inflight{0};						// Calls into its code running right now (any thread)
-	HMODULE dll = nullptr;
-	std::filesystem::path shadow;						// The copy of its DLL that is loaded (hot reload), or empty
-	MirageModUnloadFn unload = nullptr;
-	mirage::mods::LuaModPtr lua;
-	std::vector<mirage::mods::ModModule*> modules;		// Every module it ever registered, in order (the menu owns them)
-	std::vector<std::unique_ptr<Module>> pending;		// Registered by the current load, not in the menu yet
-	std::map<std::string, ctl::Setting*> declared;		// Its mod.toml settings that were made, by key
-	std::mutex configLock;
-	toml::value config;
-	bool configRead = false;
-	std::uintmax_t fingerprint = 0;						// Of its files, at the last load (hot reload)
-	std::uintmax_t seen = 0;							// At the last check: a reload waits until they stop changing
-	bool warnedNoReload = false;
-	int loadIndex = -1, reloads = 0;
-	std::string problem;
-	std::vector<std::string> warnings;
-};
+#include "runtime/mod_game.h"
+#include "runtime/mod_internal.h"
 
 namespace mirage::mods
 {
@@ -289,6 +261,32 @@ namespace mirage::mods
 		Crashed(*mod_, Name(), what, f);
 		for (ModModule* m : mod_->modules)		// Off without calling it again (its code is in an unknown state)
 			if (m->Enabled()) m->SetEnabled(false);
+		detail::RemoveGameHooks(*mod_);
+	}
+
+	bool detail::Running(const MirageMod& mod)
+	{
+		const State st = mod.state.load();
+		return st == State::Active || st == State::Loading;
+	}
+
+	bool detail::Enter(MirageMod& mod, const std::string& what, const std::string& where, void (*fn)(void*), void* arg)
+	{
+		if (!Running(mod)) return false;
+		mod.inflight.fetch_add(1);
+		if (!Running(mod)) {
+			mod.inflight.fetch_sub(1);
+			return false;
+		}
+		Fault f;
+		const bool ok = Guarded(fn, arg, &f);
+		mod.inflight.fetch_sub(1);
+		if (ok) return true;
+		Crashed(mod, where, what, f);
+		for (ModModule* m : mod.modules)
+			if (m->Enabled()) m->SetEnabled(false);
+		RemoveGameHooks(mod);
+		return false;
 	}
 
 	namespace
@@ -610,6 +608,11 @@ namespace mirage::mods
 			ConfigGet, ConfigSet,
 			ScreenSize, DrawText, DrawLine, DrawRect, DrawRectFilled, TextSize,
 			SettingFind, SettingType,
+			game_api::EventSubscribe, game_api::EventUnsubscribe, game_api::HookFunction, game_api::HookRemove,
+			game_api::CallObject, game_api::CallFunction, game_api::CallSkip, game_api::CallGet, game_api::CallSet,
+			game_api::CallBegin, game_api::CallInvoke, game_api::CallEnd,
+			game_api::PlayerPawn, game_api::PlayerController, game_api::WorldInfo, game_api::ObjectFind,
+			game_api::ObjectGet, game_api::ObjectSet, game_api::ObjectName, game_api::ObjectClassName, game_api::ObjectIsA,
 		};
 
 		// ---- Loading -----------------------------------------------------------------------------------------------
@@ -641,6 +644,7 @@ namespace mirage::mods
 
 		void UnloadCode(MirageMod& mod)
 		{
+			detail::RemoveGameHooks(mod);	// Before its code goes
 			mod.lua.reset();
 			if (mod.unload) {
 				Fault f;

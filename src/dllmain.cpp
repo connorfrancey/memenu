@@ -23,6 +23,7 @@
 #include "game/game.h"
 #include "game/levels.h"
 #include "runtime/fhooks.h"
+#include "runtime/mod_game.h"
 #include "runtime/mods.h"
 #include "runtime/reflect.h"
 #endif
@@ -95,15 +96,21 @@ static void Run(HMODULE module)
             // The world phase's mods load on the first tick after a level has loaded
             static std::atomic<bool> levelLoaded{false}, worldLoaded{false};
             game::OnLevelLoad([](bool finished) {
+                mirage::mods::DispatchLevelLoad(finished, finished ? game::MapName() : std::string());
                 if (!finished) return;
                 levelLoaded = true;
                 mirage::reflect::ClearCache();   // Classes of the old level's packages are gone
                 mirage::hooks::Retry();          // Functions hooked before they were loaded, or gone with the level
             });
-            game::OnTick([](float) {
+            game::OnTick([](float seconds) {
                 if (levelLoaded && !worldLoaded.exchange(true)) mirage::mods::LoadPhase(mirage::mods::Phase::World);
+                mirage::mods::DispatchTick(seconds);
                 modules::Tick();
             });
+            // The mods' other events: deaths, the player's move state, keys
+            game::OnPlayerDeath([](bool after) { mirage::mods::DispatchDeath(after); });
+            game::OnPlayerStateChange([] { mirage::mods::DispatchPlayerState(); return false; });
+            modules::SetKeyListener([](int vk) { mirage::mods::DispatchKey(vk); });
             STARTUP_STEP(levels::Init());
             STARTUP_STEP(mirage::mods::LoadPhase(mirage::mods::Phase::Engine));   // The game layer is up
             // Hot reload: mods whose files changed, checked twice a second (game thread, between the modules' ticks)

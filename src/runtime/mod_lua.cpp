@@ -11,6 +11,8 @@
 #include <lauxlib.h>
 #include <lua.h>
 
+#include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -22,6 +24,19 @@ namespace mirage::mods
 	{
 		constexpr const char* kModuleMeta = "mirage.module";
 		constexpr const char* kSettingMeta = "mirage.setting";
+		constexpr const char* kProxyMeta = "mirage.value";		// An object, or a struct in an object or a call
+		constexpr const char* kCallMeta = "mirage.call";		// What a hook gets: valid during the hook only
+		constexpr const char* kCallbackMeta = "mirage.callback";	// A subscription or a hook: :remove()
+		enum ProxyKind { kObject = 0, kInObject = 1, kInCall = 2 };
+		struct Proxy			// uservalue 1: the path (string); 2: the call box (kInCall)
+		{
+			int kind;
+			void* handle;			// MirageObject* or MirageCall*
+		};
+		struct CallBox
+		{
+			MirageCall* call;		// nullptr once the hook returned
+		};
 
 		enum class SettingKind : std::uint8_t { Checkbox, Slider, SliderInt, Text, Key, Choice };
 		struct SettingBox
@@ -118,6 +133,43 @@ namespace mirage::mods
 		static int Rgba(lua_State* L);
 		static int Require(lua_State* L);
 
+		// ---- Game objects, events, hooks (step 6) ------------------------------------------------------------------
+		struct Callback			// An event subscription or a function hook's Lua function
+		{
+			LuaMod* owner = nullptr;
+			int fn = LUA_NOREF;
+			MirageSubscription* subscription = nullptr;
+			MirageHook* hook = nullptr;
+			std::string what;
+			bool failed = false;
+		};
+		static void MIRAGE_CALL OnEvent(void* user, const MirageEvent* e);
+		static void MIRAGE_CALL OnHook(void* user, MirageCall* call);
+		void Fail(Callback& c, const std::string& error);
+		static int On(lua_State* L);
+		static int HookFn(lua_State* L);
+		static int CallbackRemove(lua_State* L);
+		static int Pawn(lua_State* L);
+		static int Controller(lua_State* L);
+		static int World(lua_State* L);
+		static int Find(lua_State* L);
+		static int Name(lua_State* L);
+		static int ClassName(lua_State* L);
+		static int IsA(lua_State* L);
+		static int CallGame(lua_State* L);
+		static int ProxyIndex(lua_State* L);
+		static int ProxyNewIndex(lua_State* L);
+		static int ProxyEq(lua_State* L);
+		static int ProxyToString(lua_State* L);
+		static int CallIndex(lua_State* L);
+		static int CallSkip(lua_State* L);
+		static void PushObject(lua_State* L, MirageObject* o);
+		static void PushProxy(lua_State* L, int kind, void* handle, const std::string& path, int owner);
+		static void PushValue(lua_State* L, const MirageValue& v, int kind, void* handle, const std::string& path, int owner);
+		static bool ToValue(lua_State* L, int index, MirageValue& out);
+		static MirageObject* CheckObject(lua_State* L, int index);
+		int Set(lua_State* L, int kind, void* handle, const std::string& path, int value);
+
 		static MirageModule* CheckModule(lua_State* L)
 		{
 			auto** refs = static_cast<ModuleRefs**>(luaL_checkudata(L, 1, kModuleMeta));
@@ -142,6 +194,7 @@ namespace mirage::mods
 		lua::State state_;
 		std::recursive_mutex lock_;		// Recursive: a callback may switch its module off, which calls on_disable
 		std::vector<std::unique_ptr<ModuleRefs>> modules_;
+		std::vector<std::unique_ptr<Callback>> callbacks_;		// Events and hooks (kept until the mod unloads)
 		std::filesystem::path dir_;
 	};
 
@@ -433,6 +486,369 @@ namespace mirage::mods
 		return 1;
 	}
 
+	// ---- Game objects --------------------------------------------------------------------------------------------
+	void LuaMod::PushProxy(lua_State* L, int kind, void* handle, const std::string& path, int owner)
+	{
+		auto* p = static_cast<Proxy*>(lua_newuserdatauv(L, sizeof(Proxy), 2));
+		p->kind = kind;
+		p->handle = handle;
+		lua_pushlstring(L, path.data(), path.size());
+		lua_setiuservalue(L, -2, 1);
+		if (owner) {
+			lua_pushvalue(L, owner);
+			lua_setiuservalue(L, -2, 2);
+		}
+		luaL_setmetatable(L, kProxyMeta);
+	}
+
+	void LuaMod::PushObject(lua_State* L, MirageObject* o)
+	{
+		if (!o) lua_pushnil(L);
+		else PushProxy(L, kObject, o, "", 0);
+	}
+
+	// A value as Lua sees it: numbers, booleans, strings, objects; a struct is a proxy reaching into it
+	void LuaMod::PushValue(lua_State* L, const MirageValue& v, int kind, void* handle, const std::string& path, int owner)
+	{
+		switch (v.type) {
+			case MIRAGE_VALUE_BOOL: lua_pushboolean(L, v.i); break;
+			case MIRAGE_VALUE_INT: lua_pushinteger(L, v.i); break;
+			case MIRAGE_VALUE_FLOAT: lua_pushnumber(L, v.f); break;
+			case MIRAGE_VALUE_OBJECT: PushObject(L, v.o); break;
+			case MIRAGE_VALUE_TEXT: lua_pushstring(L, v.text); break;
+			case MIRAGE_VALUE_STRUCT: PushProxy(L, kind == kObject ? kInObject : kind, handle, path, owner); break;
+			default: lua_pushnil(L); break;
+		}
+	}
+
+	MirageObject* LuaMod::CheckObject(lua_State* L, int index)
+	{
+		auto* p = static_cast<Proxy*>(luaL_testudata(L, index, kProxyMeta));
+		if (!p || p->kind != kObject) luaL_typeerror(L, index, "game object");
+		return static_cast<MirageObject*>(p->handle);
+	}
+
+	bool LuaMod::ToValue(lua_State* L, int index, MirageValue& out)
+	{
+		out = MirageValue{};
+		switch (lua_type(L, index)) {
+			case LUA_TBOOLEAN: out.type = MIRAGE_VALUE_BOOL; out.i = lua_toboolean(L, index); return true;
+			case LUA_TNUMBER:
+				if (lua_isinteger(L, index)) {
+					out.type = MIRAGE_VALUE_INT;
+					out.i = static_cast<int32_t>(lua_tointeger(L, index));
+				} else {
+					out.type = MIRAGE_VALUE_FLOAT;
+					out.f = static_cast<float>(lua_tonumber(L, index));
+				}
+				return true;
+			case LUA_TSTRING: {
+				out.type = MIRAGE_VALUE_TEXT;
+				std::size_t n = 0;
+				const char* t = lua_tolstring(L, index, &n);
+				std::memcpy(out.text, t, std::min<std::size_t>(n, sizeof out.text - 1));
+				return true;
+			}
+			case LUA_TNIL: out.type = MIRAGE_VALUE_OBJECT; return true;
+			case LUA_TUSERDATA:
+				if (auto* p = static_cast<Proxy*>(luaL_testudata(L, index, kProxyMeta)); p && p->kind == kObject) {
+					out.type = MIRAGE_VALUE_OBJECT;
+					out.o = static_cast<MirageObject*>(p->handle);
+					return true;
+				}
+				return false;
+			default: return false;
+		}
+	}
+
+	// Writes the Lua value at `value` to `path`; a table sets the struct's members one by one
+	int LuaMod::Set(lua_State* L, int kind, void* handle, const std::string& path, int value)
+	{
+		if (lua_type(L, value) == LUA_TTABLE) {
+			lua_pushnil(L);
+			while (lua_next(L, value)) {
+				if (lua_type(L, -2) == LUA_TSTRING) Set(L, kind, handle, path + "." + lua_tostring(L, -2), lua_gettop(L));
+				lua_pop(L, 1);
+			}
+			return 0;
+		}
+		MirageValue v;
+		if (!ToValue(L, value, v)) return luaL_error(L, "%s: can't be set to a %s", path.c_str(), luaL_typename(L, value));
+		const int ok = kind == kInCall ? api_->call_set(static_cast<MirageCall*>(handle), path.c_str(), &v)
+									   : api_->object_set(static_cast<MirageObject*>(handle), path.c_str(), &v);
+		if (!ok) return luaL_error(L, "%s can't be set (no such member, another type, or the object is gone)", path.c_str());
+		return 0;
+	}
+
+	namespace
+	{
+		// The proxy at 1, with its path and owner (a call box, or 0) on the stack
+		struct ProxyAt
+		{
+			Proxy* p;
+			std::string path;
+			int owner = 0;
+		};
+		ProxyAt OpenProxy(lua_State* L)
+		{
+			ProxyAt r{static_cast<Proxy*>(luaL_checkudata(L, 1, kProxyMeta)), {}};
+			lua_getiuservalue(L, 1, 1);
+			r.path = lua_tostring(L, -1) ? lua_tostring(L, -1) : "";
+			lua_pop(L, 1);
+			if (r.p->kind == kInCall) {
+				lua_getiuservalue(L, 1, 2);
+				auto* box = static_cast<CallBox*>(lua_touserdata(L, -1));
+				if (!box || !box->call) luaL_error(L, "a hook's parameters are only there while the hook runs");
+				r.owner = lua_gettop(L);
+			}
+			return r;
+		}
+		std::string Join(const std::string& path, const char* key) { return path.empty() ? key : path + "." + key; }
+	}
+
+	int LuaMod::ProxyIndex(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		const ProxyAt at = OpenProxy(L);
+		const std::string path = Join(at.path, luaL_checkstring(L, 2));
+		MirageValue v;
+		const int ok = at.p->kind == kInCall ? self.api_->call_get(static_cast<MirageCall*>(at.p->handle), path.c_str(), &v)
+											 : self.api_->object_get(static_cast<MirageObject*>(at.p->handle), path.c_str(), &v);
+		if (!ok) {
+			lua_pushnil(L);
+			return 1;
+		}
+		PushValue(L, v, at.p->kind, at.p->handle, path, at.owner);
+		return 1;
+	}
+
+	int LuaMod::ProxyNewIndex(lua_State* L)
+	{
+		const ProxyAt at = OpenProxy(L);
+		return Self(L).Set(L, at.p->kind, at.p->handle, Join(at.path, luaL_checkstring(L, 2)), 3);
+	}
+
+	int LuaMod::ProxyEq(lua_State* L)
+	{
+		auto* a = static_cast<Proxy*>(luaL_testudata(L, 1, kProxyMeta));
+		auto* b = static_cast<Proxy*>(luaL_testudata(L, 2, kProxyMeta));
+		lua_pushboolean(L, a && b && a->kind == kObject && b->kind == kObject && a->handle == b->handle);
+		return 1;
+	}
+
+	int LuaMod::ProxyToString(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		const ProxyAt at = OpenProxy(L);
+		if (at.p->kind == kObject) {
+			char name[128];
+			self.api_->object_name(static_cast<MirageObject*>(at.p->handle), name, sizeof name);
+			lua_pushstring(L, name);
+		} else {
+			lua_pushfstring(L, "<%s>", at.path.c_str());
+		}
+		return 1;
+	}
+
+	int LuaMod::Pawn(lua_State* L) { PushObject(L, Self(L).api_->player_pawn()); return 1; }
+	int LuaMod::Controller(lua_State* L) { PushObject(L, Self(L).api_->player_controller()); return 1; }
+	int LuaMod::World(lua_State* L) { PushObject(L, Self(L).api_->world_info()); return 1; }
+	int LuaMod::Find(lua_State* L) { PushObject(L, Self(L).api_->object_find(luaL_checkstring(L, 1))); return 1; }
+
+	int LuaMod::Name(lua_State* L)
+	{
+		char name[256];
+		Self(L).api_->object_name(CheckObject(L, 1), name, sizeof name);
+		lua_pushstring(L, name);
+		return 1;
+	}
+	int LuaMod::ClassName(lua_State* L)
+	{
+		char name[256];
+		Self(L).api_->object_class_name(CheckObject(L, 1), name, sizeof name);
+		lua_pushstring(L, name);
+		return 1;
+	}
+	int LuaMod::IsA(lua_State* L)
+	{
+		lua_pushboolean(L, Self(L).api_->object_is_a(CheckObject(L, 1), luaL_checkstring(L, 2)));
+		return 1;
+	}
+
+	// mirage.call(object, "Function", { Param = value, ... }): its return value (true if it returns nothing)
+	int LuaMod::CallGame(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		MirageObject* o = CheckObject(L, 1);
+		const char* fn = luaL_checkstring(L, 2);
+		MirageCall* call = self.api_->call_begin(o, fn);
+		if (!call) return luaL_error(L, "mirage.call: no function %s on this object", fn);
+		if (lua_istable(L, 3)) {
+			lua_pushnil(L);
+			while (lua_next(L, 3)) {
+				if (lua_type(L, -2) == LUA_TSTRING) {
+					const std::string param = lua_tostring(L, -2);
+					MirageValue probe;
+					if (!self.api_->call_get(call, param.c_str(), &probe)) {
+						self.api_->call_end(call);
+						return luaL_error(L, "mirage.call: %s has no parameter %s", fn, param.c_str());
+					}
+					self.Set(L, kInCall, call, param, lua_gettop(L));
+				}
+				lua_pop(L, 1);
+			}
+		}
+		if (!self.api_->call_invoke(call)) {
+			self.api_->call_end(call);
+			return luaL_error(L, "mirage.call: %s didn't run", fn);
+		}
+		MirageValue ret;
+		if (self.api_->call_get(call, "ReturnValue", &ret) && ret.type != MIRAGE_VALUE_STRUCT) PushValue(L, ret, kInCall, call, "", 0);
+		else lua_pushboolean(L, 1);
+		self.api_->call_end(call);
+		return 1;
+	}
+
+	// ---- Events and hooks ------------------------------------------------------------------------------------------
+	void LuaMod::Fail(Callback& c, const std::string& error)
+	{
+		c.failed = true;
+		Log(MIRAGE_LOG_ERROR, c.what + ": " + error + " (removed)");
+		if (c.hook) api_->hook_remove(c.hook);
+		if (c.subscription) api_->event_unsubscribe(c.subscription);
+	}
+
+	void MIRAGE_CALL LuaMod::OnEvent(void* user, const MirageEvent* e)
+	{
+		auto* c = static_cast<Callback*>(user);
+		LuaMod& self = *c->owner;
+		std::lock_guard lock(self.lock_);
+		if (c->failed) return;
+		lua_State* L = self.state_.Get();
+		lua_rawgeti(L, LUA_REGISTRYINDEX, c->fn);
+		int n = 0;
+		switch (e->type) {
+			case MIRAGE_EVENT_TICK: lua_pushnumber(L, e->number); n = 1; break;
+			case MIRAGE_EVENT_LEVEL_LOAD: lua_pushboolean(L, e->value); lua_pushstring(L, e->text ? e->text : ""); n = 2; break;
+			case MIRAGE_EVENT_DEATH: lua_pushboolean(L, e->value); n = 1; break;
+			case MIRAGE_EVENT_PLAYER_STATE: lua_pushinteger(L, e->value); lua_pushinteger(L, e->value2); n = 2; break;
+			case MIRAGE_EVENT_KEY: lua_pushinteger(L, e->value); n = 1; break;
+			default: break;
+		}
+		const lua::Result r = self.state_.Call(n, 0);
+		if (!r.ok) self.Fail(*c, r.error);
+	}
+
+	void MIRAGE_CALL LuaMod::OnHook(void* user, MirageCall* call)
+	{
+		auto* c = static_cast<Callback*>(user);
+		LuaMod& self = *c->owner;
+		std::lock_guard lock(self.lock_);
+		if (c->failed) return;
+		lua_State* L = self.state_.Get();
+		lua_rawgeti(L, LUA_REGISTRYINDEX, c->fn);
+		auto* box = static_cast<CallBox*>(lua_newuserdatauv(L, sizeof(CallBox), 0));
+		box->call = call;
+		luaL_setmetatable(L, kCallMeta);
+		lua_pushvalue(L, -1);
+		const int boxRef = luaL_ref(L, LUA_REGISTRYINDEX);	// To void it after the hook, wherever Lua kept it
+		const lua::Result r = self.state_.Call(1, 0);
+		lua_rawgeti(L, LUA_REGISTRYINDEX, boxRef);
+		static_cast<CallBox*>(lua_touserdata(L, -1))->call = nullptr;
+		lua_pop(L, 1);
+		luaL_unref(L, LUA_REGISTRYINDEX, boxRef);
+		if (!r.ok) self.Fail(*c, r.error);
+	}
+
+	// call.object, call.params, call.func; call:skip()
+	int LuaMod::CallIndex(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		auto* box = static_cast<CallBox*>(luaL_checkudata(L, 1, kCallMeta));
+		const std::string key = luaL_checkstring(L, 2);
+		if (key == "skip") {
+			lua_pushlightuserdata(L, &self);
+			lua_pushcclosure(L, CallSkip, 1);
+			return 1;
+		}
+		if (!box->call) return luaL_error(L, "a hook's call is only there while the hook runs");
+		if (key == "object") PushObject(L, self.api_->call_object(box->call));
+		else if (key == "params") PushProxy(L, kInCall, box->call, "", 1);
+		else if (key == "func") lua_pushstring(L, self.api_->call_function(box->call));
+		else lua_pushnil(L);
+		return 1;
+	}
+
+	int LuaMod::CallSkip(lua_State* L)
+	{
+		auto* box = static_cast<CallBox*>(luaL_checkudata(L, 1, kCallMeta));
+		if (!box->call) return luaL_error(L, "a hook's call is only there while the hook runs");
+		Self(L).api_->call_skip(box->call);
+		return 0;
+	}
+
+	// mirage.on("tick" | "level_load" | "death" | "player_state" | "key", function)
+	int LuaMod::On(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		static const char* const kEvents[] = {"tick", "level_load", "death", "player_state", "key", nullptr};
+		const int type = luaL_checkoption(L, 1, nullptr, kEvents);
+		luaL_checktype(L, 2, LUA_TFUNCTION);
+		auto c = std::make_unique<Callback>();
+		c->owner = &self;
+		c->what = std::string("mirage.on ") + kEvents[type];
+		lua_pushvalue(L, 2);
+		c->fn = luaL_ref(L, LUA_REGISTRYINDEX);
+		c->subscription = self.api_->event_subscribe(self.mod_, type, &OnEvent, c.get());
+		if (!c->subscription) return luaL_error(L, "mirage.on: %s can't be subscribed to", kEvents[type]);
+		auto** box = static_cast<Callback**>(lua_newuserdatauv(L, sizeof(Callback*), 0));
+		*box = c.get();
+		luaL_setmetatable(L, kCallbackMeta);
+		self.callbacks_.push_back(std::move(c));
+		return 1;
+	}
+
+	// mirage.hook("Engine.Actor.SetLocation", function(call) ... end, { when = "before", priority = 0 })
+	int LuaMod::HookFn(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		const char* function = luaL_checkstring(L, 1);
+		luaL_checktype(L, 2, LUA_TFUNCTION);
+		int when = MIRAGE_HOOK_BEFORE, priority = 0;
+		if (lua_istable(L, 3)) {
+			lua_getfield(L, 3, "when");
+			static const char* const kWhen[] = {"before", "after", "replace", nullptr};
+			if (!lua_isnil(L, -1)) when = luaL_checkoption(L, -1, nullptr, kWhen);
+			lua_pop(L, 1);
+			lua_getfield(L, 3, "priority");
+			priority = static_cast<int>(luaL_optinteger(L, -1, 0));
+			lua_pop(L, 1);
+		}
+		auto c = std::make_unique<Callback>();
+		c->owner = &self;
+		c->what = std::string("hook of ") + function;
+		lua_pushvalue(L, 2);
+		c->fn = luaL_ref(L, LUA_REGISTRYINDEX);
+		c->hook = self.api_->hook_function(self.mod_, function, when, priority, &OnHook, c.get());
+		if (!c->hook) return luaL_error(L, "mirage.hook: %s can't be hooked (see the log)", function);
+		auto** box = static_cast<Callback**>(lua_newuserdatauv(L, sizeof(Callback*), 0));
+		*box = c.get();
+		luaL_setmetatable(L, kCallbackMeta);
+		self.callbacks_.push_back(std::move(c));
+		return 1;
+	}
+
+	int LuaMod::CallbackRemove(lua_State* L)
+	{
+		auto** box = static_cast<Callback**>(luaL_checkudata(L, 1, kCallbackMeta));
+		Callback& c = **box;
+		if (c.failed) return 0;
+		c.failed = true;
+		if (c.hook) Self(L).api_->hook_remove(c.hook);
+		if (c.subscription) Self(L).api_->event_unsubscribe(c.subscription);
+		return 0;
+	}
+
 	void LuaMod::Bind()
 	{
 		lua_State* L = state_.Get();
@@ -460,10 +876,30 @@ namespace mirage::mods
 		lua_setfield(L, -2, "__index");
 		lua_pop(L, 1);
 
+		luaL_newmetatable(L, kProxyMeta);
+		const luaL_Reg proxyFns[] = {{"__index", ProxyIndex}, {"__newindex", ProxyNewIndex}, {"__eq", ProxyEq},
+			{"__tostring", ProxyToString}, {nullptr, nullptr}};
+		set(proxyFns);
+		lua_pop(L, 1);
+
+		luaL_newmetatable(L, kCallMeta);
+		const luaL_Reg callFns[] = {{"__index", CallIndex}, {nullptr, nullptr}};
+		set(callFns);
+		lua_pop(L, 1);
+
+		luaL_newmetatable(L, kCallbackMeta);
+		lua_newtable(L);
+		const luaL_Reg callbackFns[] = {{"remove", CallbackRemove}, {nullptr, nullptr}};
+		set(callbackFns);
+		lua_setfield(L, -2, "__index");
+		lua_pop(L, 1);
+
 		lua_newtable(L);	// mirage
 		const luaL_Reg fns[] = {{"log", LuaLog<MIRAGE_LOG_INFO>}, {"info", LuaLog<MIRAGE_LOG_INFO>},
 			{"warn", LuaLog<MIRAGE_LOG_WARN>}, {"error", LuaLog<MIRAGE_LOG_ERROR>}, {"module", LuaModule},
-			{"setting", FindSetting}, {"rgba", Rgba}, {nullptr, nullptr}};
+			{"setting", FindSetting}, {"rgba", Rgba},
+			{"on", On}, {"hook", HookFn}, {"pawn", Pawn}, {"controller", Controller}, {"world", World}, {"find", Find},
+			{"name", Name}, {"class", ClassName}, {"is_a", IsA}, {"call", CallGame}, {nullptr, nullptr}};
 		set(fns);
 		lua_pushstring(L, api_->mod_id(mod_));
 		lua_setfield(L, -2, "id");

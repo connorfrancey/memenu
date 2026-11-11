@@ -135,6 +135,8 @@ namespace modules
 	void Tick();				// Game thread: runs the scheduler (OnTick of the enabled modules that are due)
 	void Render();				// Render thread: OnRender of enabled modules
 	void OnKey(int vk);			// Module hotkeys and control key bindings
+	// Told about every key OnKey gets, first (Mirage mods' key event). One listener; nullptr removes it.
+	void SetKeyListener(void (*listener)(int vk));
 	// Keys another part of the menu is using right now (a TAS session's controls): OnKey ignores them, so pausing a
 	// TAS with F5 doesn't also switch on the module bound to F5. Any thread; replaces the previous set.
 	void SetReservedKeys(std::vector<int> keys);

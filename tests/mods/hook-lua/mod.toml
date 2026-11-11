@@ -1,0 +1,23 @@
+id = "hook-lua"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): hooks CheckMaxEffectDistance at priority 10 while on, events, the pawn"
+
+[settings.saw]
+type = "float"
+name = "Saw"
+description = "CullDistance after this hook changed it"
+default = -1.0
+min = -1000000.0
+max = 1000000.0
+
+[settings.pawn_z]
+type = "float"
+name = "Pawn Z"
+default = 0.0
+min = -1000000.0
+max = 1000000.0
+
+[settings.last_map]
+type = "string"
+name = "Last map"
+default = ""

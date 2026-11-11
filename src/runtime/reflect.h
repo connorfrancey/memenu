@@ -51,11 +51,11 @@ namespace mirage::reflect
 	// another kind does nothing and returns false.
 	std::int32_t GetInt(const Value& v);			// Int, Byte, Bool (0/1)
 	float GetFloat(const Value& v);					// Float (Int and Byte converted)
-	Classes::UObject* GetObject(const Value& v);	// Object, Class, Component, Interface
+	Classes::UObject* GetObj(const Value& v);	// Object, Class, Component, Interface
 	std::string GetText(const Value& v);			// Name, Str (and a number as text)
 	bool SetInt(const Value& v, std::int32_t x);	// Int, Byte (0-255), Bool
 	bool SetFloat(const Value& v, float x);
-	bool SetObject(const Value& v, Classes::UObject* x);
+	bool SetObj(const Value& v, Classes::UObject* x);
 	bool SetText(const Value& v, std::string_view x);	// Name only (a string's memory belongs to the engine)
 
 	// Forgets the members found so far: classes of a level's packages go with the level. On a level load.

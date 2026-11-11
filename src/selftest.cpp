@@ -3282,6 +3282,117 @@ void TestMirageFunctionHooks()
     End(s);
 }
 
+// Mirage step 6's milestone, with the self-test's own mods: hook-native (C++, priority 20) and hook-lua (priority 10)
+// hook the same function while their modules are on, and run in priority order (each turns CullDistance into
+// x * 10 + its number: 1 then 12); they read game objects by name and get events; reloading them keeps that up and
+// switching them off leaves no hook behind. Measured: what an unhooked script call pays for the detour (its lookup),
+// and what a native and a Lua hook add to a call.
+void TestMirageModHooks()
+{
+    Step& s = Begin("Mirage hooks from mods");
+    Probe p(s);
+    namespace mm = mirage::mods;
+    Module* native = modules::Find("Hook (native)");
+    Module* lua = modules::Find("Hook (Lua)");
+    if (!native || !lua) {
+        p.Problem("the Hook (native) or Hook (Lua) module is missing (tests/mods)");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    const auto value = [](Module* m, const char* name) {
+        auto* v = dynamic_cast<ctl::Value<float>*>(m->FindSetting(name));
+        return v ? v->Get() : -999.f;
+    };
+    // One call of CheckMaxEffectDistance from 0, `count` times: the time per call (us)
+    const auto calls = [&](int count) {
+        double us = -1.0;
+        OnGameThread([&] {
+            auto* pc = game::Controller();
+            auto* pawn = game::Pawn();
+            if (!pc || !pawn) return;
+            mirage::call::Params params(pawn, "CheckMaxEffectDistance");
+            const Classes::FVector at = pawn->Location;
+            const clk::Ticks start = clk::Now();
+            for (int i = 0; i < count; ++i) {
+                params.Set("P", static_cast<Classes::UObject*>(pc));
+                params.SetRaw("SpawnLocation", &at, sizeof at);
+                params.Set("CullDistance", 0.f);
+                mirage::call::Call(pawn, params);
+            }
+            us = clk::Micros(clk::Now() - start) / count;
+        }, 30.0);
+        return us;
+    };
+    const auto set = [](Module* m, bool on) { OnRenderThread([m, on] { m->SetEnabled(on); }); };
+    constexpr int kCalls = 2000;
+
+    set(native, false);
+    set(lua, false);
+    const double bare = calls(kCalls);
+    set(native, true);
+    const double withNative = calls(kCalls);
+    if (value(native, "Saw") != 1.f) p.Problem("hook-native alone saw " + std::to_string(value(native, "Saw")) + ", not 1");
+    set(native, false);
+    set(lua, true);
+    const double withLua = calls(kCalls);
+    if (value(lua, "Saw") != 2.f) p.Problem("hook-lua alone saw " + std::to_string(value(lua, "Saw")) + ", not 2");
+
+    // Both: priority 20 (native) first
+    set(native, true);
+    calls(1);
+    if (value(native, "Saw") != 1.f || value(lua, "Saw") != 12.f)
+        p.Problem("both on: native saw " + std::to_string(value(native, "Saw")) + ", Lua " + std::to_string(value(lua, "Saw")) +
+                  " (expected 1 then 12: priority order)");
+
+    // Reloaded with their hooks on: the same order, no hook doubled or lost
+    for (int i = 1; i <= 3; ++i) {
+        for (const char* id : {"hook-native", "hook-lua"}) {
+            std::string result = "timed out";
+            OnGameThread([&] { result = mm::Reload(id); }, 10.0);
+            if (!result.empty()) p.Problem(std::string("reload of ") + id + ": " + result);
+        }
+        calls(1);
+        const auto st = mirage::hooks::GetStats();
+        if (st.hooks != 2) p.Problem("reload " + std::to_string(i) + ": " + std::to_string(st.hooks) + " hooks, not 2");
+        if (value(native, "Saw") != 1.f || value(lua, "Saw") != 12.f)
+            p.Problem("reload " + std::to_string(i) + ": the order changed (native " + std::to_string(value(native, "Saw")) +
+                      ", Lua " + std::to_string(value(lua, "Saw")) + ")");
+    }
+
+    // Objects by name, events
+    WaitTicks(5);
+    float pawnZ = 0.f;
+    OnGameThread([&] { if (auto* pawn = game::Pawn()) pawnZ = pawn->Location.Z; });
+    if (std::fabs(value(native, "Pawn Z") - pawnZ) > 50.f || std::fabs(value(lua, "Pawn Z") - pawnZ) > 50.f)
+        p.Problem("the pawn's Location.Z read by name: native " + std::to_string(value(native, "Pawn Z")) + ", Lua " +
+                  std::to_string(value(lua, "Pawn Z")) + ", the pawn " + std::to_string(pawnZ));
+    auto* ticks = dynamic_cast<ctl::Value<int>*>(lua->FindSetting("Ticks"));
+    auto* lastMap = dynamic_cast<ctl::Value<std::string>*>(lua->FindSetting("Last map"));
+    if (!ticks || ticks->Get() == 0) p.Problem("hook-lua got no tick events");
+    if (!lastMap || lastMap->Get().empty()) p.Problem("hook-lua got no level load event (with the map)");
+
+    // Off: nothing left hooked
+    set(native, false);
+    set(lua, false);
+    if (mirage::hooks::GetStats().hooks != 0)
+        p.Problem(std::to_string(mirage::hooks::GetStats().hooks) + " hooks left with both modules off");
+
+    // Costs. The calls go through ProcessEvent and run the function, so the hooks' share is the difference.
+    const double lookupNs = mirage::hooks::UnhookedLookupNanoseconds();
+    const double nativeUs = withNative - bare, luaUs = withLua - bare;
+    char line[256];
+    std::snprintf(line, sizeof line, "a call: %.2f us; a native hook adds %.2f us, a Lua hook %.2f us; an unhooked script "
+                  "call pays %.1f ns for the detour's lookup", bare, nativeUs, luaUs, lookupNs);
+    s.notes.push_back(line);
+    if (lookupNs > 100.0) p.Problem("the detour's lookup costs " + std::to_string(lookupNs) + " ns (budget 100)");
+    if (nativeUs > 5.0) p.Problem("a native hook adds " + std::to_string(nativeUs) + " us a call (budget 5)");
+    if (luaUs > 50.0) p.Problem("a Lua hook adds " + std::to_string(luaUs) + " us a call (budget 50)");
+    s.notes.push_back("map " + (lastMap ? lastMap->Get() : std::string()) + ", " + std::to_string(ticks ? ticks->Get() : 0) + " tick events");
+    p.Check(1, true);
+    End(s);
+}
+
 // Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
 // what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
 // hot reload ten times in a row (Lua and native, settings and state kept, no memory left behind), and the file watcher.
@@ -3698,6 +3809,7 @@ const Named* FeatureList()
         {"Mirage function hooks", &TestMirageFunctionHooks, false},
         {"Mirage mods", &TestMirageMods, false},
         {"Mirage lifecycle", &TestMirageLifecycle, false},
+        {"Mirage hooks from mods", &TestMirageModHooks, false},
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},

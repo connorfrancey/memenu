@@ -51,11 +51,16 @@ def for_self_test(tc: Toolchain) -> tuple[list[Path] | None, str]:
     hello, how = build_native(tc, "hello")
     if hello is None:
         return None, how
-    crasher, how2 = build_native(tc, "crasher", source=TEST_MODS / "crasher")
-    if crasher is None:
-        return None, how2
+    native = [hello]
+    built = [how]
+    for name in ("crasher", "hook-native"):
+        folder, what = build_native(tc, name, source=TEST_MODS / name)
+        if folder is None:
+            return None, what
+        native.append(folder)
+        built.append(what)
     lua = [d for d in sorted(TEST_MODS.iterdir()) if d.is_dir() and (d / "main.lua").exists()]
-    return [hello, EXAMPLES / "hello-lua", crasher, *lua], f"{how}, {how2}, {len(lua) + 1} Lua mods"
+    return [*native, EXAMPLES / "hello-lua", *lua], f"{', '.join(built)}, {len(lua) + 1} Lua mods"
 
 
 def install_for_test(game_dir: Path, folders: list[Path]) -> Path:

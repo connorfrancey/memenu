@@ -144,7 +144,7 @@ namespace mirage::reflect
 		return 0.f;
 	}
 
-	Classes::UObject* GetObject(const Value& v)
+	Classes::UObject* GetObj(const Value& v)
 	{
 		if (!Is(v, {layout::Kind::Object, layout::Kind::Class, layout::Kind::Component, layout::Kind::Interface})) return nullptr;
 		Classes::UObject* o = nullptr;
@@ -161,7 +161,7 @@ namespace mirage::reflect
 		}
 		if (Is(v, {layout::Kind::Float})) return std::to_string(GetFloat(v));
 		if (Is(v, {layout::Kind::Int, layout::Kind::Byte, layout::Kind::Bool})) return std::to_string(GetInt(v));
-		if (Classes::UObject* o = GetObject(v)) return NameOf(o);
+		if (Classes::UObject* o = GetObj(v)) return NameOf(o);
 		return {};
 	}
 
@@ -195,7 +195,7 @@ namespace mirage::reflect
 		return false;
 	}
 
-	bool SetObject(const Value& v, Classes::UObject* x)
+	bool SetObj(const Value& v, Classes::UObject* x)
 	{
 		if (!Is(v, {layout::Kind::Object, layout::Kind::Class, layout::Kind::Component})) return false;
 		std::memcpy(v.address, &x, sizeof x);

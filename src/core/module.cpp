@@ -257,8 +257,15 @@ void modules::SetReservedKeys(std::vector<int> keys)
     g_reserved = std::move(keys);
 }
 
+namespace {
+std::atomic<void (*)(int)> g_keyListener{nullptr};
+}
+
+void modules::SetKeyListener(void (*listener)(int vk)) { g_keyListener = listener; }
+
 void modules::OnKey(int vk)
 {
+    if (auto listener = g_keyListener.load()) listener(vk);
     const int mods = keys::HeldMods();
     {
         std::lock_guard lock(g_reservedMutex);

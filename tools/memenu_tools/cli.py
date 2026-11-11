@@ -728,7 +728,7 @@ def test(ctx: click.Context, config: str, no_build: bool, name_filter: str | Non
     ctx.exit(code and 1)
 
 
-@cli.command("bench")
+@cli.command("bench", context_settings={"ignore_unknown_options": True})
 @click.option("-c", "--config", type=click.Choice(sorted(b.CONFIGS)), default="release", show_default=True,
               help="Build configuration (debug timings say little about the real thing).")
 @click.option("--no-build", is_flag=True, help="Run the benchmarks as they were last built.")
@@ -739,9 +739,10 @@ def test(ctx: click.Context, config: str, no_build: bool, name_filter: str | Non
 @click.pass_context
 def bench(ctx: click.Context, config: str, no_build: bool, list_groups: bool, csv: bool, groups: tuple[str, ...],
           verbose: bool) -> None:
-    """Build and run the benchmarks (nanobench): replays, macros, math, meshes.
+    """Build and run the benchmarks (Google Benchmark): replays, macros, math, meshes.
 
     GROUPS limits the run to the groups whose name contains one of them (case-insensitive), e.g. `memenu bench replay`.
+    Google Benchmark's own flags pass through, e.g. `memenu bench replay --benchmark_repetitions=5`.
     """
     if not no_build:
         _enable_parts(ctx, config, ["benchmarks"], verbose)

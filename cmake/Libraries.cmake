@@ -292,18 +292,20 @@ if(MEMENU_BUILD_TESTS)
   )
 endif()
 
-# nanobench (only needed for the benchmarks): header only, the implementation is compiled in bench/bench_main.cpp
+# Google Benchmark (only needed for the benchmarks: bench/, memenu bench)
 if(MEMENU_BUILD_BENCHMARKS)
   CPMAddPackage(
-      NAME nanobench
-      GITHUB_REPOSITORY martinus/nanobench
-      GIT_TAG ${NANOBENCH_VERSION}
-      DOWNLOAD_ONLY YES
+      NAME benchmark
+      GITHUB_REPOSITORY google/benchmark
+      GIT_TAG ${GOOGLEBENCH_VERSION}
+      OPTIONS
+          "BENCHMARK_ENABLE_TESTING OFF"
+          "BENCHMARK_ENABLE_GTEST_TESTS OFF"
+          "BENCHMARK_ENABLE_INSTALL OFF"
+          "BENCHMARK_INSTALL_DOCS OFF"
+          "BENCHMARK_ENABLE_WERROR OFF"
+          "BENCHMARK_ENABLE_LIBPFM OFF"
   )
-  if(nanobench_ADDED)
-    add_library(nanobench INTERFACE)
-    target_include_directories(nanobench SYSTEM INTERFACE ${nanobench_SOURCE_DIR}/src/include)
-  endif()
 endif()
 
 if(MEMENU_DEV_TOOLS)

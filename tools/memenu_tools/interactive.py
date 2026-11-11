@@ -149,7 +149,7 @@ class Menu:
                 ("staged", "Staged build", self._stage_line(), self.staged),
                 None,
                 ("test", "Run tests", "GoogleTest unit tests", lambda: self.run("test", "-c", self.config)),
-                ("bench", "Run benchmarks", "nanobench: replays, macros, math, meshes (release build)", self.bench),
+                ("bench", "Run benchmarks", "Google Benchmark: replays, macros, math, meshes (release build)", self.bench),
                 ("install", "Install into the game", "builds the installer, asks for admin rights", self.install),
                 ("devtest", "Dev test", "build, start the game with the menu, report crashes when you quit",
                  lambda: self.run("dev-test", "-c", self.config)),
@@ -262,7 +262,7 @@ class Menu:
                  "launcher": "medge_launcher.exe (injects without installing)",
                  "testhost": "memenu_testhost.exe (tests the DLL without the game)",
                  "tests": "GoogleTest unit tests",
-                 "benchmarks": "memenu_bench.exe (nanobench benchmarks)"}
+                 "benchmarks": "memenu_bench.exe (Google Benchmark)"}
         picked = checkbox(f"Optional parts ({self.config})",
                           [Choice(title=f"{p:<10} {about.get(p, '')}", value=p, checked=current[p]) for p in PARTS])
         if picked is None:

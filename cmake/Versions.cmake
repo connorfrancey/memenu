@@ -29,9 +29,6 @@ set(FORMATDOTCMAKE_VERSION 1.8.2)
 # CPM Licenses - https://github.com/cpm-cmake/CPMLicenses.cmake
 set(CPM_LICENSES_VERSION 0.0.7)
 
-# Nanobench - https://github.com/martinus/nanobench
-set(NANOBENCH_VERSION v4.3.11)
-
 # GoogleTest + GoogleBenchmark - https://github.com/google/googletest / https://github.com/google/benchmark
 set(GOOGLETEST_VERSION v1.17.0)
 set(GOOGLEBENCH_VERSION v1.10.0)

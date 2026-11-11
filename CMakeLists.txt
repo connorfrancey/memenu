@@ -29,7 +29,7 @@ option(MEMENU_BUILD_SDKGEN    "Build mirage_sdkgen.exe (writes the Mirage SDK fr
 # Developer mode (`memenu --dev`): the DLL switches its stored developer mode on at every start, which shows the Test
 # module (in-game self-tests). A normal build keeps what the menu stored (Misc > Developer Mode).
 option(MEMENU_DEV_MODE        "Developer build: developer mode on at every start (Test module)" OFF)
-option(MEMENU_BUILD_BENCHMARKS "Build the nanobench benchmarks (memenu_bench: memenu bench)" OFF)
+option(MEMENU_BUILD_BENCHMARKS "Build the Google Benchmark benchmarks (memenu_bench: memenu bench)" OFF)
 # Dev tooling packages (CPMLicenses, Format.cmake): not needed to build the DLL
 option(MEMENU_DEV_TOOLS       "Fetch CPMLicenses.cmake and Format.cmake" OFF)
 # ccache (https://ccache.dev): reuses compiled objects across rebuilds, clean builds and build folders. Needs ccache
@@ -203,7 +203,7 @@ if(MEMENU_BUILD_SDKGEN)
 endif()
 
 # -------------------------------------------------------------------------------------------------
-# Benchmarks (nanobench)
+# Benchmarks (Google Benchmark)
 if(MEMENU_BUILD_BENCHMARKS)
   add_subdirectory(bench)
 endif()

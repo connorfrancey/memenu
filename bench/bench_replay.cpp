@@ -8,7 +8,6 @@
 #include <string>
 
 using namespace tas;
-namespace nb = ankerl::nanobench;
 
 namespace {
 
@@ -50,103 +49,186 @@ Replay MakeRun(std::size_t frames)
     return r;
 }
 
+// Built once, on first use (registration stays cheap for --list)
+const Replay& TenMinutes()
+{
+    static const Replay run = MakeRun(kTenMinutes);
+    return run;
+}
+const Replay& OneMinute()
+{
+    static const Replay run = MakeRun(kOneMinute);
+    return run;
+}
+
 std::filesystem::path TempFile(const char* name)
 {
     return std::filesystem::temp_directory_path() / (std::string("memenu_bench_") + name);
 }
 
-} // namespace
-
-MEMENU_BENCH(Replay)
+// One recorded frame: what the game thread adds to every frame while recording
+void RecordFrame(benchmark::State& state)
 {
-    const Replay run = MakeRun(kTenMinutes);
-    std::string error;
-
-    // One recorded frame: what the game thread adds to every frame while recording
-    {
-        Replay r;
-        std::size_t f = 0;
-        // Nanoseconds each: many iterations per epoch, or the timer's resolution shows
-        bench.batch(1).unit("frame").minEpochIterations(200000).run("record a frame (2 inputs)", [&] {
-            r.BeginFrame(1.f / kHz);
-            Event e;
-            e.name = r.NameIndex(f % 2 ? "W" : "MouseX");
-            e.kind = f % 2 ? EventKind::Pressed : EventKind::Axis;
-            r.AddEvent(e);
-            r.AddEvent(e);
-            if (++f == kTenMinutes) {
-                r.Clear();
-                f = 0;
-            }
-        });
-        bench.minEpochIterations(5);
-    }
-
-    bench.batch(run.frames.size()).unit("frame");
-    bench.run("InputHash (10 min)", [&] { nb::doNotOptimizeAway(run.InputHash()); });
-    bench.run("SyncHash (10 min)", [&] { nb::doNotOptimizeAway(run.SyncHash()); });
-    bench.run("copy + Truncate 2 s (practice rewind, 10 min)", [&] {
-        Replay r = run;
-        r.Truncate(r.frames.size() - 120);
-        nb::doNotOptimizeAway(r.frames.size());
-    });
-
-    const auto merp = TempFile("run.merp");
-    const auto json = TempFile("run.json");
-    bench.run("Save .merp (10 min)", [&] { nb::doNotOptimizeAway(run.Save(merp, &error)); });
-    bench.run("Load .merp (10 min)", [&] {
-        Replay r;
-        nb::doNotOptimizeAway(r.Load(merp, &error));
-    });
-    // JSON is for hand-edited macros: a minute is plenty (and ten take a minute per run in a debug build)
-    const Replay minute = MakeRun(kOneMinute);
-    bench.batch(minute.frames.size());
-    bench.run("ExportJson (1 min)", [&] { nb::doNotOptimizeAway(minute.ExportJson(json, &error)); });
-    bench.run("ImportJson (1 min)", [&] {
-        Replay r;
-        nb::doNotOptimizeAway(r.ImportJson(json, &error));
-    });
-    std::error_code ec;
-    std::filesystem::remove(merp, ec);
-    std::filesystem::remove(json, ec);
-
-    // Editor operations near the start of a long replay: every later frame's `first` moves
-    bench.batch(1).unit("edit");
-    {
-        Replay r = run;
-        bench.run("InsertEvent + EraseEvent at frame 10 (10 min)", [&] {
-            Event e;
-            e.name = r.NameIndex("E");
-            r.InsertEvent(10, 0, e);
-            r.EraseEvent(10, 0);
-        });
-        bench.run("RenameKey W -> Up and back (10 min)", [&] {
-            nb::doNotOptimizeAway(r.RenameKey("W", "Up"));
-            nb::doNotOptimizeAway(r.RenameKey("Up", "W"));
-        });
+    Replay r;
+    std::size_t f = 0;
+    for (auto _ : state) {
+        r.BeginFrame(1.f / kHz);
+        Event e;
+        e.name = r.NameIndex(f % 2 ? "W" : "MouseX");
+        e.kind = f % 2 ? EventKind::Pressed : EventKind::Axis;
+        r.AddEvent(e);
+        r.AddEvent(e);
+        if (++f == kTenMinutes) {
+            r.Clear();
+            f = 0;
+        }
     }
 }
+BENCHMARK(RecordFrame)->Name("Replay/record a frame (2 inputs)");
 
-MEMENU_BENCH(Macro)
+void InputHash(benchmark::State& state)
 {
-    bench.batch(1).unit("macro");
-    bench.run("build a 1 minute macro", [&] {
+    const Replay& run = TenMinutes();
+    for (auto _ : state) bench::Keep(run.InputHash());
+    bench::PerItem(state, static_cast<double>(run.frames.size()), "frame");
+}
+BENCHMARK(InputHash)->Name("Replay/InputHash (10 min)")->Unit(benchmark::kMicrosecond);
+
+void SyncHash(benchmark::State& state)
+{
+    const Replay& run = TenMinutes();
+    for (auto _ : state) bench::Keep(run.SyncHash());
+    bench::PerItem(state, static_cast<double>(run.frames.size()), "frame");
+}
+BENCHMARK(SyncHash)->Name("Replay/SyncHash (10 min)")->Unit(benchmark::kMicrosecond);
+
+void CopyTruncate(benchmark::State& state)
+{
+    const Replay& run = TenMinutes();
+    for (auto _ : state) {
+        Replay r = run;
+        r.Truncate(r.frames.size() - 120);
+        bench::Keep(r.frames.size());
+    }
+    bench::PerItem(state, static_cast<double>(run.frames.size()), "frame");
+}
+BENCHMARK(CopyTruncate)->Name("Replay/copy + Truncate 2 s (practice rewind, 10 min)")->Unit(benchmark::kMicrosecond);
+
+void SaveMerp(benchmark::State& state)
+{
+    const Replay& run = TenMinutes();
+    const auto merp = TempFile("save.merp");
+    std::string error;
+    for (auto _ : state) bench::Keep(run.Save(merp, &error));
+    bench::PerItem(state, static_cast<double>(run.frames.size()), "frame");
+    std::error_code ec;
+    std::filesystem::remove(merp, ec);
+}
+BENCHMARK(SaveMerp)->Name("Replay/Save .merp (10 min)")->Unit(benchmark::kMillisecond);
+
+void LoadMerp(benchmark::State& state)
+{
+    const Replay& run = TenMinutes();
+    const auto merp = TempFile("load.merp");
+    std::string error;
+    if (!run.Save(merp, &error)) {
+        state.SkipWithError(("saving the replay to load failed: " + error).c_str());
+        return;
+    }
+    for (auto _ : state) {
+        Replay r;
+        bench::Keep(r.Load(merp, &error));
+    }
+    bench::PerItem(state, static_cast<double>(run.frames.size()), "frame");
+    std::error_code ec;
+    std::filesystem::remove(merp, ec);
+}
+BENCHMARK(LoadMerp)->Name("Replay/Load .merp (10 min)")->Unit(benchmark::kMillisecond);
+
+// JSON is for hand-edited macros: a minute is plenty (and ten take a minute per run in a debug build)
+void ExportJson(benchmark::State& state)
+{
+    const Replay& minute = OneMinute();
+    const auto json = TempFile("export.json");
+    std::string error;
+    for (auto _ : state) bench::Keep(minute.ExportJson(json, &error));
+    bench::PerItem(state, static_cast<double>(minute.frames.size()), "frame");
+    std::error_code ec;
+    std::filesystem::remove(json, ec);
+}
+BENCHMARK(ExportJson)->Name("Replay/ExportJson (1 min)")->Unit(benchmark::kMillisecond);
+
+void ImportJson(benchmark::State& state)
+{
+    const Replay& minute = OneMinute();
+    const auto json = TempFile("import.json");
+    std::string error;
+    if (!minute.ExportJson(json, &error)) {
+        state.SkipWithError(("exporting the JSON to import failed: " + error).c_str());
+        return;
+    }
+    for (auto _ : state) {
+        Replay r;
+        bench::Keep(r.ImportJson(json, &error));
+    }
+    bench::PerItem(state, static_cast<double>(minute.frames.size()), "frame");
+    std::error_code ec;
+    std::filesystem::remove(json, ec);
+}
+BENCHMARK(ImportJson)->Name("Replay/ImportJson (1 min)")->Unit(benchmark::kMillisecond);
+
+// Editor operations near the start of a long replay: every later frame's `first` moves
+void InsertErase(benchmark::State& state)
+{
+    Replay r = TenMinutes();
+    for (auto _ : state) {
+        Event e;
+        e.name = r.NameIndex("E");
+        r.InsertEvent(10, 0, e);
+        r.EraseEvent(10, 0);
+    }
+}
+BENCHMARK(InsertErase)->Name("Replay/InsertEvent + EraseEvent at frame 10 (10 min)")->Unit(benchmark::kMicrosecond);
+
+void RenameKey(benchmark::State& state)
+{
+    Replay r = TenMinutes();
+    for (auto _ : state) {
+        bench::Keep(r.RenameKey("W", "Up"));
+        bench::Keep(r.RenameKey("Up", "W"));
+    }
+}
+BENCHMARK(RenameKey)->Name("Replay/RenameKey W -> Up and back (10 min)")->Unit(benchmark::kMicrosecond);
+
+void BuildMacro(benchmark::State& state)
+{
+    for (auto _ : state) {
         Macro m(kHz);
         m.Describe("bench");
         for (int i = 0; i < 60; ++i) m.Press("W").Wait(10).Axis("MouseX", 2.5f).Hold("SpaceBar", 5).Wait(15).Release("W");
-        nb::doNotOptimizeAway(m.Build().frames.size());
-    });
+        bench::Keep(m.Build().frames.size());
+    }
+}
+BENCHMARK(BuildMacro)->Name("Macro/build a 1 minute macro")->Unit(benchmark::kMicrosecond);
 
-    // The shipped examples, as the menu reads them
+// The shipped examples, as the menu reads them: one benchmark per file
+const bool g_examples = [] {
     const std::filesystem::path folder = MEMENU_EXAMPLES_DIR "/replays";
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
         if (entry.path().extension() != ".json") continue;
-        const std::string name = "ImportJson " + entry.path().filename().string();
-        std::string error;
-        bench.run(name, [&] {
-            Replay r;
-            nb::doNotOptimizeAway(r.ImportJson(entry.path(), &error));
-        });
+        const std::filesystem::path path = entry.path();
+        benchmark::RegisterBenchmark("Macro/ImportJson " + path.filename().string(),
+                                     [path](benchmark::State& state) {
+                                         std::string error;
+                                         for (auto _ : state) {
+                                             Replay r;
+                                             bench::Keep(r.ImportJson(path, &error));
+                                         }
+                                     })
+            ->Unit(benchmark::kMicrosecond);
     }
-}
+    return true;
+}();
+
+} // namespace

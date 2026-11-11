@@ -19,7 +19,28 @@ mirage = "^0.1"           # runtime versions it works with
 entry = "hello.dll"       # native code (or lua = "main.lua", the default when main.lua exists)
 
 [dependencies]            # other mods, with version ranges ("^1.2", ">=1.0 <2", "*")
+
+[settings.greeting]       # a setting, shown in the module's settings panel; the menu's config keeps its value
+type = "string"           # bool, int, float, string, choice or key
+name = "Greeting"
+description = "What it draws"
+default = "Hello"
+
+[settings.height]
+type = "float"
+default = 0.2
+min = 0.0                 # int and float need a range
+max = 0.95
+
+[settings.color]
+type = "choice"
+options = ["Blue", "Orange", "White"]
+default = "Blue"
 ```
+
+Declared settings go into the mod's first module, or into the module named by `module = "..."`. Code reads them by
+key: `mirage::Get<std::string>("greeting")` in C++, `mirage.setting("greeting"):get()` in Lua. A module can also make
+its own settings in code (`mirage::Slider` members, `module:slider(...)`), which are listed after the declared ones.
 
 The full list of keys is in `src/runtime/manifest.h`. Unknown keys are reported in the menu's log.
 

@@ -2,6 +2,8 @@
 
 #include <toml.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -14,6 +16,19 @@ namespace mirage::mods
 			case Phase::Early: return "early";
 			case Phase::Engine: return "engine";
 			case Phase::World: return "world";
+		}
+		return "?";
+	}
+
+	const char* SettingTypeName(SettingDecl::Type t)
+	{
+		switch (t) {
+			case SettingDecl::Type::Bool: return "bool";
+			case SettingDecl::Type::Int: return "int";
+			case SettingDecl::Type::Float: return "float";
+			case SettingDecl::Type::String: return "string";
+			case SettingDecl::Type::Choice: return "choice";
+			case SettingDecl::Type::Key: return "key";
 		}
 		return "?";
 	}
@@ -66,12 +81,12 @@ namespace mirage::mods
 	{
 		Parsed out;
 		std::istringstream in{std::string(text)};
-		auto parsed = toml::try_parse(in, source);
+		auto parsed = toml::try_parse<toml::ordered_type_config>(in, source);	// Ordered: settings keep the file's order
 		if (parsed.is_err()) {
 			for (const auto& e : parsed.unwrap_err()) out.errors.push_back(toml::format_error(e));
 			return out;
 		}
-		const toml::value root = parsed.unwrap();
+		const toml::ordered_value root = parsed.unwrap();
 		if (!root.is_table()) {
 			out.errors.push_back(source + ": not a table");
 			return out;
@@ -83,7 +98,7 @@ namespace mirage::mods
 		// A string value, or `fallback` when missing; a wrong type is an error
 		const auto str = [&](const char* key, std::string fallback = {}) -> std::string {
 			if (!root.contains(key)) return fallback;
-			const toml::value& v = root.at(key);
+			const toml::ordered_value& v = root.at(key);
 			if (!v.is_string()) {
 				error(std::string(key) + " must be a string");
 				return fallback;
@@ -93,12 +108,12 @@ namespace mirage::mods
 		const auto strings = [&](const char* key) {
 			std::vector<std::string> list;
 			if (!root.contains(key)) return list;
-			const toml::value& v = root.at(key);
+			const toml::ordered_value& v = root.at(key);
 			if (!v.is_array()) {
 				error(std::string(key) + " must be a list of strings");
 				return list;
 			}
-			for (const toml::value& e : v.as_array()) {
+			for (const toml::ordered_value& e : v.as_array()) {
 				if (e.is_string()) list.push_back(e.as_string());
 				else error(std::string(key) + " must be a list of strings");
 			}
@@ -106,7 +121,7 @@ namespace mirage::mods
 		};
 
 		static const std::set<std::string> known = {"id", "name", "version", "description", "authors", "mirage", "game",
-			"entry", "lua", "phase", "content", "dependencies", "optional", "incompatible"};
+			"entry", "lua", "phase", "content", "dependencies", "optional", "incompatible", "settings"};
 		for (const auto& [key, value] : root.as_table())
 			if (!known.count(key)) warn("unknown key '" + key + "' (ignored)");
 
@@ -152,7 +167,7 @@ namespace mirage::mods
 		std::set<std::string> named;
 		const auto deps = [&](const char* table, std::vector<Dependency>& list) {
 			if (!root.contains(table)) return;
-			const toml::value& t = root.at(table);
+			const toml::ordered_value& t = root.at(table);
 			if (!t.is_table()) {
 				error(std::string("[") + table + "] must be a table of id = \"version range\"");
 				return;
@@ -173,6 +188,130 @@ namespace mirage::mods
 		deps("dependencies", m.required);
 		deps("optional", m.optional);
 		deps("incompatible", m.incompatible);
+
+		// [settings.<key>]: declared settings
+		if (root.contains("settings")) {
+			const toml::ordered_value& table = root.at("settings");
+			if (!table.is_table()) error("settings must be tables: [settings.<key>]");
+			else
+				for (const auto& [key, v] : table.as_table()) {
+					const std::string where = "settings." + key;
+					if (!ValidId(key) && !(key.size() == 1 && std::isalnum(static_cast<unsigned char>(key[0])))) {
+						error(where + ": a setting key is a-z, 0-9, '-' and '_'");
+						continue;
+					}
+					if (!v.is_table()) {
+						error(where + " must be a table ([" + where + "])");
+						continue;
+					}
+					static const std::set<std::string> settingKeys = {"type", "name", "description", "default", "min",
+						"max", "format", "options", "module"};
+					for (const auto& [k, unused] : v.as_table())
+						if (!settingKeys.count(k)) warn(where + ": unknown key '" + k + "' (ignored)");
+					const auto textField = [&](const char* k) -> std::string {
+						if (!v.contains(k)) return {};
+						if (!v.at(k).is_string()) {
+							error(where + "." + k + " must be a string");
+							return {};
+						}
+						return v.at(k).as_string();
+					};
+					const auto number = [&](const char* k, double& out) {
+						if (!v.contains(k)) return false;
+						const toml::ordered_value& n = v.at(k);
+						if (n.is_integer()) out = static_cast<double>(n.as_integer());
+						else if (n.is_floating()) out = n.as_floating();
+						else {
+							error(where + "." + k + " must be a number");
+							return false;
+						}
+						return true;
+					};
+
+					SettingDecl d;
+					d.key = key;
+					d.name = textField("name");
+					if (d.name.empty()) d.name = key;
+					d.description = textField("description");
+					d.module = textField("module");
+					d.format = textField("format");
+					const std::string type = textField("type");
+					using T = SettingDecl::Type;
+					if (type == "bool") d.type = T::Bool;
+					else if (type == "int") d.type = T::Int;
+					else if (type == "float") d.type = T::Float;
+					else if (type == "string") d.type = T::String;
+					else if (type == "choice") d.type = T::Choice;
+					else if (type == "key") d.type = T::Key;
+					else {
+						error(where + ".type must be bool, int, float, string, choice or key" +
+							  (type.empty() ? std::string(" (it is missing)") : ", not '" + type + "'"));
+						continue;
+					}
+					if ((d.type == T::Int || d.type == T::Float)) {
+						const bool hasMin = number("min", d.min), hasMax = number("max", d.max);
+						if (hasMin != hasMax) error(where + ": min and max go together");
+						else if (!hasMin) error(where + ": an " + type + " setting needs min and max");
+						else if (!(d.min < d.max)) error(where + ": min must be below max");
+						d.hasRange = hasMin && hasMax;
+					} else if (v.contains("min") || v.contains("max")) {
+						warn(where + ": min and max are for int and float settings (ignored)");
+					}
+					if (d.type == T::Choice) {
+						if (!v.contains("options") || !v.at("options").is_array() || v.at("options").as_array().empty()) {
+							error(where + ": a choice setting needs options = [\"...\", ...]");
+							continue;
+						}
+						for (const auto& o : v.at("options").as_array()) {
+							if (o.is_string()) d.options.push_back(o.as_string());
+							else error(where + ".options must be strings");
+						}
+					}
+					if (!v.contains("default")) {
+						error(where + ".default is required");
+						continue;
+					}
+					const toml::ordered_value& def = v.at("default");
+					switch (d.type) {
+						case T::Bool:
+							if (def.is_boolean()) d.boolDefault = def.as_boolean();
+							else error(where + ".default must be true or false");
+							break;
+						case T::Int: case T::Key:
+							if (def.is_integer()) d.intDefault = def.as_integer();
+							else error(where + ".default must be an integer");
+							if (d.type == T::Int && d.hasRange && (d.intDefault < d.min || d.intDefault > d.max))
+								error(where + ".default is outside min..max");
+							if (d.type == T::Key && (d.intDefault < 0 || d.intDefault > 0xFFFF))
+								error(where + ".default must be a key code (0 = none)");
+							break;
+						case T::Float:
+							if (def.is_floating()) d.floatDefault = def.as_floating();
+							else if (def.is_integer()) d.floatDefault = static_cast<double>(def.as_integer());
+							else error(where + ".default must be a number");
+							if (d.hasRange && (d.floatDefault < d.min || d.floatDefault > d.max))
+								error(where + ".default is outside min..max");
+							break;
+						case T::String:
+							if (def.is_string()) d.stringDefault = def.as_string();
+							else error(where + ".default must be a string");
+							break;
+						case T::Choice: {
+							if (!def.is_string()) {
+								error(where + ".default must be one of the options");
+								break;
+							}
+							const auto it = std::find(d.options.begin(), d.options.end(), def.as_string());
+							if (it == d.options.end()) error(where + ".default '" + def.as_string() + "' is not one of the options");
+							else d.intDefault = it - d.options.begin();
+							break;
+						}
+					}
+					if (std::any_of(m.settings.begin(), m.settings.end(), [&](const SettingDecl& o) { return o.name == d.name; }))
+						error(where + ": another setting is also named '" + d.name + "'");
+					m.settings.push_back(std::move(d));
+				}
+		}
 
 		if (out.errors.empty()) out.manifest = std::move(m);
 		return out;

@@ -31,11 +31,15 @@ hello = mirage.module {
         local tw, th = mirage.draw.text_size(text)
         local x, y = w * 0.5, h * Height:get()
         mirage.draw.rect_filled(x - 6, y - 4, x + tw + 6, y + th + 4, mirage.rgba(0, 0, 0, 140))
-        mirage.draw.text(x, y, mirage.rgba(255, 200, 120), text)
+        local colors = { Blue = mirage.rgba(120, 220, 255), Orange = mirage.rgba(255, 200, 120), White = mirage.rgba(255, 255, 255) }
+        mirage.draw.text(x, y, colors[Color:get()], text)
     end,
 }
 
-Greeting = hello:text("Greeting", "Hello from a Lua mod", "What it draws")
-Height = hello:slider("Height", 0.25, 0.0, 0.95, "%.2f", "Where on the screen, from the top")
+-- Declared in mod.toml ([settings.*]): made when the module registered, found by key
+Greeting = mirage.setting("greeting")
+Height = mirage.setting("height")
+Color = mirage.setting("color")
+-- Made in code
 Ticks = hello:slider_int("Ticks", 0, 0, 1 << 30, "Game ticks counted while on")
 Status = hello:text("Status", "off", "Set by the mod")

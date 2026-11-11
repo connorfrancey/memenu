@@ -155,9 +155,14 @@ toolset (only one is installed, and another compiler is the stronger proof), and
 show in the Mods column, run `on_enable` / `on_tick` / `on_render` / `on_disable`, save, load and clamp their
 settings, and keep their own config. `memenu game-test` builds and deploys them.
 
+Settings can be declared in `mod.toml`, as Geode does in `mod.json` (2026-11-11): one `[settings.<key>]` table each,
+with type (bool, int, float, string, choice, key), name, description, default and range, options or format. The runtime
+makes them when their module registers, first in its panel, and the menu's config saves their values. Code finds them
+by key: `setting_find` and `setting_type` are appended to ABI v1, Lua has `mirage.setting("key")`, C++ has
+`mirage::Get<T>("key")`. Settings made in code still work alongside them.
+
 Moved on: game object access from Lua through reflection (`player.Location.Z = 500`) goes with the hooks and events
-of step 6, where Lua first gets game objects. A settings schema in `mod.toml` is dropped: settings are declared in
-code, as in the menu.
+of step 6, where Lua first gets game objects.
 
 ### 5. Loader and mod lifecycle
 
@@ -267,6 +272,7 @@ waits for 3 and 6 because the features need the generated SDK and shared hooks.
 
 - Scripting: Lua 5.4, compiled as C++ (2026-11-09).
 - Mod manifest: `mod.toml` (TOML, read with toml11), not JSON (2026-11-10).
+- Mod settings are declared in `mod.toml` (`[settings.<key>]`), like Geode's `mod.json` (2026-11-11).
 
 ## Open questions
 

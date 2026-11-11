@@ -9,8 +9,9 @@
 //
 // mirage.log / warn / error, mirage.id / version / dir, mirage.module{...} (on_enable, on_disable, on_tick, on_render,
 // on_trigger, action, enabled_by_default, key, order), module:checkbox / slider / slider_int / text / key,
-// setting:get / set / down, mirage.config.get / set, mirage.draw.text / line / rect / rect_filled / screen_size /
-// text_size, mirage.rgba, and require("name") for name.lua in the mod's folder.
+// setting:get / set / down, mirage.setting("key") (a setting declared in mod.toml), mirage.config.get / set,
+// mirage.draw.text / line / rect / rect_filled / screen_size / text_size, mirage.rgba, and require("name") for name.lua
+// in the mod's folder.
 
 #include "mirage/api.h"
 

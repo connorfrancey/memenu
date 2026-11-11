@@ -27,6 +27,7 @@ struct MirageMod
 	MirageModUnloadFn unload = nullptr;
 	mirage::mods::LuaModPtr lua;
 	std::vector<Module*> modules;					// Registered by it (owned by the menu's module list)
+	std::map<std::string, ctl::Setting*> declared;	// Its mod.toml settings that were made, by key
 	std::mutex configLock;
 	toml::value config;
 	bool configRead = false;
@@ -161,6 +162,41 @@ namespace mirage::mods
 			}
 		}
 
+		// The settings mod.toml declares for this module ([settings.<key>] with module = its name, or no module and
+		// this is the mod's first module), in the file's order
+		void AddDeclaredSettings(MirageMod& mod, ModModule& m, bool firstModule)
+		{
+			using T = SettingDecl::Type;
+			for (const SettingDecl& d : mod.manifest.settings) {
+				if (mod.declared.count(d.key)) continue;
+				if (d.module.empty() ? !firstModule : d.module != m.Name()) continue;
+				if (m.FindSetting(d.name)) {
+					spdlog::warn("[mod {}] {}: setting '{}' from mod.toml clashes with one of the same name", mod.id, m.Name(), d.name);
+					continue;
+				}
+				std::unique_ptr<ctl::Setting> s;
+				switch (d.type) {
+					case T::Bool: s = std::make_unique<ctl::Checkbox>(&m, d.name, d.boolDefault, d.description); break;
+					case T::Int:
+						s = std::make_unique<ctl::SliderInt>(&m, d.name, static_cast<int>(d.intDefault), static_cast<int>(d.min),
+															 static_cast<int>(d.max), std::string("%d"), 0, d.description);
+						break;
+					case T::Float:
+						s = std::make_unique<ctl::Slider>(&m, d.name, static_cast<float>(d.floatDefault), static_cast<float>(d.min),
+														  static_cast<float>(d.max), d.format.empty() ? std::string("%.2f") : d.format,
+														  0.f, d.description);
+						break;
+					case T::String: s = std::make_unique<ctl::Text>(&m, d.name, d.stringDefault, d.description); break;
+					case T::Choice:
+						s = std::make_unique<ctl::Combo>(&m, d.name, d.options, static_cast<int>(d.intDefault), d.description);
+						break;
+					case T::Key: s = std::make_unique<ctl::KeyHold>(&m, d.name, static_cast<int>(d.intDefault), d.description); break;
+				}
+				mod.declared[d.key] = s.get();
+				m.owned.push_back(std::move(s));
+			}
+		}
+
 		// ---- The table -------------------------------------------------------------------------------------------
 		void MIRAGE_CALL Log(MirageMod* mod, int32_t level, const char* text)
 		{
@@ -193,7 +229,9 @@ namespace mirage::mods
 			}
 			Module* m = modules::Add(std::make_unique<ModModule>(mod, d));
 			if (!m) return nullptr;
+			const bool first = mod->modules.empty();
 			mod->modules.push_back(m);
+			AddDeclaredSettings(*mod, *static_cast<ModModule*>(m), first);
 			return reinterpret_cast<MirageModule*>(static_cast<ModModule*>(m));
 		}
 		int32_t MIRAGE_CALL ModuleEnabled(MirageModule* m) { return m && ModuleOf(m)->Enabled() ? 1 : 0; }
@@ -265,11 +303,25 @@ namespace mirage::mods
 		}
 		uint32_t MIRAGE_CALL SettingGetText(MirageSetting* h, char* buffer, uint32_t capacity)
 		{
+			if (auto* c = dynamic_cast<ctl::Combo*>(SettingOf(h))) return CopyOut(c->Selected(), buffer, capacity);
 			auto* t = dynamic_cast<ctl::Value<std::string>*>(SettingOf(h));
 			return CopyOut(t ? t->Get() : std::string(), buffer, capacity);
 		}
 		void MIRAGE_CALL SettingSetText(MirageSetting* h, const char* v)
 		{
+			if (auto* c = dynamic_cast<ctl::Combo*>(SettingOf(h))) {	// A choice: by its option's text
+				const int before = c->Get();
+				for (int i = 0; i < 4096; ++i) {
+					c->Set(i);
+					if (c->Get() != i) break;		// Past the last option (clamped)
+					if (c->Selected() == Str(v)) {
+						c->Owner().MarkDirty();
+						return;
+					}
+				}
+				c->Set(before);		// Not one of its options: unchanged
+				return;
+			}
 			if (auto* t = dynamic_cast<ctl::Value<std::string>*>(SettingOf(h))) {
 				t->Set(Str(v));
 				t->Owner().MarkDirty();
@@ -337,6 +389,25 @@ namespace mirage::mods
 			if (h) *h = s.y;
 		}
 
+		MirageSetting* MIRAGE_CALL SettingFind(MirageMod* mod, const char* key)
+		{
+			if (!mod || !key) return nullptr;
+			const auto it = mod->declared.find(key);
+			return it == mod->declared.end() ? nullptr : Handle(it->second);
+		}
+		int32_t MIRAGE_CALL SettingType(MirageSetting* h)
+		{
+			ctl::Setting* s = SettingOf(h);
+			if (!s) return MIRAGE_SETTING_UNKNOWN;
+			if (dynamic_cast<ctl::Checkbox*>(s)) return MIRAGE_SETTING_BOOL;
+			if (dynamic_cast<ctl::Combo*>(s)) return MIRAGE_SETTING_CHOICE;
+			if (dynamic_cast<ctl::KeyHold*>(s)) return MIRAGE_SETTING_KEY;
+			if (dynamic_cast<ctl::Value<int>*>(s)) return MIRAGE_SETTING_INT;
+			if (dynamic_cast<ctl::Value<float>*>(s)) return MIRAGE_SETTING_FLOAT;
+			if (dynamic_cast<ctl::Value<std::string>*>(s)) return MIRAGE_SETTING_STRING;
+			return MIRAGE_SETTING_UNKNOWN;
+		}
+
 		const MirageApi kApi = {
 			sizeof(MirageApi), MIRAGE_ABI_VERSION, kRuntimeVersion,
 			Log, ModId, ModVersion, ModDir,
@@ -345,6 +416,7 @@ namespace mirage::mods
 			SettingGetInt, SettingGetFloat, SettingSetInt, SettingSetFloat, SettingGetText, SettingSetText, KeyDown,
 			ConfigGet, ConfigSet,
 			ScreenSize, DrawText, DrawLine, DrawRect, DrawRectFilled, TextSize,
+			SettingFind, SettingType,
 		};
 
 		// ---- Loading ---------------------------------------------------------------------------------------------
@@ -484,6 +556,13 @@ namespace mirage::mods
 				g_found.push_back(std::move(info));
 				continue;
 			}
+			for (const SettingDecl& d : m.settings)
+				if (!mod->declared.count(d.key)) {
+					const std::string w = "setting " + d.key + " was not shown: " +
+						(d.module.empty() ? std::string("the mod registered no module") : "it registered no module named '" + d.module + "'");
+					spdlog::warn("[mod {}] {}", m.id, w);
+					info.warnings.push_back(w);
+				}
 			info.loaded = true;
 			for (Module* module : mod->modules) info.modules.push_back(module->Name());
 			spdlog::info("Mods: loaded {} {} ({}, {} module(s){})", m.id, info.version, info.kind, mod->modules.size(),

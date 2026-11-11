@@ -141,3 +141,103 @@ TEST(Manifest, LoadChecksTheFolder)
 	EXPECT_FALSE(Load(root / "missing").manifest);
 	fs::remove_all(root);
 }
+
+TEST(Manifest, DeclaredSettings)
+{
+	const Parsed p = Parse(R"(
+id = "hello"
+version = "1.0.0"
+
+[settings.zeta]
+type = "bool"
+default = true
+
+[settings.alpha]
+type = "float"
+name = "Alpha"
+description = "Tooltip"
+default = 0.5
+min = 0
+max = 1
+format = "%.1f"
+module = "Other"
+
+[settings.count]
+type = "int"
+default = 3
+min = 1
+max = 10
+
+[settings.text]
+type = "string"
+default = "hi"
+
+[settings.mode]
+type = "choice"
+options = ["a", "b", "c"]
+default = "b"
+
+[settings.boost]
+type = "key"
+default = 16
+)");
+	ASSERT_TRUE(p.manifest) << (p.errors.empty() ? "" : p.errors[0]);
+	const auto& s = p.manifest->settings;
+	ASSERT_EQ(s.size(), 6u);
+	using T = SettingDecl::Type;
+	EXPECT_EQ(s[0].key, "zeta");		// The file's order, not sorted
+	EXPECT_EQ(s[0].name, "zeta");		// Default name: the key
+	EXPECT_EQ(s[0].type, T::Bool);
+	EXPECT_TRUE(s[0].boolDefault);
+	EXPECT_EQ(s[1].name, "Alpha");
+	EXPECT_EQ(s[1].type, T::Float);
+	EXPECT_DOUBLE_EQ(s[1].floatDefault, 0.5);
+	EXPECT_DOUBLE_EQ(s[1].max, 1.0);
+	EXPECT_EQ(s[1].format, "%.1f");
+	EXPECT_EQ(s[1].module, "Other");
+	EXPECT_EQ(s[2].intDefault, 3);
+	EXPECT_EQ(s[3].stringDefault, "hi");
+	EXPECT_EQ(s[4].type, T::Choice);
+	EXPECT_EQ(s[4].intDefault, 1);		// The index of "b"
+	EXPECT_EQ(s[4].options.size(), 3u);
+	EXPECT_EQ(s[5].type, T::Key);
+	EXPECT_EQ(s[5].intDefault, 16);
+}
+
+TEST(Manifest, ReportsSettingMistakes)
+{
+	const std::string head = "id = \"hello\"\nversion = \"1.0.0\"\n";
+	struct Case
+	{
+		const char* toml;
+		const char* message;
+	};
+	const Case cases[] = {
+		{"[settings.a1]\ndefault = 1", "type must be"},
+		{"[settings.a1]\ntype = \"colour\"\ndefault = 1", "not 'colour'"},
+		{"[settings.a1]\ntype = \"bool\"", "default is required"},
+		{"[settings.a1]\ntype = \"bool\"\ndefault = 1", "true or false"},
+		{"[settings.a1]\ntype = \"int\"\ndefault = 1", "needs min and max"},
+		{"[settings.a1]\ntype = \"int\"\ndefault = 1\nmin = 0", "go together"},
+		{"[settings.a1]\ntype = \"int\"\ndefault = 1\nmin = 5\nmax = 2", "below max"},
+		{"[settings.a1]\ntype = \"int\"\ndefault = 20\nmin = 0\nmax = 10", "outside min..max"},
+		{"[settings.a1]\ntype = \"float\"\ndefault = \"x\"\nmin = 0\nmax = 1", "must be a number"},
+		{"[settings.a1]\ntype = \"choice\"\ndefault = \"x\"", "needs options"},
+		{"[settings.a1]\ntype = \"choice\"\noptions = [\"a\"]\ndefault = \"x\"", "not one of the options"},
+		{"[settings.a1]\ntype = \"key\"\ndefault = -1", "key code"},
+		{"[settings.a1]\ntype = \"bool\"\ndefault = true\nname = \"N\"\n[settings.b1]\ntype = \"bool\"\ndefault = true\nname = \"N\"", "also named 'N'"},
+		{"[settings.Bad]\ntype = \"bool\"\ndefault = true", "a setting key"},
+		{"settings = 3", "settings must be tables"},
+	};
+	for (const Case& c : cases) {
+		const std::string text = head + c.toml;
+		const Parsed p = Parse(text);
+		EXPECT_FALSE(p.manifest) << c.toml;
+		EXPECT_TRUE(HasMessage(p.errors, c.message)) << c.toml << "\nexpected: " << c.message
+													 << "\ngot: " << (p.errors.empty() ? "nothing" : p.errors[0]);
+	}
+	const Parsed warn = Parse(head + "[settings.a1]\ntype = \"bool\"\ndefault = true\ncolour = 1\nmin = 2");
+	ASSERT_TRUE(warn.manifest);
+	EXPECT_TRUE(HasMessage(warn.warnings, "unknown key 'colour'"));
+	EXPECT_TRUE(HasMessage(warn.warnings, "min and max are for int and float"));
+}

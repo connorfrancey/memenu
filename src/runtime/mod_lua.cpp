@@ -23,7 +23,7 @@ namespace mirage::mods
 		constexpr const char* kModuleMeta = "mirage.module";
 		constexpr const char* kSettingMeta = "mirage.setting";
 
-		enum class SettingKind : std::uint8_t { Checkbox, Slider, SliderInt, Text, Key };
+		enum class SettingKind : std::uint8_t { Checkbox, Slider, SliderInt, Text, Key, Choice };
 		struct SettingBox
 		{
 			MirageSetting* handle;
@@ -103,6 +103,7 @@ namespace mirage::mods
 		static int ModuleSliderInt(lua_State* L);
 		static int ModuleText(lua_State* L);
 		static int ModuleKey(lua_State* L);
+		static int FindSetting(lua_State* L);
 		static int SettingGet(lua_State* L);
 		static int SettingSet(lua_State* L);
 		static int SettingDown(lua_State* L);
@@ -257,6 +258,27 @@ namespace mirage::mods
 		return PushSetting(L, Self(L).api_->setting_key(m, luaL_checkstring(L, 2), vk, OptString(L, 4)), SettingKind::Key);
 	}
 
+	// mirage.setting("key"): a setting declared in mod.toml, nil when there is none
+	int LuaMod::FindSetting(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		MirageSetting* h = self.api_->setting_find(self.mod_, luaL_checkstring(L, 1));
+		if (!h) {
+			lua_pushnil(L);
+			return 1;
+		}
+		SettingKind kind = SettingKind::Text;
+		switch (self.api_->setting_type(h)) {
+			case MIRAGE_SETTING_BOOL: kind = SettingKind::Checkbox; break;
+			case MIRAGE_SETTING_INT: kind = SettingKind::SliderInt; break;
+			case MIRAGE_SETTING_FLOAT: kind = SettingKind::Slider; break;
+			case MIRAGE_SETTING_CHOICE: kind = SettingKind::Choice; break;
+			case MIRAGE_SETTING_KEY: kind = SettingKind::Key; break;
+			default: break;
+		}
+		return PushSetting(L, h, kind);
+	}
+
 	int LuaMod::SettingGet(lua_State* L)
 	{
 		const auto* box = static_cast<SettingBox*>(luaL_checkudata(L, 1, kSettingMeta));
@@ -265,7 +287,7 @@ namespace mirage::mods
 			case SettingKind::Checkbox: lua_pushboolean(L, api->setting_get_int(box->handle)); break;
 			case SettingKind::Slider: lua_pushnumber(L, api->setting_get_float(box->handle)); break;
 			case SettingKind::SliderInt: case SettingKind::Key: lua_pushinteger(L, api->setting_get_int(box->handle)); break;
-			case SettingKind::Text: {
+			case SettingKind::Text: case SettingKind::Choice: {
 				const uint32_t n = api->setting_get_text(box->handle, nullptr, 0);
 				std::string s(n + 1, '\0');
 				api->setting_get_text(box->handle, s.data(), n + 1);
@@ -285,6 +307,10 @@ namespace mirage::mods
 			case SettingKind::SliderInt: api->setting_set_int(box->handle, static_cast<int32_t>(luaL_checkinteger(L, 2))); break;
 			case SettingKind::Text: api->setting_set_text(box->handle, luaL_checkstring(L, 2)); break;
 			case SettingKind::Key: return luaL_error(L, "a key setting is set by binding it in the menu");
+			case SettingKind::Choice:
+				if (lua_type(L, 2) == LUA_TNUMBER) api->setting_set_int(box->handle, static_cast<int32_t>(luaL_checkinteger(L, 2)) - 1);
+				else api->setting_set_text(box->handle, luaL_checkstring(L, 2));
+				break;
 		}
 		return 0;
 	}
@@ -437,7 +463,7 @@ namespace mirage::mods
 		lua_newtable(L);	// mirage
 		const luaL_Reg fns[] = {{"log", LuaLog<MIRAGE_LOG_INFO>}, {"info", LuaLog<MIRAGE_LOG_INFO>},
 			{"warn", LuaLog<MIRAGE_LOG_WARN>}, {"error", LuaLog<MIRAGE_LOG_ERROR>}, {"module", LuaModule},
-			{"rgba", Rgba}, {nullptr, nullptr}};
+			{"setting", FindSetting}, {"rgba", Rgba}, {nullptr, nullptr}};
 		set(fns);
 		lua_pushstring(L, api_->mod_id(mod_));
 		lua_setfield(L, -2, "id");

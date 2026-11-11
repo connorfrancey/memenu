@@ -18,6 +18,20 @@
 //     [optional]                         # Loaded first when present
 //     [incompatible]                     # Not loaded together
 //
+//     [settings.greeting]                # Settings, declared like Geode's mod.json: one table per key
+//     type = "string"                    # bool, int, float, string, choice or key
+//     name = "Greeting"                  # Shown in the settings panel (default: the key)
+//     description = "What it draws"      # Tooltip
+//     default = "Hello"                  # Required, of the type's kind (choice: one of the options; key: a key code)
+//     min = 0                            # int and float: the range (both or neither)
+//     max = 10
+//     format = "%.2f"                    # float: how the value is shown
+//     options = ["a", "b"]               # choice: the items
+//     module = "Hello"                   # The module whose panel shows it (default: the mod's first module)
+//
+// The runtime makes them when their module registers, the menu's config saves their values, and code finds them
+// by key (MirageApi::setting_find, mirage.setting("greeting") in Lua).
+//
 // Unknown keys are reported as warnings (a typo in a key would otherwise be silently ignored).
 
 #include "runtime/semver.h"
@@ -32,6 +46,21 @@ namespace mirage::mods
 {
 	enum class Phase : std::uint8_t { Early, Engine, World };
 	const char* PhaseName(Phase p);
+
+	struct SettingDecl
+	{
+		enum class Type : std::uint8_t { Bool, Int, Float, String, Choice, Key };
+		std::string key, name, description, module, format;
+		Type type = Type::Bool;
+		bool boolDefault = false;
+		std::int64_t intDefault = 0;		// Int, Key; Choice: the index of the default option
+		double floatDefault = 0.0;
+		std::string stringDefault;
+		bool hasRange = false;
+		double min = 0.0, max = 0.0;
+		std::vector<std::string> options;
+	};
+	const char* SettingTypeName(SettingDecl::Type t);
 
 	struct Dependency
 	{
@@ -50,6 +79,7 @@ namespace mirage::mods
 		Phase phase = Phase::Engine;
 		std::vector<std::string> content;
 		std::vector<Dependency> required, optional, incompatible;
+		std::vector<SettingDecl> settings;	// In the order of the file
 		std::filesystem::path dir;		// Load: the folder mod.toml is in
 	};
 

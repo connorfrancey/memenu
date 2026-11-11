@@ -21,6 +21,7 @@
 #include "mirage/api.h"
 
 #include <memory>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,40 @@ namespace mirage
 	{
 		Api().config_set(Mod(), key.c_str(), value.c_str());
 	}
+
+	// ---- Settings declared in mod.toml ([settings.<key>]), by key ----------------------------------------------------
+	// They exist once the module they belong to is registered (after its mirage::Module constructor).
+	//     const float height = mirage::Get<float>("height");
+	//     mirage::Set("greeting", "Hi");
+	inline MirageSetting* FindSetting(const std::string& key) { return Api().setting_find(Mod(), key.c_str()); }
+	template <class T>
+	T Get(const std::string& key)
+	{
+		MirageSetting* s = FindSetting(key);
+		if constexpr (std::is_same_v<T, bool>) {
+			return s && Api().setting_get_int(s) != 0;
+		} else if constexpr (std::is_integral_v<T>) {
+			return s ? static_cast<T>(Api().setting_get_int(s)) : T{};
+		} else if constexpr (std::is_floating_point_v<T>) {
+			return s ? static_cast<T>(Api().setting_get_float(s)) : T{};
+		} else {
+			static_assert(std::is_same_v<T, std::string>, "Get<bool / int / float / std::string>");
+			if (!s) return {};
+			const uint32_t n = Api().setting_get_text(s, nullptr, 0);
+			std::string text(n + 1, '\0');
+			Api().setting_get_text(s, text.data(), n + 1);
+			text.resize(n);
+			return text;
+		}
+	}
+	inline void Set(const std::string& key, bool v) { if (auto* s = FindSetting(key)) Api().setting_set_int(s, v ? 1 : 0); }
+	inline void Set(const std::string& key, int v) { if (auto* s = FindSetting(key)) Api().setting_set_int(s, v); }
+	inline void Set(const std::string& key, float v) { if (auto* s = FindSetting(key)) Api().setting_set_float(s, v); }
+	inline void Set(const std::string& key, const std::string& v)
+	{
+		if (auto* s = FindSetting(key)) Api().setting_set_text(s, v.c_str());
+	}
+	inline void Set(const std::string& key, const char* v) { Set(key, std::string(v)); }
 
 	// ---- Drawing (OnRender only) ----------------------------------------------------------------------------------
 	inline void ScreenSize(float& w, float& h) { Api().screen_size(&w, &h); }

@@ -5,3 +5,27 @@ description = "A native example mod: one module that draws a greeting"
 authors = ["Mirror's Edge Menu"]
 mirage = "^0.1"
 entry = "hello.dll"
+
+# Settings, declared here and shown in the module's panel; the menu's config keeps their values.
+# The code reads them by key: mirage::Get<std::string>("greeting")
+[settings.greeting]
+type = "string"
+name = "Greeting"
+description = "What it draws"
+default = "Hello from a native mod"
+
+[settings.height]
+type = "float"
+name = "Height"
+description = "Where on the screen, from the top"
+default = 0.2
+min = 0.0
+max = 0.95
+format = "%.2f"
+
+[settings.color]
+type = "choice"
+name = "Color"
+description = "The text's color"
+options = ["Blue", "Orange", "White"]
+default = "Blue"

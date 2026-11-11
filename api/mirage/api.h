@@ -63,6 +63,17 @@ typedef enum MirageLogLevel {
 #define MIRAGE_MODULE_ACTION 0x1u                /* A button: on_trigger, no on/off state */
 #define MIRAGE_MODULE_ENABLED_BY_DEFAULT 0x2u    /* On the first time the mod is loaded (the config remembers after) */
 
+/* setting_type: what a setting holds */
+typedef enum MirageSettingType {
+    MIRAGE_SETTING_BOOL = 0,
+    MIRAGE_SETTING_INT = 1,
+    MIRAGE_SETTING_FLOAT = 2,
+    MIRAGE_SETTING_STRING = 3,
+    MIRAGE_SETTING_CHOICE = 4,
+    MIRAGE_SETTING_KEY = 5,
+    MIRAGE_SETTING_UNKNOWN = -1
+} MirageSettingType;
+
 typedef void(MIRAGE_CALL* MirageCallback)(void* user);
 
 /* What a module is: filled by the mod, copied by module_register */
@@ -138,6 +149,13 @@ typedef struct MirageApi {
     void(MIRAGE_CALL* draw_rect)(float x1, float y1, float x2, float y2, uint32_t color, float thickness);
     void(MIRAGE_CALL* draw_rect_filled)(float x1, float y1, float x2, float y2, uint32_t color);
     void(MIRAGE_CALL* text_size)(const char* text, float* width, float* height);
+
+    /* ---- Settings declared in mod.toml ([settings.<key>]) ---------------------------------------------------------
+     * The runtime makes them when their module registers (module_register returns with them in place). Their values
+     * are read and written with the setting_get / setting_set functions above (a choice is its option's index as an
+     * int, its option's text as text). */
+    MirageSetting*(MIRAGE_CALL* setting_find)(MirageMod* mod, const char* key);    /* NULL if the mod has none such */
+    int32_t(MIRAGE_CALL* setting_type)(MirageSetting* setting);                    /* MIRAGE_SETTING_* */
 } MirageApi;
 
 /* The runtime has `field` (a mod built against a newer header, running on an older runtime) */

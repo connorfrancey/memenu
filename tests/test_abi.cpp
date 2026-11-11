@@ -60,8 +60,12 @@ MIRAGE_AT(draw_line, 104);
 MIRAGE_AT(draw_rect, 108);
 MIRAGE_AT(draw_rect_filled, 112);
 MIRAGE_AT(text_size, 116);
+MIRAGE_AT(setting_find, 120);
+MIRAGE_AT(setting_type, 124);
 // Size of ABI v1's table: a later version only makes it larger
-static_assert(sizeof(MirageApi) >= 120);
+static_assert(sizeof(MirageApi) >= 128);
+static_assert(MIRAGE_SETTING_BOOL == 0 && MIRAGE_SETTING_INT == 1 && MIRAGE_SETTING_FLOAT == 2 &&
+              MIRAGE_SETTING_STRING == 3 && MIRAGE_SETTING_CHOICE == 4 && MIRAGE_SETTING_KEY == 5);
 
 TEST(Abi, NewerRuntimeTableCoversOlderMods)
 {

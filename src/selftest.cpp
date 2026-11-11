@@ -3097,6 +3097,11 @@ void TestMirageMods()
             p.Problem(std::string(name) + ": its settings are missing or of the wrong type");
             continue;
         }
+        // Greeting, Height and Color come from mod.toml ([settings.*]): first in the panel, in the file's order
+        auto* color = dynamic_cast<ctl::Combo*>(m->FindSetting("Color"));
+        if (!color) p.Problem(std::string(name) + ": the choice setting Color from mod.toml is missing");
+        else if (m->Settings().size() < 3 || m->Settings()[0]->Name() != "Greeting" || m->Settings()[2]->Name() != "Color")
+            p.Problem(std::string(name) + ": the mod.toml settings aren't first, in the file's order");
 
         // Settings save and load like the menu's own (the config writes each with Save, reads it with Load)
         {

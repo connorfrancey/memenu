@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <unordered_map>
+#include <ankerl/unordered_dense.h>
 
 namespace rmesh
 {
@@ -62,7 +62,7 @@ namespace rmesh
         if (style_.fill) faces.reserve(faces.size() + triCount * 3);
 
         // Edge bookkeeping is only needed for outlines.
-        std::unordered_map<std::uint64_t, Edge> edges;
+        ankerl::unordered_dense::map<std::uint64_t, Edge> edges;
         if (style_.outline) edges.reserve(idx.size());
 
         for (std::size_t t = 0; t + 2 < idx.size(); t += 3)

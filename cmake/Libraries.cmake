@@ -157,6 +157,22 @@ CPMAddPackage(
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE magic_enum::magic_enum)
 
+# unordered_dense: open-addressing hash maps (values in one vector) where lookups are the hot part: the mesh builder's
+# edge map (render/mesh.cpp: 2x faster builds). Not the TAS page tables: measured, no gain. Header only. Unlike std::, an
+# insert or erase moves the other entries: no reference into the map may be kept across one.
+CPMAddPackage(
+        NAME unordered_dense
+        GITHUB_REPOSITORY martinus/unordered_dense
+        GIT_TAG ${UNORDERED_DENSE_VERSION}
+        DOWNLOAD_ONLY YES
+)
+if(unordered_dense_ADDED AND NOT TARGET unordered_dense::unordered_dense)
+    add_library(unordered_dense INTERFACE)
+    target_include_directories(unordered_dense SYSTEM INTERFACE ${unordered_dense_SOURCE_DIR}/include)
+    add_library(unordered_dense::unordered_dense ALIAS unordered_dense)
+endif()
+target_link_libraries(${PROJECT_NAME} PRIVATE unordered_dense::unordered_dense)
+
 # imgui-filebrowser: the TAS module's Open / Save file browser, drawn with ImGui inside the menu (Windows' own dialog
 # opened behind the fullscreen game and took the cursor). Header only; the repo has no tags, so a commit is pinned.
 if("tas" IN_LIST MEMENU_ENABLED_FEATURES)

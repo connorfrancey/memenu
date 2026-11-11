@@ -44,6 +44,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import build as b
+from . import example_mods as em
 from . import features as feat
 from .game import INSTALLER, LAUNCHER, detected_installs, is_elevated, project_version, run_elevated
 from .toolchain import ROOT, Toolchain, ToolchainError, cmake_version, find_toolchain
@@ -1115,6 +1116,14 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
     if devtest.game_pids():
         console.print("[red]Mirror's Edge is running.[/] Close it first.")
         ctx.exit(1)
+    # The example mods, for the self-test step "Mirage mods": hello built like a mod author would (its own CMake
+    # project, clang-cl when installed), hello-lua as it is
+    hello, how = em.build_native(_toolchain(ctx))
+    if hello is None:
+        console.print(f"[red]The example mod hello didn't build:[/]\n{escape(how)}")
+        ctx.exit(1)
+    test_mods = [hello, em.EXAMPLES / "hello-lua"]
+    console.print(f"Example mods: {how}, hello-lua")
     if (game_dir / "memenu" / "disabled").exists():
         console.print("[yellow]memenu\\disabled exists: the loader would skip the menu. Removed it.[/]")
         (game_dir / "memenu" / "disabled").unlink()
@@ -1129,6 +1138,7 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
     attempt = 0
     while True:
         gt.install(game_dir, dll, loader)
+        em.install_for_test(game_dir, test_mods)
         gt.write_options(game_dir, {"map": map_name, "checkpoint": str(checkpoint), "ticks": str(ticks), "only": only,
                                     "skip": skip, "fast": "0" if real_speed else "1",
                                     # The menu never closes the game itself: gt.run does, once the menu has unloaded
@@ -1141,6 +1151,7 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
             ctx.exit(1)
         finally:
             gt.cleanup(game_dir)
+            em.remove_test_mods(game_dir)
         if res.ok or not res.environment or attempt >= retries:
             break
         attempt += 1

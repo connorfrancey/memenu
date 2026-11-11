@@ -139,6 +139,26 @@ measured.
 written in Lua are both loaded, register a module with settings that save and load, and show in the menu; the ABI
 tests pass.
 
+**Status (2026-11-11): done, with two items moved on.** `api/mirage/api.h` is ABI v1: a `MirageApi` function table
+that starts with its size and only grows, a size-prefixed module description with five callbacks, settings
+(checkbox, slider, int slider, text, key), per-mod `config.toml`, and drawing primitives (a native mod can't share the
+menu's ImGui). `mirage.hpp` wraps it in the menu's own `Module` / `ctl::` style. `src/runtime/manifest` reads `mod.toml`
+with toml11 and warns about unknown keys; `semver` handles versions and npm/Cargo ranges. `src/runtime/mods` runs each
+mod module as a normal menu `Module`. Every call into native code is under SEH: a crash is logged and the module
+stopped. The Lua binding (`mod_lua`) is written only against `MirageApi`. Its callbacks hold the mod's lock and get the
+instruction budget, and `require` stays inside the mod's folder. Mods load in id order after their runtime range and
+required and incompatible mods are checked; topological order is step 5.
+
+The check: `tests/test_abi.cpp` freezes every offset; semver and manifest have unit tests. The in-game self-test
+"Mirage mods" covers `examples/mods/hello`, built by its own CMake project with **clang-cl** instead of a second MSVC
+toolset (only one is installed, and another compiler is the stronger proof), and `examples/mods/hello-lua`. Both load,
+show in the Mods column, run `on_enable` / `on_tick` / `on_render` / `on_disable`, save, load and clamp their
+settings, and keep their own config. `memenu game-test` builds and deploys them.
+
+Moved on: game object access from Lua through reflection (`player.Location.Z = 500`) goes with the hooks and events
+of step 6, where Lua first gets game objects. A settings schema in `mod.toml` is dropped: settings are declared in
+code, as in the menu.
+
 ### 5. Loader and mod lifecycle
 
 - Discovery in `mods\`, manifest validation, dependency resolution (topological order, semver ranges, cycles, missing

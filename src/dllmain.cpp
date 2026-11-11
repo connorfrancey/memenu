@@ -20,6 +20,7 @@
 #if MEMENU_GAME
 #include "game/game.h"
 #include "game/levels.h"
+#include "runtime/mods.h"
 #endif
 #if MEMENU_FEATURE_TAS
 #include "tas/tas.h"
@@ -59,6 +60,12 @@ static void Run(HMODULE module)
     prof::Start();                            // Tracy builds only: profiler threads (stopped after the hooks are gone)
     STARTUP_STEP(theme::Init());              // themes/ folder + built-in theme files
     STARTUP_STEP(modules::Init());            // Every module registered with MEM_MODULE
+#if MEMENU_GAME
+    // Mirage mods (mods\<id>\mod.toml): their modules join the list before the config and the scheduler see it. The
+    // self-test also loads its test mods, put next to the menu by `memenu game-test` and removed after.
+    STARTUP_STEP(mirage::mods::LoadAll(paths::Dir() / "mods"));
+    if (selfTest) STARTUP_STEP(mirage::mods::LoadAll(paths::Dir() / "selftest-mods"));
+#endif
     STARTUP_STEP(modules::ApplyDefaults());   // Modules flagged enabledByDefault
     STARTUP_STEP(config::Load());             // Saved state overrides the defaults
     devmode::ApplyBuild();                    // A developer build (memenu --dev) switches developer mode on
@@ -119,12 +126,18 @@ static void Run(HMODULE module)
         tas::Shutdown();        // The snapshot workers
 #endif
         hooks::Uninstall();
+#if MEMENU_GAME
+        mirage::mods::UnloadAll();   // Nothing calls into a mod any more
+#endif
         if (selfTest) selftest::Finish(true);
     }
     else
     {
         config::Save();
         modules::DisableAll();
+#if MEMENU_GAME
+        mirage::mods::UnloadAll();
+#endif
         if (selfTest) selftest::Finish(false);
     }
 

@@ -718,7 +718,12 @@ MirrorsEdge.exe
    writes the decompiled script and Lua type stubs, and a report of what the old (mmultiplayer) SDK had wrong. The
    menu builds on it (the full in-game self-test passes).
 
-**Next:** the mod format (`mod.toml`) and ABI v1, the loader and mod lifecycle, hooks and
+4. **Mod format and ABI v1:** a mod is a folder in `Binaries\memenu\mods` with a `mod.toml` and a DLL and/or
+   `main.lua`. Native mods use the C ABI in `api/mirage/api.h` (or the C++ wrapper `mirage.hpp`), so any compiler
+   works; Lua mods get the same API as a `mirage` table. Their modules show in the menu's Mods column and save their
+   settings like built-in ones. See `examples/mods/` (self-test "Mirage mods").
+
+**Next:** the loader and mod lifecycle (dependency order, load phases, hot reload, crash attribution), hooks and
 events, content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
 
 ### Testing

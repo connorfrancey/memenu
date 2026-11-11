@@ -105,6 +105,33 @@ void modules::Init()
     spdlog::info("{} modules in {} tabs", g_modules.size(), g_tabs.size());
 }
 
+Module* modules::Add(std::unique_ptr<Module> module)
+{
+    if (!module || Find(module->Name())) return nullptr;     // Names are unique: the config saves by name
+    Module* m = module.get();
+    g_modules.push_back(std::move(module));
+    auto it = std::find_if(g_tabs.begin(), g_tabs.end(), [&](const auto& t) { return t->name == m->Tab(); });
+    if (it == g_tabs.end()) {
+        auto tab = std::make_unique<Tab>();
+        tab->name = m->Tab();
+        g_tabs.push_back(std::move(tab));
+        it = g_tabs.end() - 1;
+    }
+    auto& list = (*it)->modules;
+    const auto at = std::find_if(list.begin(), list.end(), [&](const Module* o) {
+        return o->Order() != m->Order() ? m->Order() < o->Order() : m->Name() < o->Name();
+    });
+    list.insert(at, m);
+    return m;
+}
+
+void modules::Remove(Module* module)
+{
+    // Its tab goes too when this was its last module (a tab only a mod's modules used)
+    std::erase_if(g_tabs, [&](const auto& t) { return std::erase(t->modules, module) > 0 && t->modules.empty(); });
+    std::erase_if(g_modules, [&](const auto& m) { return m.get() == module; });
+}
+
 Module* modules::Find(std::string_view name)
 {
     for (auto& m : g_modules)

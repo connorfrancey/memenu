@@ -1,0 +1,7 @@
+id = "hello"
+name = "Hello"
+version = "1.0.0"
+description = "A native example mod: one module that draws a greeting"
+authors = ["Mirror's Edge Menu"]
+mirage = "^0.1"
+entry = "hello.dll"

@@ -1,0 +1,7 @@
+id = "hello-lua"
+name = "Hello (Lua)"
+version = "1.0.0"
+description = "The Hello example written in Lua: no compiler, just this folder"
+authors = ["Mirror's Edge Menu"]
+mirage = "^0.1"
+# lua = "main.lua" is the default

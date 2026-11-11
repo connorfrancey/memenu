@@ -35,6 +35,9 @@ namespace mirage::lua
 		// Compiles and runs `code` (named `chunk` in messages). Errors, the memory limit and the budget come back in
 		// Result, never as exceptions.
 		Result Run(std::string_view code, std::string_view chunk = "chunk");
+		// Calls the function under `nargs` arguments on the stack, with a fresh instruction budget. Ok: its `nresults`
+		// results are left on the stack. Not ok: nothing is left, the message is in Result::error.
+		Result Call(int nargs, int nresults);
 
 		std::size_t MemoryUsed() const { return used_; }
 		std::size_t MemoryPeak() const { return peak_; }

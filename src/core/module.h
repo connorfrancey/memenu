@@ -120,6 +120,10 @@ namespace modules
 	void Init();				// Creates every registered module and the tabs
 	void ApplyDefaults();		// Turns on modules flagged enabledByDefault (after Init, before the config is loaded)
 	void DisableAll();			// On unload, so modules can undo their changes
+	// Modules made at run time (Mirage mods): after Init, before config::Load and sched::Init, so their saved state is
+	// read and the scheduler runs them. Remove only before sched::Init (a mod that failed to load).
+	Module* Add(std::unique_ptr<Module> module);
+	void Remove(Module* module);
 
 	// ---- Per frame -----------------------------------------------------------------------------------------------------------------
 	void Tick();				// Game thread: runs the scheduler (OnTick of the enabled modules that are due)

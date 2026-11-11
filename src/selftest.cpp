@@ -22,6 +22,7 @@
 #include "runtime/engine_calls.h"
 #include "runtime/layout.h"
 #include "runtime/lua_vm.h"
+#include "runtime/mods.h"
 #include "runtime/packages.h"
 #if MEMENU_FEATURE_SPEEDRUN_TIMER
 #include "speedrun/live.h"
@@ -3061,6 +3062,96 @@ unsigned HudVertices()
     return last;
 }
 
+#if MEMENU_GAME
+// Mirage step 4: the example mods (examples/mods: hello built by its own CMake project with clang-cl, hello-lua), put in
+// selftest-mods by `memenu game-test`, are loaded; their modules are in the menu, run, draw, save and load their
+// settings like built-in ones, and keep their own config.
+void TestMirageMods()
+{
+    Step& s = Begin("Mirage mods");
+    Probe p(s);
+    const auto mods = mirage::mods::List();
+    for (const char* id : {"hello", "hello-lua"}) {
+        const auto it = std::find_if(mods.begin(), mods.end(), [&](const auto& m) { return m.id == id; });
+        if (it == mods.end()) {
+            p.Problem(std::string(id) + " was not found (is selftest-mods there? memenu game-test puts it)");
+            continue;
+        }
+        if (!it->loaded) p.Problem(std::string(id) + " was not loaded: " + it->problem);
+        else s.notes.push_back(it->id + " " + it->version + " (" + it->kind + "): " + std::to_string(it->modules.size()) + " module(s)");
+        for (const auto& w : it->warnings) p.Problem(std::string(id) + ": " + w);
+    }
+
+    for (const char* name : {"Hello (native)", "Hello (Lua)"}) {
+        Module* m = modules::Find(name);
+        if (!m) {
+            p.Problem(std::string(name) + " is not in the menu");
+            continue;
+        }
+        if (m->Tab() != "Mods") p.Problem(std::string(name) + " is in the " + m->Tab() + " column, not Mods");
+        auto* greeting = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Greeting"));
+        auto* height = dynamic_cast<ctl::Value<float>*>(m->FindSetting("Height"));
+        auto* ticks = dynamic_cast<ctl::Value<int>*>(m->FindSetting("Ticks"));
+        auto* status = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Status"));
+        if (!greeting || !height || !ticks || !status) {
+            p.Problem(std::string(name) + ": its settings are missing or of the wrong type");
+            continue;
+        }
+
+        // Settings save and load like the menu's own (the config writes each with Save, reads it with Load)
+        {
+            nlohmann::ordered_json saved;
+            const std::string before = greeting->Get();
+            greeting->Set("saved greeting");
+            greeting->Save(saved["Greeting"]);
+            height->Set(0.5f);
+            height->Save(saved["Height"]);
+            greeting->Set("changed");
+            height->Set(0.1f);
+            greeting->Load(saved["Greeting"]);
+            height->Load(saved["Height"]);
+            if (greeting->Get() != "saved greeting" || std::fabs(height->Get() - 0.5f) > 1e-6f)
+                p.Problem(std::string(name) + ": settings didn't load back what was saved");
+            height->Set(2.0f);
+            if (height->Get() > 0.95f) p.Problem(std::string(name) + ": Height isn't clamped to its range");
+            greeting->Set(before);
+            height->Set(0.3f);
+        }
+
+        // On: on_enable, on_tick (Ticks counts) and on_render (it draws); off: on_disable
+        const int ticksBefore = ticks->Get();
+        OnRenderThread([] { gui::visible = false; });
+        WaitTicks(3);
+        const unsigned drawnBefore = hooks::MenuVertices();
+        OnRenderThread([m] { m->SetEnabled(true); });
+        WaitTicks(10);
+        const unsigned drawnOn = hooks::MenuVertices();
+        if (!m->Enabled()) p.Problem(std::string(name) + " didn't switch on");
+        if (status->Get().rfind("on (", 0) != 0) p.Problem(std::string(name) + ": on_enable didn't run (Status '" + status->Get() + "')");
+        if (ticks->Get() <= ticksBefore) p.Problem(std::string(name) + ": on_tick didn't run");
+        if (drawnOn <= drawnBefore) p.Problem(std::string(name) + ": on_render drew nothing");
+        OnRenderThread([m] { m->SetEnabled(false); });
+        OnRenderThread([] { gui::visible = true; });
+        WaitTicks(3);
+        if (status->Get() != "off") p.Problem(std::string(name) + ": on_disable didn't run");
+        s.notes.push_back(std::string(name) + ": " + std::to_string(ticks->Get() - ticksBefore) + " ticks, drew " +
+                          std::to_string(drawnOn - drawnBefore) + " vertices, " + status->Get());
+    }
+
+    // Each mod's own config (config.toml in its folder, written by mirage.config.set / mirage::SetConfig)
+    for (const char* id : {"hello", "hello-lua"}) {
+        const auto file = paths::Dir() / "selftest-mods" / id / "config.toml";
+        std::ifstream in(file);
+        std::stringstream text;
+        text << in.rdbuf();
+        if (text.str().find("times_enabled") == std::string::npos)
+            p.Problem(std::string(id) + ": config.toml has no times_enabled");
+    }
+    p.Check(1, true);
+    End(s);
+}
+#endif
+
 void TestModule(Module& m)
 {
     Step& s = Begin("module " + m.Tab() + "/" + m.Name());
@@ -3301,6 +3392,7 @@ const Named* FeatureList()
         {"Mirage runtime", &TestMirageRuntime, false},
         {"Mirage layouts", &TestMirageLayouts, false},
         {"Mirage calls", &TestMirageCalls, false},
+        {"Mirage mods", &TestMirageMods, false},
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},

@@ -166,6 +166,7 @@ namespace mirage::mods
 		static int CallSkip(lua_State* L);
 		static MirageScript* CheckScript(lua_State* L);
 		static bool ToToken(lua_State* L, int index, MirageToken& t);
+		static int Notify(lua_State* L);
 		static int ScriptOpen(lua_State* L);
 		static int ScriptRestore(lua_State* L);
 		static int ScriptCount(lua_State* L);
@@ -875,6 +876,14 @@ namespace mirage::mods
 	//
 	// Indices are 1-based; children(0) / set_children(0, ...) are the top-level statements.
 
+	int LuaMod::Notify(lua_State* L)
+	{
+		LuaMod& self = Self(L);
+		const std::string text = Concat(L);
+		self.api_->notify(self.mod_, text.c_str());
+		return 0;
+	}
+
 	MirageScript* LuaMod::CheckScript(lua_State* L)
 	{
 		auto** box = static_cast<MirageScript**>(luaL_checkudata(L, 1, kScriptMeta));
@@ -1199,7 +1208,7 @@ namespace mirage::mods
 			{"warn", LuaLog<MIRAGE_LOG_WARN>}, {"error", LuaLog<MIRAGE_LOG_ERROR>}, {"module", LuaModule},
 			{"setting", FindSetting}, {"rgba", Rgba},
 			{"on", On}, {"hook", HookFn}, {"pawn", Pawn}, {"controller", Controller}, {"world", World}, {"find", Find},
-			{"name", Name}, {"class", ClassName}, {"is_a", IsA}, {"call", CallGame}, {nullptr, nullptr}};
+			{"name", Name}, {"class", ClassName}, {"is_a", IsA}, {"call", CallGame}, {"notify", Notify}, {nullptr, nullptr}};
 		set(fns);
 		lua_pushstring(L, api_->mod_id(mod_));
 		lua_setfield(L, -2, "id");

@@ -31,6 +31,7 @@
 #include "runtime/reflect.h"
 #include "runtime/texture_overlays.h"
 #include "runtime/script_patch.h"
+#include "runtime/firstparty.h"
 #endif
 #if MEMENU_FEATURE_TAS
 #include "tas/tas.h"
@@ -73,6 +74,7 @@ static void Run(HMODULE module)
 #if MEMENU_GAME
     // Mirage mods (mods\<id>\mod.toml): found and ordered now, the early phase loaded before the config and the
     // scheduler see the modules. The self-test also loads its test mods (selftest-mods, put there by `memenu game-test`).
+    STARTUP_STEP(mirage::firstparty::Install(paths::Dir() / "mods"));   // The menu's own mods, at this DLL's version
     STARTUP_STEP(mirage::mods::Discover(selfTest ? std::vector{paths::Dir() / "mods", paths::Dir() / "selftest-mods"}
                                                  : std::vector{paths::Dir() / "mods"}));
     STARTUP_STEP(mirage::mods::LoadPhase(mirage::mods::Phase::Early));

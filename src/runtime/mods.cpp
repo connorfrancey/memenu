@@ -1,4 +1,5 @@
 #include "runtime/mods.h"
+#include "core/notify.h"
 
 #include "core/module.h"
 #include "core/setting.h"
@@ -386,8 +387,11 @@ namespace mirage::mods
 				switch (d.type) {
 					case T::Bool: s = std::make_unique<ctl::Checkbox>(&m, d.name, d.boolDefault, d.description); break;
 					case T::Int:
-						s = std::make_unique<ctl::SliderInt>(&m, d.name, static_cast<int>(d.intDefault), static_cast<int>(d.min),
-															 static_cast<int>(d.max), std::string("%d"), 0, d.description);
+						// Within ImGui's int slider range (see SettingSliderInt)
+						s = std::make_unique<ctl::SliderInt>(&m, d.name, static_cast<int>(d.intDefault),
+															 static_cast<int>(std::clamp<double>(d.min, -(INT32_MAX / 2), INT32_MAX / 2)),
+															 static_cast<int>(std::clamp<double>(d.max, -(INT32_MAX / 2), INT32_MAX / 2)),
+															 std::string("%d"), 0, d.description);
 						break;
 					case T::Float:
 						s = std::make_unique<ctl::Slider>(&m, d.name, static_cast<float>(d.floatDefault), static_cast<float>(d.min),
@@ -635,6 +639,13 @@ namespace mirage::mods
 			return MIRAGE_SETTING_UNKNOWN;
 		}
 
+		// A notification on screen (the menu's toasts), prefixed with nothing: the mod writes what the player reads
+		void MIRAGE_CALL Notify(MirageMod* mod, const char* text)
+		{
+			if (!mod || !text || !*text) return;
+			notify::Push(text);
+		}
+
 		const MirageApi kApi = {
 			sizeof(MirageApi), MIRAGE_ABI_VERSION, kRuntimeVersion,
 			Log, ModId, ModVersion, ModDir,
@@ -653,6 +664,7 @@ namespace mirage::mods
 			game_api::ScriptOpen, game_api::ScriptClose, game_api::ScriptCount, game_api::ScriptGet, game_api::ScriptSet,
 			game_api::ScriptAdd, game_api::ScriptChildren, game_api::ScriptSetChildren, game_api::ScriptApply,
 			game_api::ScriptRestore, game_api::ScriptDump, game_api::ScriptKind, game_api::ScriptKindName,
+			Notify,
 		};
 
 		// ---- Loading -----------------------------------------------------------------------------------------------

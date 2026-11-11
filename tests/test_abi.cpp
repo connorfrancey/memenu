@@ -100,6 +100,8 @@ MIRAGE_AT(script_restore, 260);
 MIRAGE_AT(script_dump, 264);
 MIRAGE_AT(script_kind, 268);
 MIRAGE_AT(script_kind_name, 272);
+// Step 9: the menu
+MIRAGE_AT(notify, 276);
 static_assert(sizeof(MirageToken) == 384 && offsetof(MirageToken, name) == 48 && offsetof(MirageToken, target) == 120 &&
               offsetof(MirageToken, text) == 128, "MirageToken moved");
 // Size of ABI v1's table: a later version only makes it larger

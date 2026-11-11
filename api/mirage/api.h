@@ -292,6 +292,9 @@ typedef struct MirageApi {
     uint32_t(MIRAGE_CALL* script_dump)(MirageScript* script, char* buffer, uint32_t capacity);    /* Full length */
     int32_t(MIRAGE_CALL* script_kind)(const char* name);            /* -1: no such kind */
     const char*(MIRAGE_CALL* script_kind_name)(int32_t kind);        /* "Bad" if none */
+
+    /* ---- The menu (step 9) ---------------------------------------------------------------------------------------- */
+    void(MIRAGE_CALL* notify)(MirageMod* mod, const char* text);   /* A notification on screen for a few seconds. Any thread */
 } MirageApi;
 
 /* The runtime has `field` (a mod built against a newer header, running on an older runtime) */

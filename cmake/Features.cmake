@@ -6,7 +6,7 @@
 #
 #   cmake ... -D MEMENU_FEATURES=OFF                 just the menu GUI: no modules, no game integration
 #   cmake ... -D MEMENU_FEATURES_DEBUG=OFF           everything except the Debug tab
-#   cmake ... -D MEMENU_FEATURE_GOD_MODE=OFF         everything except God Mode
+#   cmake ... -D MEMENU_FEATURE_NO_CLIP=OFF          everything except No Clip
 #
 # Features marked GAME need the game integration (src/game, src/render, the engine tick hook and the Mirror's Edge
 # SDK). When none of the enabled features needs it, that layer is left out too (MEMENU_GAME, set below), and the DLL
@@ -140,8 +140,6 @@ endfunction()
 # Player
 memenu_feature(flight_mode       player GAME STAGE 10 FILES features/player/flight_mode.cpp features/player/fly_module.cpp)
 memenu_feature(no_clip           player GAME STAGE 10 FILES features/player/no_clip.cpp features/player/fly_module.cpp)
-memenu_feature(god_mode          player GAME STAGE 9  FILES features/player/god_mode.cpp)
-memenu_feature(teleport_to_spawn player GAME STAGE 9  FILES features/player/teleport_to_spawn.cpp)
 
 # Trainer
 memenu_feature(beamer            trainer GAME STAGE 10 FILES features/trainer/beamer.cpp)
@@ -162,7 +160,6 @@ memenu_feature(tas               tas GAME STAGE 12 FILES features/tas/tas_module
                   tas/snapshot.cpp tas/d3d_pins.cpp)
 
 # World
-memenu_feature(game_speed        world GAME STAGE 9 FILES features/world/game_speed.cpp)
 memenu_feature(freeze_timer      world GAME STAGE 9 FILES features/world/freeze_timer.cpp)
 memenu_feature(kill_bots         world GAME STAGE 9 FILES features/world/kill_bots.cpp)
 

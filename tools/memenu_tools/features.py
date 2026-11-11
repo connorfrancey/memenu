@@ -2,7 +2,7 @@
 
 CMake builds a feature when MEMENU_FEATURES, MEMENU_FEATURES_<CATEGORY> and MEMENU_FEATURE_<NAME> are all ON. The
 CLI flattens that: it works out the on/off state of every feature, then writes all of them (with the master and
-category switches ON), so `--disable all --enable god_mode` means exactly "only God Mode".
+category switches ON), so `--disable all --enable no_clip` means exactly "only No Clip".
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def current_state(config: str, features: list[Feature]) -> dict[str, bool]:
 def apply(features: list[Feature], state: dict[str, bool], only: tuple[str, ...], enable: tuple[str, ...],
           disable: tuple[str, ...], reset: bool = False) -> dict[str, bool]:
     """The new state. `reset` starts from the defaults in Features.cmake, `only` from everything off. Then the broadest names go first (all, then categories, then
-    single features), so a narrower toggle always wins: `--disable all --enable god_mode`, `--enable debug --disable
+    single features), so a narrower toggle always wins: `--disable all --enable no_clip`, `--enable debug --disable
     log_viewer`. Raises ValueError for an unknown name and for the same name enabled and disabled."""
     state = {f.name: f.default for f in features} if reset else dict(state)
     if only:

@@ -4,11 +4,14 @@ include(${CMAKE_CURRENT_LIST_DIR}/Versions.cmake)   # Pinned versions (fmt, spdl
 
 # -------------------------------------------------------------------------------------------------
 
+# Threads
+find_package(Threads REQUIRED)
+
 # MinHook (built by hand so we skip its own CMake project entirely)
 CPMAddPackage(
         NAME minhook
         GITHUB_REPOSITORY TsudaKageyu/minhook
-        GIT_TAG v1.3.4
+        GIT_TAG ${MINHOOK_VERSION}
         DOWNLOAD_ONLY YES
 )
 if(minhook_ADDED)
@@ -25,7 +28,7 @@ endif()
 CPMAddPackage(
         NAME imgui
         GITHUB_REPOSITORY ocornut/imgui
-        GIT_TAG v1.92.9b
+        GIT_TAG ${IMGUI_VERSION}
         DOWNLOAD_ONLY YES
 )
 if(imgui_ADDED)
@@ -77,10 +80,11 @@ CPMAddPackage(
 # zstd: compresses the previous session's log into logs/.old/ (log.cpp) and the TAS's memory snapshots
 # (tas/snapshot.cpp). Built by hand like MinHook: zstd's own CMake project is large and sets its own runtime-library
 # flags. The target keeps its old name; it has the decompressor too.
+# gh: https://github.com/facebook/zstd
 CPMAddPackage(
         NAME zstd
         GITHUB_REPOSITORY facebook/zstd
-        GIT_TAG v1.5.7
+        GIT_TAG ${ZSTD_VERSION}
         DOWNLOAD_ONLY YES
 )
 if(zstd_ADDED)
@@ -99,8 +103,8 @@ if(_need_themes)
 # nlohmann/json: config file + theme parsing (release tarball is much smaller than cloning the repo)
 CPMAddPackage(
         NAME nlohmann_json
-        VERSION 3.12.0
-        URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+        VERSION ${NLOHMANN_JSON_VERSION}
+        URL https://github.com/nlohmann/json/releases/download/v${NLOHMANN_JSON_VERSION}/json.tar.xz
         OPTIONS "JSON_Install OFF"
 )
 
@@ -110,7 +114,7 @@ CPMAddPackage(
 CPMAddPackage(
         NAME imjson
         GITHUB_REPOSITORY moleium/imjson
-        GIT_TAG master
+        GIT_TAG ${IMJSON_COMMIT}
         DOWNLOAD_ONLY YES
 )
 if(imjson_ADDED)
@@ -146,7 +150,7 @@ if("tas" IN_LIST MEMENU_ENABLED_FEATURES)
 CPMAddPackage(
         NAME imgui_filebrowser
         GITHUB_REPOSITORY AirGuanZ/imgui-filebrowser
-        GIT_TAG 47a1884524d6a3df5d99f70ecc82e1ed0ccd26cf
+        GIT_TAG ${IMGUIFILEBROWSER_GIT_COMMIT}
         DOWNLOAD_ONLY YES
 )
 if(imgui_filebrowser_ADDED)
@@ -186,12 +190,6 @@ CPMAddPackage(
 target_link_libraries(${PROJECT_NAME} PRIVATE Tracy::TracyClient)
 endif()
 
-# Discord RPC
-#include(${CMAKE_SOURCE_DIR}/cmake/discord-rpc.cmake)
-
-# Portable File Dialogs
-#include(${CMAKE_SOURCE_DIR}/cmake/portable-file-dialogs.cmake)
-
 # Direct3D 9 comes from the Windows SDK (d3d9.h / d3d9.lib). Nothing uses D3DX, so the legacy DirectX SDK
 # (June 2010) is not needed, and players don't need the d3dx9_43.dll runtime either.
 
@@ -208,7 +206,7 @@ if(MEMENU_BUILD_SDKGEN)
 CPMAddPackage(
         NAME mmultiplayer
         GITHUB_REPOSITORY connorfrancey/mmultiplayer
-        GIT_TAG 7b1eb25ddc0fc1ce498d024e7b2f9d1980b9eca3
+        GIT_TAG ${MMULTIPLAYER_COMMIT}
         DOWNLOAD_ONLY YES
 )
 endif()
@@ -234,7 +232,7 @@ if(MEMENU_GAME OR MEMENU_BUILD_SDKGEN OR MEMENU_BUILD_TESTS)
 CPMAddPackage(
         NAME toml11
         GITHUB_REPOSITORY ToruNiina/toml11
-        GIT_TAG v${TOML_VERSION}
+        GIT_TAG ${TOML_VERSION}
         OPTIONS
             "TOML11_INSTALL OFF"
             "TOML11_BUILD_EXAMPLES OFF"
@@ -270,7 +268,7 @@ if(MEMENU_BUILD_TESTS)
   CPMAddPackage(
       NAME googletest
       GITHUB_REPOSITORY google/googletest
-      GIT_TAG v1.17.0
+      GIT_TAG ${GOOGLETEST_VERSION}
       OPTIONS
           "INSTALL_GTEST OFF"
           "BUILD_GMOCK OFF"
@@ -283,7 +281,7 @@ if(MEMENU_BUILD_BENCHMARKS)
   CPMAddPackage(
       NAME nanobench
       GITHUB_REPOSITORY martinus/nanobench
-      GIT_TAG v4.3.11
+      GIT_TAG ${NANOBENCH_VERSION}
       DOWNLOAD_ONLY YES
   )
   if(nanobench_ADDED)
@@ -297,28 +295,26 @@ if(MEMENU_DEV_TOOLS)
 CPMAddPackage(
         NAME CPMLicenses.cmake
         GITHUB_REPOSITORY cpm-cmake/CPMLicenses.cmake
-        VERSION 0.0.7
+        VERSION ${CPM_LICENSES_VERSION}
 )
 
+# Format.cmake
+# GitHub Repository: https://github.com/TheLartians/Format.cmake
 CPMAddPackage(
         NAME Format.cmake
-        VERSION 1.8.2
+        VERSION ${FORMATDOTCMAKE_VERSION}
         GITHUB_REPOSITORY TheLartians/Format.cmake
         OPTIONS
-        # set to yes skip cmake formatting
-        "FORMAT_SKIP_CMAKE NO"
-        # set to yes skip clang formatting
-        "FORMAT_SKIP_CLANG NO"
-        # path to exclude (optional, supports regular expressions)
-        "CMAKE_FORMAT_EXCLUDE cmake/CPM.cmake"
-        # extra arguments for cmake_format (optional)
-        "CMAKE_FORMAT_EXTRA_ARGS -c /path/to/cmake-format.{yaml,json,py}"
+            "FORMAT_SKIP_CMAKE NO"  # Set to yes skip cmake formatting
+            "FORMAT_SKIP_CLANG NO"  # Set to yes skip clang formatting
+            "CMAKE_FORMAT_EXCLUDE cmake/CPM.cmake"  # path to exclude (optional, supports regular expressions)
+            "CMAKE_FORMAT_EXTRA_ARGS -c /path/to/cmake-format.{yaml,json,py}" # extra arguments for cmake_format (optional)
 )
 endif()
 # -------------------------------------------------------------------------------------------------
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-        imgui imjson minhook d3d9 shell32 spdlog::spdlog zstd_compress nlohmann_json::nlohmann_json winmm)
+        imgui imjson minhook d3d9 shell32 spdlog::spdlog zstd_compress nlohmann_json::nlohmann_json winmm Threads::Threads)
 if(MEMENU_GAME)
   target_link_libraries(${PROJECT_NAME} PRIVATE mirage::sdk UnrealLib::Linker lua::lua toml11::toml11)
   target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/api)   # mirage/api.h: the mod ABI

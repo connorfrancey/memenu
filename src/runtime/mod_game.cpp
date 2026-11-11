@@ -4,6 +4,7 @@
 #include "game/object_cache.h"
 #include "game/uobject.h"
 #include "runtime/call.h"
+#include "runtime/detours.h"
 #include "runtime/fhooks.h"
 #include "runtime/mod_internal.h"
 #include "runtime/reflect.h"
@@ -161,7 +162,7 @@ namespace mirage::mods
 		{
 			const auto subs = g_subs.load(std::memory_order_acquire);
 			if (subs->empty()) return;
-			static const char* const kNames[] = {"tick", "level load", "death", "player state", "key"};
+			static const char* const kNames[] = {"tick", "level load", "death", "player state", "key", "state restored"};
 			for (const auto& s : *subs) {
 				if (s->type != e.type || !s->active.load(std::memory_order_relaxed)) continue;
 				EventArgs args{s.get(), &e};
@@ -191,6 +192,8 @@ namespace mirage::mods
 			Republish();
 		}
 		mod.subscriptions.clear();
+		for (int id : mod.detours) detours::Remove(id);
+		mod.detours.clear();
 	}
 
 	void DispatchTick(float seconds)
@@ -223,6 +226,8 @@ namespace mirage::mods
 		previous = e.value;
 		Dispatch(e);
 	}
+	void DispatchStateRestored() { Dispatch(Event(MIRAGE_EVENT_STATE_RESTORED)); }
+
 	void DispatchKey(int vk)
 	{
 		MirageEvent e = Event(MIRAGE_EVENT_KEY);
@@ -234,7 +239,7 @@ namespace mirage::mods
 	{
 		MirageSubscription* MIRAGE_CALL EventSubscribe(MirageMod* mod, int32_t type, MirageEventFn fn, void* user)
 		{
-			if (!mod || !fn || type < MIRAGE_EVENT_TICK || type > MIRAGE_EVENT_KEY) return nullptr;
+			if (!mod || !fn || type < MIRAGE_EVENT_TICK || type > MIRAGE_EVENT_STATE_RESTORED) return nullptr;
 			auto s = std::make_shared<Subscription>();
 			s->mod = mod;
 			s->type = type;
@@ -368,6 +373,30 @@ namespace mirage::mods
 		uint32_t MIRAGE_CALL ObjectClassName(MirageObject* object, char* buffer, uint32_t capacity)
 		{
 			return CopyOut(object && Alive(Obj(object)) ? reflect::ClassNameOf(Obj(object)) : std::string(), buffer, capacity);
+		}
+
+		// A detour's handle is its id (never 0), as a pointer
+		MirageDetour* MIRAGE_CALL DetourCreate(MirageMod* mod, void* target, void* detour, int32_t priority, void** original)
+		{
+			if (!mod) return nullptr;
+			std::string error;
+			const int id = detours::Add(target, detour, priority, original, mod->id, &error);
+			if (!id) {
+				spdlog::error("[mod {}] detour_create: {}", mod->id, error);
+				return nullptr;
+			}
+			mod->detours.push_back(id);
+			return reinterpret_cast<MirageDetour*>(static_cast<std::uintptr_t>(id));
+		}
+
+		void MIRAGE_CALL DetourRemove(MirageDetour* detour)
+		{
+			if (detour) detours::Remove(static_cast<int>(reinterpret_cast<std::uintptr_t>(detour)));
+		}
+
+		void* MIRAGE_CALL FindPattern(const char* pattern, const char* mask)
+		{
+			return pattern && mask ? game::FindPattern(pattern, mask) : nullptr;
 		}
 
 		int32_t MIRAGE_CALL ObjectIsA(MirageObject* object, const char* className)

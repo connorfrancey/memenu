@@ -3389,6 +3389,19 @@ void TestMirageModHooks()
     if (nativeUs > 5.0) p.Problem("a native hook adds " + std::to_string(nativeUs) + " us a call (budget 5)");
     if (luaUs > 50.0) p.Problem("a Lua hook adds " + std::to_string(luaUs) + " us a call (budget 50)");
     s.notes.push_back("map " + (lastMap ? lastMap->Get() : std::string()) + ", " + std::to_string(ticks ? ticks->Get() : 0) + " tick events");
+#if MEMENU_FEATURE_TAS
+    // A TAS rewind puts back the game's memory only: no mod's code or data is ever counted as the game's
+    {
+        std::size_t mods = 0;
+        for (const auto& m : tas::memmap::Modules()) {
+            if (m.path.find("\\selftest-mods\\") == std::string::npos) continue;
+            ++mods;
+            if (m.game) p.Problem(m.name + " (a mod) is counted as the game's memory: a TAS rewind would put it back");
+        }
+        if (mods == 0) p.Problem("no mod DLL was found among the process's modules");
+        else s.notes.push_back(std::to_string(mods) + " mod DLLs, none in TAS snapshots");
+    }
+#endif
     p.Check(1, true);
     End(s);
 }

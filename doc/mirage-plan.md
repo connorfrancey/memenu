@@ -230,6 +230,45 @@ take the game down).
 cleanly; the `ProcessEvent` hook costs under a set budget per call for unhooked functions and for a Lua hook (measured
 in the performance module).
 
+**Status (2026-11-11): done.** Function hooks (`src/runtime/fhooks`): every script function runs through
+`UObject::ProcessInternal`, whether it is called from script, from native code or through ProcessEvent, so that one
+function is detoured. A lock-free table keyed by the frame's function sends hooked calls to their hooks, and an
+unhooked call costs a hash and a load (measured: 0.7-0.8 ns). Hooks run before, after or instead of the function, in
+priority order, and see its parameters by name (`runtime/reflect`: properties, struct members and parameters through
+the engine's own UProperty objects, by dotted path). Native functions get a per-function thunk in `UFunction::Func`:
+before and after only, without parameters. One with a native index is called straight from bytecode and only reaches
+its hooks through ProcessEvent, so its code is detoured instead. The offsets are found in the game: `Func` at 0xAC
+(where every script function holds ProcessInternal's address), and the frame's `Node` at 0x4 and `Locals` at 0x10.
+
+Mods get these by appending to ABI v1: events (tick, level load, death, player state, key, and a TAS rewind putting the
+game's memory back), function hooks, calls, game objects with values by path, and managed native detours
+(`runtime/detours`). Several mods can chain on one function in priority order; every `original` is relinked as
+detours come and go, two mods on one target is logged, and a function the menu hooks itself is refused. 3 unit tests
+cover the chains. A mod's hooks, events and detours run like its module callbacks: only while it runs, counted for
+reloads, guarded against crashes, and removed when it unloads, reloads or crashes. In Lua: `mirage.on`, `mirage.hook`
+(`call.params.CullDistance = 1`, `call:skip()`), `mirage.pawn() / controller() / world() / find()` with object and
+struct proxies (`pawn.Location.Z = 500`), and `mirage.call`. In C++: `mirage::On`, `mirage::Hook`,
+`mirage::Object`, `mirage::Call`, `mirage::Detour`, `mirage::FindPattern`.
+
+TAS: snapshots never hold a mod's memory. Its DLLs, the copies hot reload runs, its heaps and its allocations are under
+`memenu\`, which the memory map leaves out (checked by the self-test). Its changes to the game's own memory are rewound
+with the game. The `state_restored` event tells mods to look their objects up again. Rewinding a mod's own state was
+the "opt in" idea; it isn't done, because a mod can rebuild its state from that event.
+
+The check, self-test "Mirage hooks from mods" (`tests/mods/hook-native`, `hook-lua`): both hook
+`CheckMaxEffectDistance` while their modules are on, and run in priority order (each turns `CullDistance` into
+x * 10 + its number: 1, then 12). They keep that through three hot reloads of both, leave no hook behind when off, read
+the pawn's `Location.Z` by name, and get tick and level load events. Costs, also shown in the Performance module: a
+call through ProcessEvent takes 0.18 us, a native hook adds 0.28 us (budget 5) and a Lua hook 1.12 us (budget 50).
+Self-test "Mirage function hooks" covers the core: priority, parameters read and changed, after hooks, replace, a
+call from script, removal.
+
+Seen while testing: 2 of about 12 full runs this session crashed the game in `ntdll`'s heap code. One was during the
+Speedrun timer level restart, the other during the TAS workflow, a free in the game's CRT heap (MSVCR80) with the AMD
+driver on the stack, before any hook or detour existed. The runs around them passed. Not explained yet; a TAS rewind of
+the game's CRT heap while the driver holds memory in it is the first suspect. To look into separately, against a build
+from before Mirage.
+
 ### 7. Content mods through UnrealLib
 
 - A virtual file system for `TdGame\CookedPC`: the engine's package opens are redirected to overlay packages that

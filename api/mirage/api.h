@@ -100,6 +100,7 @@ typedef struct MirageObject MirageObject;           /* A game object (an Actor, 
 typedef struct MirageCall MirageCall;               /* A call of a game function: one a hook sees, or one the mod makes */
 typedef struct MirageHook MirageHook;               /* A function hook */
 typedef struct MirageSubscription MirageSubscription;   /* An event subscription */
+typedef struct MirageDetour MirageDetour;           /* A detour of native code */
 
 /* A value read from or written to a game object or a call, by dotted path ("Location.Z", "NewLocation", "ReturnValue") */
 typedef enum MirageValueType {
@@ -131,6 +132,9 @@ typedef void(MIRAGE_CALL* MirageHookFn)(void* user, MirageCall* call);
 #define MIRAGE_EVENT_DEATH 2          /* Game thread: value 0 the player died (before the game handles it), 1 after */
 #define MIRAGE_EVENT_PLAYER_STATE 3   /* Game thread: the player's move state changed: value = new EMovement, value2 = old */
 #define MIRAGE_EVENT_KEY 4            /* A key went down (the game window's thread): value = virtual-key code */
+#define MIRAGE_EVENT_STATE_RESTORED 5 /* Game thread: the TAS put back a memory snapshot. The game's memory went back in
+                                         time (a mod's own memory didn't): every game object kept from before may be
+                                         another or gone, so look them up again */
 typedef struct MirageEvent {
     uint32_t size;              /* sizeof(MirageEvent) */
     int32_t type;               /* MIRAGE_EVENT_* */
@@ -238,6 +242,15 @@ typedef struct MirageApi {
     uint32_t(MIRAGE_CALL* object_name)(MirageObject* object, char* buffer, uint32_t capacity);         /* "TdPlayerPawn_0" */
     uint32_t(MIRAGE_CALL* object_class_name)(MirageObject* object, char* buffer, uint32_t capacity);   /* "TdPlayerPawn" */
     int32_t(MIRAGE_CALL* object_is_a)(MirageObject* object, const char* class_name);   /* An instance of it or a subclass */
+
+    /* ---- Native code (step 6): detours of the game's functions, chained by the runtime ----------------------------
+     * Several mods may detour one function: they run by priority, higher first, each calling its *original (the next
+     * detour, or the real function); the runtime keeps every *original right as detours come and go, so keep it in a
+     * variable that lives as long as the mod. A function the menu hooks itself is refused. Removed at the mod's unload. */
+    MirageDetour*(MIRAGE_CALL* detour_create)(MirageMod* mod, void* target, void* detour, int32_t priority, void** original);
+    void(MIRAGE_CALL* detour_remove)(MirageDetour* detour);
+    /* A byte pattern in the game's code ('x' in `mask` must match, '?' is any byte), NULL if not found */
+    void*(MIRAGE_CALL* find_pattern)(const char* pattern, const char* mask);
 } MirageApi;
 
 /* The runtime has `field` (a mod built against a newer header, running on an older runtime) */

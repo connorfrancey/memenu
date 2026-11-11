@@ -22,6 +22,7 @@
 #if MEMENU_GAME
 #include "game/game.h"
 #include "game/levels.h"
+#include "runtime/detours.h"
 #include "runtime/fhooks.h"
 #include "runtime/mod_game.h"
 #include "runtime/mods.h"
@@ -111,6 +112,8 @@ static void Run(HMODULE module)
             game::OnPlayerDeath([](bool after) { mirage::mods::DispatchDeath(after); });
             game::OnPlayerStateChange([] { mirage::mods::DispatchPlayerState(); return false; });
             modules::SetKeyListener([](int vk) { mirage::mods::DispatchKey(vk); });
+            // A TAS rewind: the game's memory went back (the mods' own didn't: tas/memory_map.h leaves memenu\ out)
+            game::OnStateRestored([] { mirage::mods::DispatchStateRestored(); });
             STARTUP_STEP(levels::Init());
             STARTUP_STEP(mirage::mods::LoadPhase(mirage::mods::Phase::Engine));   // The game layer is up
             // Hot reload: mods whose files changed, checked twice a second (game thread, between the modules' ticks)
@@ -160,6 +163,7 @@ static void Run(HMODULE module)
 #endif
 #if MEMENU_GAME
         mirage::hooks::RemoveAll();  // Functions back to their own code before this DLL goes
+        mirage::detours::RemoveAll();   // Mods' detours, before MinHook is shut down
 #endif
         hooks::Uninstall();
 #if MEMENU_GAME

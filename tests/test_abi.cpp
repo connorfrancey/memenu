@@ -83,13 +83,16 @@ MIRAGE_AT(object_set, 196);
 MIRAGE_AT(object_name, 200);
 MIRAGE_AT(object_class_name, 204);
 MIRAGE_AT(object_is_a, 208);
+MIRAGE_AT(detour_create, 212);
+MIRAGE_AT(detour_remove, 216);
+MIRAGE_AT(find_pattern, 220);
 // Size of ABI v1's table: a later version only makes it larger
-static_assert(sizeof(MirageApi) >= 212);
+static_assert(sizeof(MirageApi) >= 224);
 static_assert(sizeof(MirageValue) == 272 && offsetof(MirageValue, text) == 16);
 static_assert(sizeof(MirageEvent) == 24 && offsetof(MirageEvent, number) == 16 && offsetof(MirageEvent, text) == 20);
 static_assert(MIRAGE_HOOK_BEFORE == 0 && MIRAGE_HOOK_AFTER == 1 && MIRAGE_HOOK_REPLACE == 2);
 static_assert(MIRAGE_EVENT_TICK == 0 && MIRAGE_EVENT_LEVEL_LOAD == 1 && MIRAGE_EVENT_DEATH == 2 &&
-              MIRAGE_EVENT_PLAYER_STATE == 3 && MIRAGE_EVENT_KEY == 4);
+              MIRAGE_EVENT_PLAYER_STATE == 3 && MIRAGE_EVENT_KEY == 4 && MIRAGE_EVENT_STATE_RESTORED == 5);
 static_assert(MIRAGE_VALUE_NONE == 0 && MIRAGE_VALUE_TEXT == 5 && MIRAGE_VALUE_STRUCT == 6);
 static_assert(MIRAGE_SETTING_BOOL == 0 && MIRAGE_SETTING_INT == 1 && MIRAGE_SETTING_FLOAT == 2 &&
               MIRAGE_SETTING_STRING == 3 && MIRAGE_SETTING_CHOICE == 4 && MIRAGE_SETTING_KEY == 5);

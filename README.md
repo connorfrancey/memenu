@@ -728,7 +728,13 @@ MirrorsEdge.exe
    settings and state; native ones do too with `hot_reload = true`. A mod that crashes is stopped and named, the rest go
    on, and it isn't loaded next time (`crashes.toml`). Self-test "Mirage lifecycle".
 
-**Next:** hooks and events, content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
+6. **Hooks and events:** mods hook the game's UnrealScript functions before, after or instead of them, with their
+   parameters by name (`call.params.CullDistance = 1`). They get events (tick, level load, death, player state, keys,
+   TAS rewinds), read and write game objects by name (`mirage.pawn().Location.Z = 500`), and native mods chain detours
+   on the game's code. An unhooked call costs under a nanosecond; a Lua hook adds about 1 us. Self-tests "Mirage
+   function hooks" and "Mirage hooks from mods".
+
+**Next:** content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
 
 ### Testing
 

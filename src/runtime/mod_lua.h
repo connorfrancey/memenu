@@ -16,7 +16,7 @@
 // The game (step 6): mirage.pawn() / controller() / world() / find("Class Engine.Actor") give objects whose properties
 // read and write by name, structs too (pawn.Location.Z = pawn.Location.Z + 100, pawn.Velocity = {X = 0, Y = 0, Z = 0});
 // mirage.name / class / is_a(object, "Pawn"); mirage.call(object, "Function", { Param = value }) runs a function.
-// mirage.on("tick" | "level_load" | "death" | "player_state" | "key", fn) subscribes to an event; mirage.hook(
+// mirage.on("tick" | "level_load" | "death" | "player_state" | "key" | "state_restored", fn) subscribes to an event; mirage.hook(
 // "Engine.Actor.SetLocation", function(call) ... end, { when = "before" | "after" | "replace", priority = 0 }) hooks a
 // function: call.object, call.params (call.params.NewLocation.Z = 0, call.params.ReturnValue), call.func,
 // call:skip(). Both return a handle with :remove(); a callback that errors is removed (and logged).

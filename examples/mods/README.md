@@ -95,3 +95,31 @@ logged and its module is switched off.
   game runs. Its `OnDisable` must undo everything the mod changed.
 - If a mod crashes, it is stopped and named in the log, and the rest of the menu goes on. The crash is written to
   `mods\crashes.toml`, and the mod isn't loaded again until its entry there is deleted.
+
+## The game: objects, events and hooks
+
+Lua:
+
+```lua
+local pawn = mirage.pawn()                       -- the player (nil while loading); mirage.controller(), mirage.world()
+pawn.Location.Z = pawn.Location.Z + 500          -- properties and struct members by name
+pawn.Velocity = { X = 0, Y = 0, Z = 0 }          -- a struct from a table
+mirage.call(pawn, "SetLocation", { NewLocation = pawn.Location })   -- a function, with its parameters by name
+
+mirage.on("level_load", function(finished, map) if finished then mirage.log("now in", map) end end)
+-- events: tick (seconds), level_load (finished, map), death (after), player_state (new, old), key (vk), state_restored
+
+local hook = mirage.hook("Engine.Actor.CheckMaxEffectDistance", function(call)
+    call.params.CullDistance = 0                 -- before the function: change its parameters...
+    -- call:skip()                               -- ...or don't run it
+end, { when = "before", priority = 10 })         -- "after" sees call.params.ReturnValue; "replace" sets it
+hook:remove()
+```
+
+C++ (`mirage.hpp`): `mirage::Object::Pawn().Set("Location.Z", 500.f)`, `mirage::On(MIRAGE_EVENT_TICK, ...)`,
+`mirage::Hook("Engine.Actor.SetLocation", MIRAGE_HOOK_BEFORE, 0, [](mirage::Call& c) { ... })`, and for native code
+`mirage::FindPattern(...)` and `mirage::Detour(target, &Mine, priority, &original)`. Several mods can detour one
+function, and they run by priority.
+
+Hooks run on the game thread. A mod's hooks, events and detours go away when it unloads, reloads or crashes. A TAS
+rewind puts the game's memory back but never a mod's: after `state_restored`, look game objects up again.

@@ -30,6 +30,9 @@ namespace mirage::mods::game_api
 	uint32_t MIRAGE_CALL ObjectName(MirageObject* object, char* buffer, uint32_t capacity);
 	uint32_t MIRAGE_CALL ObjectClassName(MirageObject* object, char* buffer, uint32_t capacity);
 	int32_t MIRAGE_CALL ObjectIsA(MirageObject* object, const char* className);
+	MirageDetour* MIRAGE_CALL DetourCreate(MirageMod* mod, void* target, void* detour, int32_t priority, void** original);
+	void MIRAGE_CALL DetourRemove(MirageDetour* detour);
+	void* MIRAGE_CALL FindPattern(const char* pattern, const char* mask);
 }
 
 namespace mirage::mods
@@ -40,4 +43,5 @@ namespace mirage::mods
 	void DispatchDeath(bool after);									// Game thread
 	void DispatchPlayerState();										// Game thread: reads the move state itself
 	void DispatchKey(int vk);										// The window's thread
+	void DispatchStateRestored();									// Game thread: a TAS snapshot was put back
 }

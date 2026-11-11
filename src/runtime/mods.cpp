@@ -613,6 +613,7 @@ namespace mirage::mods
 			game_api::CallBegin, game_api::CallInvoke, game_api::CallEnd,
 			game_api::PlayerPawn, game_api::PlayerController, game_api::WorldInfo, game_api::ObjectFind,
 			game_api::ObjectGet, game_api::ObjectSet, game_api::ObjectName, game_api::ObjectClassName, game_api::ObjectIsA,
+			game_api::DetourCreate, game_api::DetourRemove, game_api::FindPattern,
 		};
 
 		// ---- Loading -----------------------------------------------------------------------------------------------

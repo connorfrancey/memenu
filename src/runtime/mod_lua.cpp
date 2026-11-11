@@ -791,7 +791,7 @@ namespace mirage::mods
 	int LuaMod::On(lua_State* L)
 	{
 		LuaMod& self = Self(L);
-		static const char* const kEvents[] = {"tick", "level_load", "death", "player_state", "key", nullptr};
+		static const char* const kEvents[] = {"tick", "level_load", "death", "player_state", "key", "state_restored", nullptr};
 		const int type = luaL_checkoption(L, 1, nullptr, kEvents);
 		luaL_checktype(L, 2, LUA_TFUNCTION);
 		auto c = std::make_unique<Callback>();

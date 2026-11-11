@@ -58,6 +58,7 @@ struct MirageMod
 	// before a hook was removed may still hold one.
 	std::vector<std::unique_ptr<mirage::mods::HookRecord>> hooks;
 	std::vector<std::shared_ptr<mirage::mods::Subscription>> subscriptions;
+	std::vector<int> detours;							// mirage::detours ids, removed with its hooks
 };
 
 namespace mirage::mods

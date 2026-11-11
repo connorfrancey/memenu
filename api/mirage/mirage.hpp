@@ -439,6 +439,22 @@ namespace mirage
 		return detail::Callbacks().back().get();
 	}
 
+	// ---- Native code (step 6) ---------------------------------------------------------------------------------------
+	// A byte pattern in the game's code ('x' must match, '?' any byte), nullptr if not found
+	inline void* FindPattern(const char* pattern, const char* mask) { return Api().find_pattern(pattern, mask); }
+	// Detours `target` with `detour`; `original` (a variable that outlives the detour) is what to call for the rest of
+	// the chain. Higher priority runs first. Removed when the mod unloads. nullptr if it fails (the log says why).
+	//     static int(__thiscall* original)(void*, int);
+	//     int __fastcall Mine(void* self, void*, int x) { return original(self, x) * 2; }
+	//     mirage::Detour(target, &Mine, 0, &original);
+	// (The detour and the original may have different types: a __fastcall detour of a __thiscall function.)
+	template <class F, class G>
+	MirageDetour* Detour(void* target, F* detour, int32_t priority, G** original)
+	{
+		return Api().detour_create(Mod(), target, reinterpret_cast<void*>(detour), priority, reinterpret_cast<void**>(original));
+	}
+	inline void RemoveDetour(MirageDetour* d) { Api().detour_remove(d); }
+
 	// ---- Registration ----------------------------------------------------------------------------------------------
 	namespace detail
 	{

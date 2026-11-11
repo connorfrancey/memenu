@@ -21,6 +21,8 @@ add_executable(memenu_tests
         test_semver.cpp
         test_manifest.cpp
         test_abi.cpp
+        test_resolve.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/resolve.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/semver.cpp
         ${CMAKE_SOURCE_DIR}/src/runtime/manifest.cpp
         ${CMAKE_SOURCE_DIR}/src/render/mesh.cpp

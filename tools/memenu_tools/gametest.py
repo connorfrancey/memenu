@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import devtest
+from . import devtest, hangmon
 
 LINUX = sys.platform.startswith("linux")
 if not LINUX:
@@ -101,6 +101,7 @@ class Result:
     crashes: list[devtest.Crash] = field(default_factory=list)
     log_errors: list[str] = field(default_factory=list)
     exit_reason: str = ""
+    hang: "hangmon.Hang | None" = None   # The game stopped making progress and was ended (tools/memenu_tools/hangmon.py)
     seconds: float = 0.0
     environment: str = ""     # Not the menu's fault (the game or Steam didn't get going): worth another try
 
@@ -281,6 +282,7 @@ def run(game_dir: Path, timeout: float, on_progress=None, close: bool = True) ->
         raise
     res = Result()
     last_current = None
+    watch = None if LINUX else hangmon.HangWatch(proc.pid, menu_dir / "logs" / "memenu.log", menu_dir / "logs")
     while True:
         time.sleep(0.25)
         data = _read(result_file)
@@ -290,6 +292,10 @@ def run(game_dir: Path, timeout: float, on_progress=None, close: bool = True) ->
             if on_progress and res.current != last_current:
                 last_current = res.current
                 on_progress(res)
+        hang = watch.check(res.current) if watch and not res.finished else None
+        if watch and watch.finished is not None and not res.finished:
+            # The menu logged the end but its result file says otherwise (a write lost): the log decides
+            res.finished, res.passed = True, watch.finished
         if proc.poll() is not None:
             finished = (_read(result_file) or {}).get("finished", False)
             res.exit_reason = ("game closed by the self-test" if finished and proc.returncode == 0
@@ -310,6 +316,12 @@ def run(game_dir: Path, timeout: float, on_progress=None, close: bool = True) ->
             except subprocess.TimeoutExpired:
                 proc.kill()
                 res.exit_reason = "the game did not close 30 s after the self-test finished: killed"
+            break
+        if hang and not res.finished:
+            # Stuck: what is known about it written down, then the game ended (not the whole timeout, not the failsafe)
+            res.hang = watch.record(hang)
+            res.exit_reason = f"{res.hang.describe()}: game ended"
+            proc.kill()
             break
         if time.monotonic() - t0 > timeout:
             res.exit_reason = f"timed out after {timeout:.0f} s: game killed"

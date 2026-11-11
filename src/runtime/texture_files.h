@@ -69,5 +69,8 @@ namespace mirage::textures
 	};
 	// `package` with every replacement it holds a copy of rewritten (NeverStream, all mips inline, sizes and format
 	// from the image). Throws std::runtime_error if the package itself can't be read or written.
-	Overlay BuildOverlay(const std::filesystem::path& package, const std::vector<Replacement>& replacements);
+	// `compress`: LZO like the original (slow: seconds per map), else uncompressed (the engine reads both; the game's
+	// own storage packages are uncompressed).
+	Overlay BuildOverlay(const std::filesystem::path& package, const std::vector<Replacement>& replacements,
+						 bool compress = false);
 }

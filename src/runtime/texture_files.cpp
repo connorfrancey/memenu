@@ -382,7 +382,7 @@ namespace mirage::textures
 		return out;
 	}
 
-	Overlay BuildOverlay(const fs::path& file, const std::vector<Replacement>& replacements)
+	Overlay BuildOverlay(const fs::path& file, const std::vector<Replacement>& replacements, bool compress)
 	{
 		Overlay result;
 		Linker linker;
@@ -475,7 +475,9 @@ namespace mirage::textures
 			}
 		}
 		WriteOptions options;
-		options.compression = compression_method_from_flags(pkg.summary().compression_flags);
+		options.compression = compress ? compression_method_from_flags(pkg.summary().compression_flags) : CompressionMethod::None;
+		// The package flag says how it is stored, apart from the chunk table: the engine trusts it
+		if (options.compression == CompressionMethod::None) model.summary.package_flags &= ~PackageFlag::Compressed;
 		result.bytes = write_package(model, options);
 		for (const Edit& e : edits) result.replaced.push_back(e.path);
 		return result;

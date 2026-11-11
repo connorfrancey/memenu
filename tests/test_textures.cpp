@@ -173,7 +173,10 @@ TEST(Textures, RewritesAMapPackage)
 	linker.add_search_path(cooked);
 	Package rewritten;
 	rewritten.load_from_memory(overlay.bytes, original.name());
-	EXPECT_EQ(rewritten.summary().compression_flags, original.summary().compression_flags);
+	EXPECT_FALSE(rewritten.summary().is_compressed());		// Uncompressed: quick to write while the game waits
+	EXPECT_EQ(rewritten.summary().package_flags & PackageFlag::Compressed, 0u) << "the flag must say so too";
+	EXPECT_EQ(rewritten.summary().package_flags | PackageFlag::Compressed,
+			  original.summary().package_flags | PackageFlag::Compressed);	// Nothing else changed
 	ASSERT_EQ(rewritten.exports().size(), original.exports().size());
 	const Package& added = linker.add(std::move(rewritten));
 

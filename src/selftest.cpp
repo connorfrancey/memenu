@@ -22,6 +22,8 @@
 #include "runtime/call.h"
 #include "runtime/engine_calls.h"
 #include "runtime/fhooks.h"
+#include "runtime/file_redirect.h"
+#include "runtime/texture_overlays.h"
 #include "runtime/reflect.h"
 #include "runtime/layout.h"
 #include "runtime/lua_vm.h"
@@ -3474,6 +3476,83 @@ void TestMirageContent()
     End(s);
 }
 
+// Mirage step 7: a texture replaced by a content mod (examples/mods/retexture: one PNG, on from the start). The level
+// loaded before this step opened the packages holding the texture as rewritten copies, made on demand: the texture
+// object has the image's size. Turned off, a package the game already opened keeps its copy for the session (the
+// engine keeps its files open: switching one under it hung the loader), so reloading the level works and still shows
+// the mod; a package not opened yet is the original again, and turned back on, it would be a copy.
+void TestMirageTextures()
+{
+    Step& s = Begin("Mirage textures");
+    Probe p(s);
+    Module* m = modules::Find("Retexture");
+    if (!m) {
+        p.Problem("the Retexture module (examples/mods/retexture) is missing");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    constexpr const char* kTexture = "Texture2D M_Rooftops.Textures.T_Roof_02_D";
+    const auto size = [&] {
+        int w = -1, h = -1;
+        OnGameThread([&] {
+            auto* t = game::FindObject<Classes::UObject>(kTexture);
+            if (!t) return;
+            w = mirage::reflect::GetInt(mirage::reflect::Resolve(t->Class, t, "SizeX"));
+            h = mirage::reflect::GetInt(mirage::reflect::Resolve(t->Class, t, "SizeY"));
+        });
+        return std::pair{w, h};
+    };
+    const auto describe = [](std::pair<int, int> wh) { return std::to_string(wh.first) + "x" + std::to_string(wh.second); };
+    const auto set = [&](bool on) {
+        OnRenderThread([m, on] { m->SetEnabled(on); });
+        WaitTicks(3);
+        return mirage::textures::WaitIdle(120.0);
+    };
+    const auto reload = [&] {
+        const int loads = g_loadsFinished.load();
+        const auto maps = levels::Maps();
+        for (int i = 0; i < static_cast<int>(maps.size()); ++i)
+            if (Lower(maps[i].label).find(Lower(g_options.map)) != std::string::npos) {
+                OnGameThread([i] { levels::Load(i, g_options.checkpoint, levels::Method::Game, false); });
+                break;
+            }
+        if (!WaitFor(120.0, [&] { return g_loadsFinished.load() > loads && !game::IsLoading(); })) return false;
+        WaitPlayerReady(30.0);
+        return true;
+    };
+    const std::filesystem::path unopened = mirage::packages::CookedDir() / "Maps" / "SP09" / "Scraper_Roof.me1";
+
+    if (!set(true)) p.Problem("the texture index took more than 2 minutes");
+    const auto st = mirage::textures::GetStatus("retexture");
+    for (const auto& problem : st.problems) p.Problem(problem);
+    char line[200];
+    std::snprintf(line, sizeof line, "index: %zu packages (%.1f s); the texture is in %d of them; %llu copies made "
+                  "(%.1f s), %llu package opens from copies", st.indexedPackages, st.indexSeconds, st.packages,
+                  static_cast<unsigned long long>(mirage::files::Built()), st.buildSeconds,
+                  static_cast<unsigned long long>(mirage::files::Redirected()));
+    s.notes.push_back(line);
+    if (st.textures != 1 || st.packages < 1) p.Problem("the texture should be found in at least one package");
+
+    const auto on = size();
+    if (on != std::pair{256, 256}) p.Problem("on: the texture is " + describe(on) + ", not the mod's 256x256");
+    if (mirage::files::Redirected() == 0) p.Problem("the game opened no package from a mod copy");
+
+    set(false);
+    if (mirage::files::Redirects(unopened)) p.Problem("off: a package not opened yet (Scraper_Roof) is still redirected");
+    if (mirage::files::Held() == 0) p.Problem("off: no opened package is held (the level's packages should keep their copies)");
+    if (!reload()) p.Problem("off: the level didn't reload (the loader must not see a package change files)");
+    const auto held = size();
+    if (held != std::pair{256, 256}) p.Problem("off, reloaded: the texture is " + describe(held) + ", not the held copy's 256x256");
+    s.notes.push_back("off: " + std::to_string(mirage::files::Held()) + " opened packages keep their copies until a restart; "
+                      "reloaded fine, texture " + describe(held));
+
+    set(true);      // As the player would have it
+    if (!mirage::files::Redirects(unopened)) p.Problem("on again: Scraper_Roof (not opened yet) would not be redirected");
+    p.Check(1, true);
+    End(s);
+}
+
 // Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
 // what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
 // hot reload ten times in a row (Lua and native, settings and state kept, no memory left behind), and the file watcher.
@@ -3892,6 +3971,7 @@ const Named* FeatureList()
         {"Mirage lifecycle", &TestMirageLifecycle, false},
         {"Mirage hooks from mods", &TestMirageModHooks, false},
         {"Mirage content", &TestMirageContent, false},
+        {"Mirage textures", &TestMirageTextures, false},
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},

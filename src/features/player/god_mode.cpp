@@ -2,7 +2,7 @@
 #include "game/game.h"
 #include "game/player_state.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 
 namespace {
 

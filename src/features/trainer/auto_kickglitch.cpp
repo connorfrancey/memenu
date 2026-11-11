@@ -4,7 +4,7 @@
 #include "game/flight.h"
 #include "game/game.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <spdlog/spdlog.h>
 
 #include <mutex>

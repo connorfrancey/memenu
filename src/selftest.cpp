@@ -54,7 +54,7 @@
 #include "tas/tas.h"
 #endif
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <cmath>
 #include <cstdio>
 #endif
@@ -2469,6 +2469,16 @@ void TestMirageLayouts()
         std::ofstream(paths::Dir() / "mirage-live-layouts.json", std::ios::trunc) << mirage::layout::ToJson(onlyLive);
         s.notes.push_back(std::to_string(onlyLive.size()) + " engine-only layouts saved to mirage-live-layouts.json");
     }
+    // The generated SDK's checks the compiler can't make (each bool's bit in its dword; offsets and sizes are
+    // static_asserts): its bitfields as MSVC packs them, against the masks the engine uses
+    {
+        std::string first;
+        if (const int failures = Classes::detail::CheckLayouts(&first))
+            p.Problem("the SDK has " + std::to_string(failures) + " bool bits where the engine doesn't (first: " +
+                      first + ")");
+        else
+            s.notes.push_back("SDK bitfields match the engine");
+    }
     if (!r.mismatches.empty())
         p.Problem(std::to_string(r.mismatches.size()) + " structs differ from the engine (first: " +
                   r.mismatches[0].path + ": " + r.mismatches[0].what + "); all in " + file.string());
@@ -3035,9 +3045,20 @@ const std::set<std::string> kDrawsHud = {"Crosshair", "Show FPS", "Watermark", "
 // What the menu draws with its window closed (the modules' HUDs), a few frames after a change.
 unsigned HudVertices()
 {
+    hooks::DescribeDrawLists(true);
     OnRenderThread([] { gui::visible = false; });
+    // Until the count settles: in fast mode a few ticks can pass before the next frame is drawn, and the frame drawn
+    // just before a module switched off still holds what it drew (a HUD that changes every frame, like the speedometer's
+    // digits, never settles: then the last count)
     WaitTicks(3);
-    return hooks::MenuVertices();
+    unsigned last = hooks::MenuVertices();
+    for (int i = 0; i < 20; ++i) {
+        WaitTicks(3);
+        const unsigned now = hooks::MenuVertices();
+        if (now == last) break;
+        last = now;
+    }
+    return last;
 }
 
 void TestModule(Module& m)
@@ -3047,9 +3068,22 @@ void TestModule(Module& m)
     Probe p(s);
     const bool drawsHud = kDrawsHud.count(m.Name()) != 0;
     unsigned hudBefore = 0;
+    std::string listsBefore;
+    // While a HUD is measured, the other HUDs whose text changes as the game runs (Game Status counts ticks, events and
+    // health, Collision View the volumes the player is in) are off: they made "still draws after switching off" fail
+    // with nothing left of the module's own
+    std::vector<Module*> quieted;
+    if (drawsHud) {
+        std::set<std::string> noisy(kDrawsHud.begin(), kDrawsHud.end());
+        noisy.insert({"Game Status", "Info Lines", "Tool Overlay", "Collision View"});
+        for (const std::string& name : noisy)
+            if (Module* other = modules::Find(name); other && other != &m && other->Enabled()) quieted.push_back(other);
+        OnRenderThread([&quieted] { for (Module* q : quieted) q->SetEnabled(false); });
+    }
     if (drawsHud) {
         OnRenderThread([&m] { if (m.Enabled()) m.SetEnabled(false); });
         hudBefore = HudVertices();
+        listsBefore = hooks::MenuDrawLists();
         OnRenderThread([] { gui::visible = true; });
     }
     const auto runsBefore = [&] { const auto e = sched::Snapshot(); const auto* v = FindEntry(e, m.Name()); return v ? v->runs : 0; }();
@@ -3136,8 +3170,10 @@ void TestModule(Module& m)
         const unsigned hudOff = HudVertices();
         if (hudOff > hudBefore)
             p.Problem("still draws after switching off (" + std::to_string(hudOff) + " vertices, " +
-                      std::to_string(hudBefore) + " before it was on)");
+                      std::to_string(hudBefore) + " before it was on; now: " + hooks::MenuDrawLists() +
+                      "; before: " + listsBefore + ")");
         OnRenderThread([] { gui::visible = true; });
+        OnRenderThread([&quieted] { for (Module* q : quieted) q->SetEnabled(true); });
     }
     OnRenderThread([&m] { m.expanded = false; });
     WaitTicks(3);   // OnDisable hands its cleanup to the next tick

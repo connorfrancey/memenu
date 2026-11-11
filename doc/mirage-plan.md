@@ -106,7 +106,7 @@ Flight's collision mode calls MoveSmooth, which now runs, not yet covered by a t
 **Milestone:** the generated SDK compiles with zero warnings; the menu builds on it with no mmultiplayer headers left;
 `game-test` passes; a report lists every layout the old SDK had wrong.
 
-**Status (2026-11-10): the generator is done; the menu still uses the old SDK.** `memenu sdk` builds and runs
+**Status (2026-11-10): done.** `memenu sdk` builds and runs
 `mirage_sdkgen` (`tools/sdkgen/`, configured by `sdkgen.toml`, read with toml11) and compiles what it writes. Inputs:
 the layouts computed from the packages (the same `runtime/computed_layout.cpp` the self-test proves) plus
 `engine-layouts.json`, what only the engine knows (601 intrinsic and native-only types, saved by the self-test "Mirage
@@ -116,8 +116,12 @@ time (`detail::CheckLayouts`). `build/sdk-reference/` holds the decompiled scrip
 placeholders), the LuaLS stubs and `old-sdk-report.md`. The report lays out the old SDK's C++ the way MSVC does under
 its `pack(4)` and compares it with the engine: 197 classes, 16 structs and 6,002 parameter structs wrong (IsInState's
 return value at 0x9 instead of 0xC, SetMove's parameters 4 bytes instead of 16, the intrinsic classes too small).
-Known gap: two HTTPDownload properties lie inside its native base's opaque block and can't be declared. Left: move the
-menu onto `sdk/` and drop mmultiplayer, then `game-test`.
+Known gap: two HTTPDownload properties lie inside its native base's opaque block and can't be declared. The menu builds on
+`sdk/` (committed; mmultiplayer is only downloaded for the report), with one source change (`StaticMesh` is now typed:
+intrinsic classes are named by their import). The full `game-test` passes, and "Mirage layouts" also runs the SDK's
+bitfield checks in the game. The "still draws after switching off" check had been failing for Kickglitch Helper
+before this step too: Game Status and Collision View text changed under it, so they are switched off while a HUD is
+measured.
 
 ### 4. Mod format and ABI v1
 

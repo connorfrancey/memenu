@@ -75,6 +75,9 @@ namespace
     int g_stallQuiet = 0;                       // DrawWhileStalled calls in a row without an EndScene in between
     std::atomic<unsigned> g_stalledFrames{0};   // hooks::StalledFrames()
     std::atomic<unsigned> g_menuVertices{0};    // hooks::MenuVertices()
+    std::atomic<bool> g_describeLists{false};   // hooks::DescribeDrawLists
+    std::mutex g_drawListsMutex;
+    std::string g_drawLists;
 
     std::mutex g_renderQueueMutex;              // hooks::RunOnRenderThread
     std::vector<std::function<void()>> g_renderQueue;
@@ -445,6 +448,18 @@ namespace
         ImGui::EndFrame();
         ImGui::Render();
         g_menuVertices.store(static_cast<unsigned>(ImGui::GetDrawData()->TotalVtxCount), std::memory_order_relaxed);
+        if (g_describeLists.load(std::memory_order_relaxed)) {
+            std::string lists;
+            const ImDrawData* data = ImGui::GetDrawData();
+            for (int i = 0; i < data->CmdListsCount; ++i) {
+                const ImDrawList* l = data->CmdLists[i];
+                if (l->VtxBuffer.Size == 0) continue;
+                if (!lists.empty()) lists += ", ";
+                lists += (l->_OwnerName ? l->_OwnerName : "?") + std::string(" ") + std::to_string(l->VtxBuffer.Size);
+            }
+            std::lock_guard lock(g_drawListsMutex);
+            g_drawLists = std::move(lists);
+        }
         {
             PROF_ZONE("ImGui draw");
             ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
@@ -829,6 +844,14 @@ bool hooks::DrawWhileStalled()
 
 unsigned hooks::StalledFrames() { return g_stalledFrames.load(std::memory_order_relaxed); }
 unsigned hooks::MenuVertices() { return g_menuVertices.load(std::memory_order_relaxed); }
+
+void hooks::DescribeDrawLists(bool on) { g_describeLists = on; }
+
+std::string hooks::MenuDrawLists()
+{
+    std::lock_guard lock(g_drawListsMutex);
+    return g_drawLists;
+}
 
 void hooks::RunOnRenderThread(std::function<void()> fn)
 {

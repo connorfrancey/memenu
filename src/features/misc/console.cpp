@@ -29,7 +29,7 @@
 #include "paths.h"
 #include "theme.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <Windows.h>
 #include <imgui.h>
 #include <imgui_internal.h>

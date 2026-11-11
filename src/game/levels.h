@@ -2,7 +2,7 @@
 #include <string>
 #include <vector>
 
-// Level / Checkpoint / Sublevel loading on top of the mmultiplayer SDK.
+// Level / Checkpoint / Sublevel loading on top of the Mirage SDK (sdk/).
 // All lists are snapshots (updated on the game thread, guarded by a mutex) so the menu thread can read them freely.
 namespace levels
 {

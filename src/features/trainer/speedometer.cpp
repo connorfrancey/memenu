@@ -4,7 +4,7 @@
 #include "gui.h"
 
 #include <imgui.h>
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 
 #include <cmath>
 #include <cstdio>

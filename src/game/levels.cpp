@@ -6,7 +6,7 @@
 #include "game/uobject.h"
 #include "runtime/engine_calls.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <spdlog/spdlog.h>
 
 #include <algorithm>

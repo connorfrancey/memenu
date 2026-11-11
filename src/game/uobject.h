@@ -1,17 +1,15 @@
 #pragma once
 // Reflection of the engine's own objects (classes, their fields), done right for this build of the game.
 //
-// The SDK (mmultiplayer's generated ME_Core_classes.hpp) has the layout of UField and UStruct wrong:
+// The game's layout (UE3 of 2008, checked in game::Init):
 //
-//                    SDK                     the game (UE3 of 2008, checked in game::Init)
-//   UField           Next        @ 0x3C      SuperField @ 0x3C, Next @ 0x40         (UField is 0x44 bytes)
-//   UStruct          SuperField  @ 0x48      ScriptText @ 0x44, CppText @ 0x48, Children @ 0x4C, PropertySize @ 0x50
+//   UField           SuperField @ 0x3C, Next @ 0x40         (UField is 0x44 bytes)
+//   UStruct          ScriptText @ 0x44, CppText @ 0x48, Children @ 0x4C, PropertySize @ 0x50
 //
-// So with the SDK's members, `field->Next` reads the field's SuperField (null: a walk over a class's properties stops
-// after the first one) and `UObject::IsA()` walks CppText instead of the parent class: it only ever matches the exact
-// class (a TdPlayerController is not "a PlayerController"). The SDK's class sizes are left alone (its generated
-// function wrappers depend on them); use these instead of IsA() / SuperField / Children / Next.
-#include <ME_SDK.hpp>
+// The old (mmultiplayer) SDK had these wrong (Next at 0x3C, SuperField at 0x48), so these helpers were the only safe
+// way to walk the reflection objects. The Mirage SDK (sdk/) has them right, and its IsA() walks SuperField; the helpers
+// stay because they read through raw offsets that game::Init verifies, and the code that uses them is checked in-game.
+#include "sdk/SDK.hpp"
 
 #include <cstdint>
 #include <cstring>

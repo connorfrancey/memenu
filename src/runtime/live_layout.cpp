@@ -4,7 +4,7 @@
 
 #include "game/uobject.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 
 #include <cstring>
 #include <unordered_set>

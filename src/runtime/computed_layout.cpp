@@ -104,6 +104,20 @@ namespace mirage::layout
 				return std::nullopt;
 			}
 
+			// The name and path of the object `index` refers to. An intrinsic class no package exports
+			// (Engine.StaticMesh) doesn't resolve: the import's own path names it.
+			void TypeOf(const Package& p, ObjectIndex index, std::string& name, std::string& path)
+			{
+				if (index.is_null()) return;
+				if (const auto target = Resolve(p, index)) {
+					name = target->package->object_name(target->index);
+					path = PathOf(*target);
+				} else if (index.is_import()) {
+					name = p.object_name(index);
+					path = p.object_path(index);
+				}
+			}
+
 			std::unique_ptr<Struct> Build(ObjectRef ref)
 			{
 				const FieldObject* f = schema_.field(ref);
@@ -187,18 +201,13 @@ namespace mirage::layout
 							break;
 						default: break;
 					}
-					if ((p.kind == Kind::Object || p.kind == Kind::Class || p.kind == Kind::Component ||
-						 p.kind == Kind::Byte || p.kind == Kind::Interface) && !data.reference.is_null())
-						if (const auto target = Resolve(*ref.package, data.reference))
-							p.type = target->package->object_name(target->index);
-					// A class property's type is the class it is limited to (class<Pawn>): reference2, not Class
-					if (p.kind == Kind::Class && !data.reference2.is_null())
-						if (const auto target = Resolve(*ref.package, data.reference2))
-							p.type = target->package->object_name(target->index);
-					if (!p.type.empty()) {
-						const ObjectIndex typeIndex = p.kind == Kind::Class && !data.reference2.is_null() ? data.reference2
-																										  : data.reference;
-						if (const auto target = Resolve(*ref.package, typeIndex)) p.typePath = PathOf(*target);
+					// The struct, class or enum a property refers to. A class property's type is the class it is
+					// limited to (class<Pawn>): reference2, not Class
+					if (p.kind == Kind::Object || p.kind == Kind::Class || p.kind == Kind::Component ||
+						p.kind == Kind::Byte || p.kind == Kind::Interface || p.kind == Kind::Struct) {
+						const ObjectIndex t = p.kind == Kind::Class && !data.reference2.is_null() ? data.reference2
+																								  : data.reference;
+						TypeOf(*ref.package, t, p.type, p.typePath);
 					}
 					if (p.kind == Kind::Array && !data.reference.is_null())
 						if (const auto inner = Resolve(*ref.package, data.reference))
@@ -207,11 +216,7 @@ namespace mirage::layout
 								ObjectIndex t = in->property->reference;
 								if (p.innerKind == Kind::Class && !in->property->reference2.is_null())
 									t = in->property->reference2;
-								if (!t.is_null())
-									if (const auto target = Resolve(*inner->package, t)) {
-										p.innerType = target->package->object_name(target->index);
-										p.innerPath = PathOf(*target);
-									}
+								TypeOf(*inner->package, t, p.innerType, p.innerPath);
 							}
 
 					if (p.kind == Kind::Bool) {

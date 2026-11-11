@@ -3,7 +3,7 @@
 #include "game/uobject.h"
 #include "render/debug_renderer.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <spdlog/spdlog.h>
 
 #include <algorithm>

@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #include <functional>
 
 struct IDirect3DDevice9;
@@ -25,4 +26,8 @@ namespace hooks {
 // Vertices the menu's ImGui frame drew last time (the menu window, every module's overlay): the self-test's "does this
 // module draw" check.
 unsigned MenuVertices();   // frames DrawWhileStalled presented so far (the self-test checks pausing with it)
+// The same per draw list ("Speedometer 300, ##Foreground 116"), for the self-test's messages: built only once asked
+// for (DescribeDrawLists(true)), every frame from then on.
+void DescribeDrawLists(bool on);
+std::string MenuDrawLists();
 }

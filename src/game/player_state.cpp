@@ -7,7 +7,7 @@
 
 #include <Windows.h>
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 

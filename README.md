@@ -526,7 +526,7 @@ when you changed something that touches the game.
 | `src/gui.cpp`          | the click-GUI: columns, module rows, settings panels                         |
 | `src/core/`            | module system, settings / controls, keybinds, scheduler, caches, notifications |
 | `src/features/<tab>/`  | one file per module, grouped by tab                                          |
-| `src/game/`            | game integration on top of the Mirror's Edge SDK: player, levels, flight, object lookups |
+| `src/game/`            | game integration on top of the Mirage SDK: player, levels, flight, object lookups |
 | `src/runtime/`         | Mirage: UnrealLib packages, Lua VM, computed/live layouts, `mirage::call`     |
 | `src/tas/`             | TAS engine (`engine`), sessions (`tas`), the replay format (`replay`), scripted macros (`macro.h`) |
 | `src/render/`          | debug renderer and meshes (Collision View)                                   |
@@ -538,7 +538,7 @@ when you changed something that touches the game.
 | `launcher/`            | `medge_launcher.exe`: injects into a running game (no install)                |
 | `tests/`               | unit tests (GoogleTest), run without the game                                |
 | `tools/memenu_tools/`  | the `memenu` Python tool; `tools/testhost/` is the fake D3D9 game for `verbose-build` |
-| `cmake/`               | dependencies (`Libraries.cmake`), feature switches (`Features.cmake`), build info, patches for the SDK |
+| `cmake/`               | dependencies (`Libraries.cmake`), feature switches (`Features.cmake`), build info      |
 
 ### How the menu works
 
@@ -567,7 +567,7 @@ Create `src/features/<tab>/my_thing.cpp`:
 #include "core/module.h"
 #include "game/game.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 
 namespace {
 
@@ -637,9 +637,10 @@ last. That is what `verbose-build` walks through to find the first stage that br
 
 ### Working with the game
 
-- The SDK is [mmultiplayer](https://github.com/connorfrancey/mmultiplayer)'s Mirror's Edge SDK, fetched by
-  `cmake/Libraries.cmake` and patched from `cmake/patches/`. Its `UField`/`UStruct` offsets are wrong: use
-  `game/uobject.h` (`game::SuperOf`, `NextOf`, `ChildrenOf`, `game::IsA`), never `->IsA()`, `->Next` or `->SuperField`.
+- The SDK is the Mirage SDK in `sdk/` (`#include "sdk/SDK.hpp"`, namespace `Classes`), generated from the game's
+  own packages by `memenu sdk` (`tools/sdkgen/`): every member offset and size is a `static_assert` checked against
+  the engine, bools are the engine's 4-byte UBOOLs in function calls, and functions with a native index are called
+  the way `ProcessEvent` accepts. Don't edit it: change the generator (or `tools/sdkgen/static/`) and regenerate.
 - `game::Pawn()`, `game::Controller()`, `game::World()` give the player and world (they can be null during loads and
   cutscenes). Check every time.
 - `AActor::SetLocation()` reports success but doesn't move the player: write `pawn->Location` directly.
@@ -712,7 +713,12 @@ MirrorsEdge.exe
    silently refuses (self-test "Mirage calls"). That fixed SDK calls that never worked: `SetMove`, `SetRotation`,
    `MoveSmooth`, `IsInState` and others.
 
-**Next:** an SDK generator from the packages, the mod format and ABI v1, the loader and mod lifecycle, hooks and
+3. **SDK generator:** `memenu sdk` writes the Mirage SDK (`sdk/`) from the packages and the engine's
+   own layouts: 2,354 classes, 515 structs and 11,310 functions, every offset and size a compile-time check. It also
+   writes the decompiled script and Lua type stubs, and a report of what the old (mmultiplayer) SDK had wrong. The
+   menu builds on it (the full in-game self-test passes).
+
+**Next:** the mod format (`mod.toml`) and ABI v1, the loader and mod lifecycle, hooks and
 events, content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
 
 ### Testing

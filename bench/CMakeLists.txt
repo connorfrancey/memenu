@@ -10,7 +10,7 @@ add_executable(memenu_bench
 target_include_directories(memenu_bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(memenu_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         MEMENU_EXAMPLES_DIR="${CMAKE_SOURCE_DIR}/examples")
-target_link_libraries(memenu_bench PRIVATE benchmark::benchmark nlohmann_json::nlohmann_json)
+target_link_libraries(memenu_bench PRIVATE benchmark::benchmark nlohmann_json::nlohmann_json magic_enum::magic_enum)
 set_target_properties(memenu_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 if(MSVC)
   target_compile_options(memenu_bench PRIVATE /W4 /permissive- /utf-8)

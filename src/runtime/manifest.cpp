@@ -1,5 +1,7 @@
 #include "runtime/manifest.h"
 
+#include "core/enum_names.h"
+
 #include <toml.hpp>
 
 #include <algorithm>
@@ -10,28 +12,8 @@
 
 namespace mirage::mods
 {
-	const char* PhaseName(Phase p)
-	{
-		switch (p) {
-			case Phase::Early: return "early";
-			case Phase::Engine: return "engine";
-			case Phase::World: return "world";
-		}
-		return "?";
-	}
-
-	const char* SettingTypeName(SettingDecl::Type t)
-	{
-		switch (t) {
-			case SettingDecl::Type::Bool: return "bool";
-			case SettingDecl::Type::Int: return "int";
-			case SettingDecl::Type::Float: return "float";
-			case SettingDecl::Type::String: return "string";
-			case SettingDecl::Type::Choice: return "choice";
-			case SettingDecl::Type::Key: return "key";
-		}
-		return "?";
-	}
+	const char* PhaseName(Phase p) { return enums::Name(p); }
+	const char* SettingTypeName(SettingDecl::Type t) { return enums::Name(t); }
 
 	namespace
 	{
@@ -155,10 +137,8 @@ namespace mirage::mods
 			error("lua '" + m.lua + "' must be a .lua file inside the mod's folder");
 
 		const std::string phase = str("phase", "engine");
-		if (phase == "early") m.phase = Phase::Early;
-		else if (phase == "engine") m.phase = Phase::Engine;
-		else if (phase == "world") m.phase = Phase::World;
-		else error("phase '" + phase + "' must be early, engine or world");
+		if (const auto p = enums::Parse<Phase>(phase)) m.phase = *p;
+		else error("phase '" + phase + "' must be " + enums::List<Phase>());
 
 		m.hotReload = m.entry.empty();
 		if (root.contains("hot_reload")) {
@@ -243,14 +223,9 @@ namespace mirage::mods
 					d.format = textField("format");
 					const std::string type = textField("type");
 					using T = SettingDecl::Type;
-					if (type == "bool") d.type = T::Bool;
-					else if (type == "int") d.type = T::Int;
-					else if (type == "float") d.type = T::Float;
-					else if (type == "string") d.type = T::String;
-					else if (type == "choice") d.type = T::Choice;
-					else if (type == "key") d.type = T::Key;
+					if (const auto t = enums::Parse<T>(type)) d.type = *t;
 					else {
-						error(where + ".type must be bool, int, float, string, choice or key" +
+						error(where + ".type must be " + enums::List<T>() +
 							  (type.empty() ? std::string(" (it is missing)") : ", not '" + type + "'"));
 						continue;
 					}

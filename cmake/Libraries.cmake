@@ -144,6 +144,19 @@ if(MEMENU_BARE)
     return()
 endif()
 
+# magic_enum: enumerator names at compile time, for the file-format words that are exactly an enum's names
+# (src/core/enum_names.h: mod.toml's phase and setting types, a replay's start kind and camera ease). Header only.
+CPMAddPackage(
+        NAME magic_enum
+        GITHUB_REPOSITORY Neargye/magic_enum
+        GIT_TAG ${MAGICENUM_VERSION}
+        OPTIONS
+            "MAGIC_ENUM_OPT_BUILD_EXAMPLES OFF"
+            "MAGIC_ENUM_OPT_BUILD_TESTS OFF"
+            "MAGIC_ENUM_OPT_INSTALL OFF"
+)
+target_link_libraries(${PROJECT_NAME} PRIVATE magic_enum::magic_enum)
+
 # imgui-filebrowser: the TAS module's Open / Save file browser, drawn with ImGui inside the menu (Windows' own dialog
 # opened behind the fullscreen game and took the cursor). Header only; the repo has no tags, so a commit is pinned.
 if("tas" IN_LIST MEMENU_ENABLED_FEATURES)

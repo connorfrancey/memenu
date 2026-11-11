@@ -1,5 +1,7 @@
 #include "tas/replay.h"
 
+#include "core/enum_names.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -677,10 +679,8 @@ bool Replay::ImportJson(const std::filesystem::path& path, std::string* error)
         if (j.contains("start") && j["start"].is_object()) {
             const json& st = j["start"];
             const std::string kind = st.value("kind", "now");
-            if (kind == "command") rep.start = StartKind::Command;
-            else if (kind == "checkpoint") rep.start = StartKind::Checkpoint;
-            else if (kind == "now") rep.start = StartKind::Now;
-            else { Fail(error, "unknown start kind \"" + kind + "\""); return false; }
+            if (const auto k = enums::Parse<StartKind>(kind)) rep.start = *k;
+            else { Fail(error, "unknown start kind \"" + kind + "\" (" + enums::List<StartKind>() + ")"); return false; }
             rep.command = st.value("command", "");
             rep.map = st.value("map", "");
             rep.checkpoint = st.value("checkpoint", "");
@@ -740,10 +740,8 @@ bool Replay::ImportJson(const std::filesystem::path& path, std::string* error)
                 k.yaw = c.value("yaw", 0.f);
                 k.pitch = c.value("pitch", 0.f);
                 const std::string ease = c.value("ease", "smooth");
-                if (ease == "linear") k.ease = Ease::Linear;
-                else if (ease == "smooth") k.ease = Ease::Smooth;
-                else if (ease == "hold") k.ease = Ease::Hold;
-                else { Fail(error, "unknown ease \"" + ease + "\""); return false; }
+                if (const auto e = enums::Parse<Ease>(ease)) k.ease = *e;
+                else { Fail(error, "unknown ease \"" + ease + "\" (" + enums::List<Ease>() + ")"); return false; }
                 if (k.frame >= frameCount) { Fail(error, "a camera key is past \"frames\""); return false; }
                 rep.camera.push_back(k);
             }
@@ -780,25 +778,9 @@ const char* KindName(EventKind kind)
     return "?";
 }
 
-const char* EaseName(Ease ease)
-{
-    switch (ease) {
-        case Ease::Linear: return "linear";
-        case Ease::Smooth: return "smooth";
-        case Ease::Hold:   return "hold";
-    }
-    return "smooth";
-}
-
-const char* StartName(StartKind kind)
-{
-    switch (kind) {
-        case StartKind::Now:        return "now";
-        case StartKind::Command:    return "command";
-        case StartKind::Checkpoint: return "checkpoint";
-    }
-    return "?";
-}
+// An unknown ease is written as "smooth", what reading takes when the key has none
+const char* EaseName(Ease ease) { return magic_enum::enum_contains(ease) ? enums::Name(ease) : "smooth"; }
+const char* StartName(StartKind kind) { return enums::Name(kind); }
 
 std::string Describe(const Replay& r, const Event& e)
 {

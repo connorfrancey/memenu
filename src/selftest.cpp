@@ -20,6 +20,8 @@
 #include "game/save_library.h"
 #include "runtime/call.h"
 #include "runtime/engine_calls.h"
+#include "runtime/fhooks.h"
+#include "runtime/reflect.h"
 #include "runtime/layout.h"
 #include "runtime/lua_vm.h"
 #include "runtime/memory.h"
@@ -3165,6 +3167,121 @@ void TestMirageMods()
     End(s);
 }
 
+// Mirage step 6: UnrealScript function hooks (runtime/fhooks.h). The offsets they need are found (UFunction::Func,
+// the frame's Locals); a script function called through ProcessEvent (CheckMaxEffectDistance, whose answer depends on
+// its parameters) runs hooks in priority order, sees and changes its parameters, can be replaced; a script function
+// called from script every tick (UpdateMomentumStats) is caught too; removing the hooks puts the function back.
+void TestMirageFunctionHooks()
+{
+    Step& s = Begin("Mirage function hooks");
+    Probe p(s);
+    namespace mh = mirage::hooks;
+    struct Seen
+    {
+        std::vector<std::string> order;
+        float cull = -1.f, z = 0.f;
+        bool after = false, afterResult = false;
+        int momentumCalls = 0;
+        float momentumDelta = 0.f;
+        Classes::UObject* momentumObject = nullptr;
+    } seen;
+    const char* kCheck = "Engine.Actor.CheckMaxEffectDistance";
+    const auto checkOnce = [&](bool& answer, std::string& error) {
+        auto* pc = game::Controller();
+        auto* pawn = game::Pawn();
+        if (!pc || !pawn) { error = "no player"; return false; }
+        mirage::call::Params params(pawn, "CheckMaxEffectDistance");
+        params.Set("P", static_cast<Classes::UObject*>(pc));
+        Classes::FVector at = pc->ViewTarget ? pc->ViewTarget->Location : pawn->Location;
+        params.SetRaw("SpawnLocation", &at, sizeof at);
+        params.Set("CullDistance", 0.f);
+        if (!mirage::call::Call(pawn, params, &error)) return false;
+        answer = params.GetBool("ReturnValue");
+        return true;
+    };
+
+    std::string why;
+    std::vector<int> ids;
+    OnGameThread([&] {
+        if (!mh::Ready(&why)) return;
+        std::string error;
+        // Two before hooks: priority 20 first. The second moves the spawn point far away and sets a cull distance, so
+        // the function answers false where it would answer true
+        ids.push_back(mh::Add(kCheck, mh::When::Before, 10, [](void* u, mh::Call& c) {
+            auto& sn = *static_cast<Seen*>(u);
+            sn.order.push_back("low");
+            sn.cull = mirage::reflect::GetFloat(c.Param("CullDistance"));
+            const auto z = c.Param("SpawnLocation.Z");
+            mirage::reflect::SetFloat(z, mirage::reflect::GetFloat(z) + 100000.f);
+            sn.z = mirage::reflect::GetFloat(z);
+            mirage::reflect::SetFloat(c.Param("CullDistance"), 1.f);
+        }, &seen, &error));
+        ids.push_back(mh::Add(kCheck, mh::When::Before, 20, [](void* u, mh::Call&) { static_cast<Seen*>(u)->order.push_back("high"); },
+                              &seen, &error));
+        ids.push_back(mh::Add(kCheck, mh::When::After, 0, [](void* u, mh::Call& c) {
+            auto& sn = *static_cast<Seen*>(u);
+            sn.after = true;
+            sn.afterResult = mirage::reflect::GetInt(c.Param("ReturnValue")) != 0;
+        }, &seen, &error));
+        ids.push_back(mh::Add("TdGame.TdPlayerController.UpdateMomentumStats", mh::When::Before, 0, [](void* u, mh::Call& c) {
+            auto& sn = *static_cast<Seen*>(u);
+            ++sn.momentumCalls;
+            sn.momentumDelta = mirage::reflect::GetFloat(c.Param("DeltaTime"));
+            sn.momentumObject = c.object;
+        }, &seen, &error));
+        if (!error.empty()) why = error;
+    });
+    if (!why.empty()) {
+        p.Problem("hooks: " + why);
+    } else {
+        bool plain = false, hooked = true;
+        std::string error;
+        // Hooked: the before hooks change its parameters, so it answers false
+        OnGameThread([&] { checkOnce(hooked, error); });
+        if (!error.empty()) p.Problem("CheckMaxEffectDistance: " + error);
+        if (seen.order != std::vector<std::string>{"high", "low"}) p.Problem("before hooks didn't run high priority first");
+        if (seen.cull != 0.f) p.Problem("the hook read CullDistance " + std::to_string(seen.cull) + ", not 0");
+        if (!seen.after) p.Problem("the after hook didn't run");
+        if (hooked) p.Problem("changing its parameters didn't change its answer (true with the point 100000 away)");
+        if (seen.afterResult != hooked) p.Problem("the after hook saw another return value than the caller");
+
+        // Replace: it answers what the hook says, its own code doesn't run
+        int replaceId = 0;
+        OnGameThread([&] {
+            replaceId = mh::Add(kCheck, mh::When::Replace, 30, [](void*, mh::Call& c) {
+                mirage::reflect::SetInt(c.Param("ReturnValue"), 1);
+            }, nullptr, &error);
+        });
+        bool replaced = false;
+        OnGameThread([&] { checkOnce(replaced, error); });
+        if (!replaced) p.Problem("the replace hook's return value didn't reach the caller");
+
+        // Called from script every tick
+        WaitTicks(5);
+        if (seen.momentumCalls == 0) p.Problem("UpdateMomentumStats (called from script) never reached its hook");
+        else if (seen.momentumDelta <= 0.f || seen.momentumObject != game::Controller())
+            p.Problem("UpdateMomentumStats's hook saw DeltaTime " + std::to_string(seen.momentumDelta) + " on the wrong object");
+
+        // Removed: the function as it was
+        OnGameThread([&] {
+            mh::Remove(replaceId);
+            for (int id : ids) mh::Remove(id);
+        });
+        seen.order.clear();
+        OnGameThread([&] { checkOnce(plain, error); });
+        if (!seen.order.empty()) p.Problem("hooks still ran after they were removed");
+        if (!plain) p.Problem("unhooked, CheckMaxEffectDistance at the view target answered false");
+        const auto st = mh::GetStats();
+        if (st.functions != 0 || st.hooks != 0) p.Problem(std::to_string(st.hooks) + " hooks left after removing them");
+        s.notes.push_back(std::to_string(st.calls) + " hooked calls, " +
+                          std::to_string(st.calls ? st.microseconds / static_cast<double>(st.calls) : 0.0) +
+                          " us each around the original (native hooks); UpdateMomentumStats seen " +
+                          std::to_string(seen.momentumCalls) + " times");
+    }
+    p.Check(1, true);
+    End(s);
+}
+
 // Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
 // what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
 // hot reload ten times in a row (Lua and native, settings and state kept, no memory left behind), and the file watcher.
@@ -3578,6 +3695,7 @@ const Named* FeatureList()
         {"Mirage runtime", &TestMirageRuntime, false},
         {"Mirage layouts", &TestMirageLayouts, false},
         {"Mirage calls", &TestMirageCalls, false},
+        {"Mirage function hooks", &TestMirageFunctionHooks, false},
         {"Mirage mods", &TestMirageMods, false},
         {"Mirage lifecycle", &TestMirageLifecycle, false},
         {"Engine script events", &TestEngineScriptEvents, false},

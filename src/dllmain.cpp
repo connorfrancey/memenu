@@ -22,7 +22,9 @@
 #if MEMENU_GAME
 #include "game/game.h"
 #include "game/levels.h"
+#include "runtime/fhooks.h"
 #include "runtime/mods.h"
+#include "runtime/reflect.h"
 #endif
 #if MEMENU_FEATURE_TAS
 #include "tas/tas.h"
@@ -92,7 +94,12 @@ static void Run(HMODULE module)
         {
             // The world phase's mods load on the first tick after a level has loaded
             static std::atomic<bool> levelLoaded{false}, worldLoaded{false};
-            game::OnLevelLoad([](bool finished) { if (finished) levelLoaded = true; });
+            game::OnLevelLoad([](bool finished) {
+                if (!finished) return;
+                levelLoaded = true;
+                mirage::reflect::ClearCache();   // Classes of the old level's packages are gone
+                mirage::hooks::Retry();          // Functions hooked before they were loaded, or gone with the level
+            });
             game::OnTick([](float) {
                 if (levelLoaded && !worldLoaded.exchange(true)) mirage::mods::LoadPhase(mirage::mods::Phase::World);
                 modules::Tick();
@@ -143,6 +150,9 @@ static void Run(HMODULE module)
 #endif
 #if MEMENU_FEATURE_TAS
         tas::Shutdown();        // The snapshot workers
+#endif
+#if MEMENU_GAME
+        mirage::hooks::RemoveAll();  // Functions back to their own code before this DLL goes
 #endif
         hooks::Uninstall();
 #if MEMENU_GAME

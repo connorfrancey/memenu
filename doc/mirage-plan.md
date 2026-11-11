@@ -281,6 +281,16 @@ from before Mirage.
 no game file touched; turning them off restores the original on the next level load; UnrealLib's corpus sweeps still
 pass.
 
+**Status (2026-11-11): half done.** Default property overrides work, as data applied at runtime rather than baked
+into overlay packages. `content/defaults.toml` holds the overrides (`runtime/content`). They are applied through
+reflection on the game thread, re-applied after level loads and undone exactly, and a module named after the mod turns
+them on and off. `examples/mods/high-steps` and the self-test "Mirage content" show this, with no game file touched.
+Left: texture replacement. A rewritten package moves every byte, but other packages' streamed mips point into it by
+raw file offset. The plan is an append-only overlay: keep the original file's bytes, write the changed chunk(s) and
+the new texture (all mips inline) at the end, and redirect the engine's opens of that file. That needs a Texture2D
+native-data writer (layout: UnrealLib `read_texture2d`) and a DXT encoder. Sounds, meshes and T3D map edits come after
+that.
+
 ### 8. Script mods: bytecode assembly and patching
 
 - Add a bytecode encoder to UnrealLib (the inverse of its decoder) and prove it on the corpus: every function of every

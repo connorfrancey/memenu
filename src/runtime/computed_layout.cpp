@@ -113,6 +113,7 @@ namespace mirage::layout
 				st->kind = ref.package->class_name(ref.index);
 				const bool inherits = st->kind == "Class" || st->kind == "ScriptStruct" || st->kind == "Struct";
 				const bool isFunction = st->kind == "Function";
+				if (f->function) st->functionFlags = f->function->flags;
 
 				std::uint32_t offset = 0, align = 1;
 				if (auto super = Resolve(*ref.package, f->field.super)) {
@@ -187,9 +188,31 @@ namespace mirage::layout
 						default: break;
 					}
 					if ((p.kind == Kind::Object || p.kind == Kind::Class || p.kind == Kind::Component ||
-						 p.kind == Kind::Byte) && !data.reference.is_null())
+						 p.kind == Kind::Byte || p.kind == Kind::Interface) && !data.reference.is_null())
 						if (const auto target = Resolve(*ref.package, data.reference))
 							p.type = target->package->object_name(target->index);
+					// A class property's type is the class it is limited to (class<Pawn>): reference2, not Class
+					if (p.kind == Kind::Class && !data.reference2.is_null())
+						if (const auto target = Resolve(*ref.package, data.reference2))
+							p.type = target->package->object_name(target->index);
+					if (!p.type.empty()) {
+						const ObjectIndex typeIndex = p.kind == Kind::Class && !data.reference2.is_null() ? data.reference2
+																										  : data.reference;
+						if (const auto target = Resolve(*ref.package, typeIndex)) p.typePath = PathOf(*target);
+					}
+					if (p.kind == Kind::Array && !data.reference.is_null())
+						if (const auto inner = Resolve(*ref.package, data.reference))
+							if (const FieldObject* in = schema_.field(*inner); in && in->property) {
+								p.innerKind = FromType(in->property->type);
+								ObjectIndex t = in->property->reference;
+								if (p.innerKind == Kind::Class && !in->property->reference2.is_null())
+									t = in->property->reference2;
+								if (!t.is_null())
+									if (const auto target = Resolve(*inner->package, t)) {
+										p.innerType = target->package->object_name(target->index);
+										p.innerPath = PathOf(*target);
+									}
+							}
 
 					if (p.kind == Kind::Bool) {
 						p.elementSize = 4;

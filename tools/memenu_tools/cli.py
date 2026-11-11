@@ -788,6 +788,46 @@ def unreallib(ctx: click.Context, config: str, no_build: bool, cooked_pc: Path |
     ctx.exit(code and 1)
 
 
+@cli.command("sdk")
+@config_option
+@click.option("--no-build", is_flag=True, help="Run mirage_sdkgen as it was last built.")
+@click.option("--no-check", is_flag=True, help="Don't compile the generated SDK afterwards (its layout checks).")
+@click.option("--no-report", is_flag=True, help="Don't compare with the old (mmultiplayer) SDK.")
+@click.argument("sdkgen_args", nargs=-1, type=click.UNPROCESSED)
+@verbose_option
+@click.pass_context
+def sdk(ctx: click.Context, config: str, no_build: bool, no_check: bool, no_report: bool,
+        sdkgen_args: tuple[str, ...], verbose: bool) -> None:
+    """Generate the Mirage SDK (sdk/) from the game's packages with mirage_sdkgen, then compile it.
+
+    Settings are in tools/sdkgen/sdkgen.toml; SDKGEN_ARGS go to mirage_sdkgen (after --, e.g. `memenu sdk --
+    --cooked D:/Games/MirrorsEdge/TdGame/CookedPC`). The report of what the old SDK has wrong goes to
+    build/sdk-reference/old-sdk-report.md, with the decompiled script and the Lua stubs.
+    """
+    if not no_build:
+        _enable_parts(ctx, config, ["sdkgen"], verbose)
+        if _build(ctx, config, ("mirage_sdkgen",), verbose=verbose).returncode != 0:
+            ctx.exit(1)
+    exe = _artifact(config, "bin/mirage_sdkgen.exe")
+    if not exe.exists():
+        console.print(f"[red]{exe} not found[/]: build it first (without --no-build).")
+        ctx.exit(1)
+    args = [str(exe)]
+    old = b.cache_value(config, "CPM_PACKAGE_mmultiplayer_SOURCE_DIR")
+    if not no_report and old and (Path(old) / "Client" / "sdk").is_dir():
+        args += ["--old-sdk", str(Path(old) / "Client" / "sdk")]
+    console.rule("mirage_sdkgen")
+    if subprocess.run([*args, *sdkgen_args], cwd=ROOT).returncode != 0:
+        ctx.exit(1)
+    if no_check:
+        return
+    # The SDK's CMakeLists is picked up by tools/sdkgen when it exists: configure again the first time
+    console.rule("Compiling the SDK (every offset and size is a static_assert)")
+    result = b.configure(console, _toolchain(ctx), config, verbose=verbose)
+    if result.returncode != 0 or _build(ctx, config, ("mirage_sdk",), verbose=verbose).returncode != 0:
+        ctx.exit(1)
+
+
 def _remove_build_dir(config: str) -> None:
     folder = b.build_dir(config)
     if folder.exists():

@@ -233,7 +233,7 @@ endif()
 # UnrealLib: reads Unreal Engine 3 packages (.u/.upk/.me1), a C++ port of EliotVU/Unreal-Library. The Mirage runtime
 # (src/runtime/) reads the game's script packages with it inside the game, so every build with the game layer links it;
 # MEMENU_UNREALLIB adds its tests and status tool. Reuses the fmt/spdlog above and adds zlib.
-if(MEMENU_UNREALLIB OR MEMENU_GAME)
+if(MEMENU_UNREALLIB OR MEMENU_GAME OR MEMENU_BUILD_SDKGEN)
 CPMAddPackage(
         NAME UnrealLib
         GITHUB_REPOSITORY connorfrancey/UnrealLib
@@ -242,6 +242,20 @@ CPMAddPackage(
             "UNREALLIB_BUILD_TESTS OFF"
             "UNREALLIB_BUILD_TOOLS OFF"
             "UNREALLIB_BUILD_EXAMPLES OFF"
+)
+endif()
+
+# toml11 (https://github.com/ToruNiina/toml11): TOML for Mirage's own files: mod manifests (mod.toml, step 4: the
+# runtime will need it too) and the SDK generator's configuration (tools/sdkgen/sdkgen.toml). Header only.
+if(MEMENU_BUILD_SDKGEN)
+CPMAddPackage(
+        NAME toml11
+        GITHUB_REPOSITORY ToruNiina/toml11
+        GIT_TAG v${TOML_VERSION}
+        OPTIONS
+            "TOML11_INSTALL OFF"
+            "TOML11_BUILD_EXAMPLES OFF"
+            "TOML11_BUILD_TESTS OFF"
 )
 endif()
 

@@ -20,6 +20,7 @@ namespace mirage::layout
 		constexpr int kFlags = 0x4C;
 		constexpr int kOffset = 0x64;
 		constexpr int kReference = 0x84;		// The subclass's first field: BitMask, Struct, PropertyClass, Enum, Inner
+		constexpr int kFunctionFlags = 0x90;	// UFunction (iNative follows at 0x94: runtime/call.cpp)
 
 		std::uint32_t Dword(const void* p, int at)
 		{
@@ -47,6 +48,15 @@ namespace mirage::layout
 			return o ? o->GetName() : std::string();
 		}
 
+		void ReadType(Classes::UField* f, Kind kind, std::string& type, std::string& path)
+		{
+			// ClassProperty: PropertyClass (always Class), then MetaClass, the class it is limited to
+			Classes::UObject* ref = ObjectAt(f, kind == Kind::Class ? kReference + 4 : kReference);
+			if (!ref) return;
+			type = ref->GetName();
+			path = Path(ref);
+		}
+
 		Property ReadProperty(Classes::UField* f)
 		{
 			Property p;
@@ -64,7 +74,20 @@ namespace mirage::layout
 					break;
 				case Kind::Struct: case Kind::Object: case Kind::Class: case Kind::Component: case Kind::Byte:
 				case Kind::Interface:
-					if (auto* ref = ObjectAt(f, kReference)) p.type = ref->GetName();
+					ReadType(f, p.kind, p.type, p.typePath);
+					break;
+				case Kind::Array:
+					if (auto* inner = reinterpret_cast<Classes::UField*>(ObjectAt(f, kReference)); inner && inner->Class) {
+						p.innerKind = KindFromClass(inner->Class->GetName());
+						switch (p.innerKind) {	// Only these have a type after UProperty: the rest end there
+							case Kind::Struct: case Kind::Object: case Kind::Class: case Kind::Component: case Kind::Byte:
+							case Kind::Interface:
+								ReadType(inner, p.innerKind, p.innerType, p.innerPath);
+								break;
+							default:
+								break;
+						}
+					}
 					break;
 				default:
 					break;
@@ -105,6 +128,7 @@ namespace mirage::layout
 			st.kind = o->Class->GetName();
 			if (UStruct* super = game::SuperOf(s)) st.super = Path(super);
 			st.size = game::PropertySizeOf(s);
+			if (st.kind == "Function") st.functionFlags = Dword(s, kFunctionFlags);
 			st.properties = LiveProperties(s);
 			out.emplace(st.path, std::move(st));
 		}

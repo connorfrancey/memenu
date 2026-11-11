@@ -692,7 +692,7 @@ MirrorsEdge.exe
      └─ mirage.dll ......... runtime: engine layer, reflection, hooks, events, VFS, mod manager UI
          ├─ Lua 5.4 ....... one sandboxed state per Lua mod
          ├─ mods\memenu\ ... the current features, as first-party mods
-         └─ mods\<id>\ ..... mod.json + main.lua and/or <id>.dll + content\
+         └─ mods\<id>\ ..... mod.toml + main.lua and/or <id>.dll + content\
 ```
 
 - **Lua 5.4** (compiled as C++, so a Lua error unwinds C++ frames) is the main way to write a mod: one sandboxed state

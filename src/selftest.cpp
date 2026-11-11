@@ -2391,14 +2391,18 @@ void TestMirageLayouts()
 {
     Step& s = Begin("Mirage layouts");
     Probe p(s);
-    const std::vector<std::string> packages{"Core", "Engine", "TdGame"};
+    // Every package the SDK covers. The native-only ones have no .u file: Compute skips what it can't find
+    const std::vector<std::string>& packages = mirage::layout::SdkPackages();
+    std::vector<std::string> scripts;
+    for (const auto& name : packages)
+        if (std::filesystem::exists(mirage::packages::CookedDir() / (name + ".u"))) scripts.push_back(name);
 
     mirage::layout::Layouts live;
     const clk::Ticks t0 = clk::Now();
     if (!OnGameThread([&] { live = mirage::layout::Live(packages); }, 30.0)) p.Problem("reading the live layouts timed out");
     const double liveSeconds = clk::SecondsSince(t0);
     const clk::Ticks t1 = clk::Now();
-    const mirage::layout::Computed computed = mirage::layout::Compute(mirage::packages::CookedDir(), packages);
+    const mirage::layout::Computed computed = mirage::layout::Compute(mirage::packages::CookedDir(), scripts);
     const double computeSeconds = clk::SecondsSince(t1);
     if (!computed.error.empty()) p.Problem("UnrealLib: " + computed.error);
 
@@ -2456,6 +2460,14 @@ void TestMirageLayouts()
                 }
             }
         }
+    }
+    // What only the engine knows (intrinsic classes, native-only packages): the SDK generator's second input
+    {
+        mirage::layout::Layouts onlyLive;
+        for (const auto& [path, l] : live)
+            if (!computed.layouts.count(path)) onlyLive.emplace(path, l);
+        std::ofstream(paths::Dir() / "mirage-live-layouts.json", std::ios::trunc) << mirage::layout::ToJson(onlyLive);
+        s.notes.push_back(std::to_string(onlyLive.size()) + " engine-only layouts saved to mirage-live-layouts.json");
     }
     if (!r.mismatches.empty())
         p.Problem(std::to_string(r.mismatches.size()) + " structs differ from the engine (first: " +

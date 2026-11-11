@@ -26,7 +26,7 @@ MirrorsEdge.exe
      └─ mirage.dll ......... runtime: engine layer, reflection, hooks, events, VFS, mod manager UI
          ├─ Lua 5.4 ....... one sandboxed state per Lua mod
          ├─ mods\memenu\ ... the current features, as first-party mods (trainer, TAS, Info Lines, ...)
-         └─ mods\<id>\ ..... mod.json + main.lua and/or <id>.dll + content\ (packages, textures, script patches)
+         └─ mods\<id>\ ..... mod.toml + main.lua and/or <id>.dll + content\ (packages, textures, script patches)
 ```
 
 - **Stable C ABI** (`mirage/api.h`: a versioned function table, plain structs, no STL across the boundary) with a
@@ -106,10 +106,24 @@ Flight's collision mode calls MoveSmooth, which now runs, not yet covered by a t
 **Milestone:** the generated SDK compiles with zero warnings; the menu builds on it with no mmultiplayer headers left;
 `game-test` passes; a report lists every layout the old SDK had wrong.
 
+**Status (2026-11-10): the generator is done; the menu still uses the old SDK.** `memenu sdk` builds and runs
+`mirage_sdkgen` (`tools/sdkgen/`, configured by `sdkgen.toml`, read with toml11) and compiles what it writes. Inputs:
+the layouts computed from the packages (the same `runtime/computed_layout.cpp` the self-test proves) plus
+`engine-layouts.json`, what only the engine knows (601 intrinsic and native-only types, saved by the self-test "Mirage
+layouts"). Output, in 1.5 s: `sdk/` with 2,354 classes, 515 structs and all 11,310 functions (static array parameters
+included), with every offset and size a `static_assert`. It compiles with no warnings at /W4. Bits are checked at run
+time (`detail::CheckLayouts`). `build/sdk-reference/` holds the decompiled script of the 2,110 classes (2,107 with no
+placeholders), the LuaLS stubs and `old-sdk-report.md`. The report lays out the old SDK's C++ the way MSVC does under
+its `pack(4)` and compares it with the engine: 197 classes, 16 structs and 6,002 parameter structs wrong (IsInState's
+return value at 0x9 instead of 0xC, SetMove's parameters 4 bytes instead of 16, the intrinsic classes too small).
+Known gap: two HTTPDownload properties lie inside its native base's opaque block and can't be declared. Left: move the
+menu onto `sdk/` and drop mmultiplayer, then `game-test`.
+
 ### 4. Mod format and ABI v1
 
-- `mod.json`: id, semver version, name, authors, runtime version range, game build, dependencies (required / optional /
-  incompatible, with version ranges), entry DLL, load phase, settings schema, content folders.
+- `mod.toml` (TOML, read with toml11): id, semver version, name, authors, runtime version range, game build,
+  dependencies (required / optional / incompatible, with version ranges), entry DLL, load phase, settings schema,
+  content folders.
 - `mirage/api.h` v1: logging, the module and settings system (today's `ctl::` controls) and per-mod config, exposed
   through the ABI; the C++ wrapper gives mods the same `MEM_MODULE` / `ctl::Slider` style as today.
 - The Lua API (`mirage` table) over the same calls: `mirage.module{...}`, settings, log, config, plus game object
@@ -228,6 +242,7 @@ waits for 3 and 6 because the features need the generated SDK and shared hooks.
 ## Decisions
 
 - Scripting: Lua 5.4, compiled as C++ (2026-11-09).
+- Mod manifest: `mod.toml` (TOML, read with toml11), not JSON (2026-11-10).
 
 ## Open questions
 

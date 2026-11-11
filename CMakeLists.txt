@@ -25,6 +25,7 @@ option(MEMENU_BUILD_INSTALLER "Build the dinput8.dll loader and memenu_installer
 option(MEMENU_BUILD_LAUNCHER  "Build medge_launcher.exe (injects the DLL into a running game)" OFF)
 option(MEMENU_BUILD_TESTHOST  "Build memenu_testhost.exe (loads the DLL into a D3D9 test app: memenu verbose-build)" OFF)
 option(MEMENU_UNREALLIB       "Build UnrealLib's tests and status tool (unreallib_tests). The DLL links UnrealLib whenever it has the game layer" ${MEMENU_BUILD_TESTS})
+option(MEMENU_BUILD_SDKGEN    "Build mirage_sdkgen.exe (writes the Mirage SDK from the game's packages: memenu sdk)" OFF)
 # Developer mode (`memenu --dev`): the DLL switches its stored developer mode on at every start, which shows the Test
 # module (in-game self-tests). A normal build keeps what the menu stored (Misc > Developer Mode).
 option(MEMENU_DEV_MODE        "Developer build: developer mode on at every start (Test module)" OFF)
@@ -193,6 +194,12 @@ endif()
 if(MEMENU_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# -------------------------------------------------------------------------------------------------
+# SDK generator (Mirage, step 3): a host tool, run at development time, not part of the DLL
+if(MEMENU_BUILD_SDKGEN)
+  add_subdirectory(tools/sdkgen)
 endif()
 
 # -------------------------------------------------------------------------------------------------

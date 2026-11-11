@@ -338,6 +338,12 @@ cover before/after), and patches baked into packages.
 **Milestone:** the first-party mods compile against `api/` headers only (enforced by the build: no runtime include
 paths); every one of today's self-test checks passes with the features loaded as mods.
 
+**Status (2026-11-11): started.** First-party mods live in `mods/`, are embedded in the DLL (`cmake/EmbedMods.cmake`)
+and written to the mods folder at startup (`runtime/firstparty`), so every install has them. `mods/memenu-trainer`
+(Lua) replaces the native God Mode, Teleport to Spawn and Game Speed, with the same names and settings, and the
+self-test's checks pass on it. API: `notify` appended. Measured: a Lua module's tick costs 20-30 us in release (native
+~1 us), worth bringing down before many features move. Next: the mod manager, then more features.
+
 ### 10. Tooling, docs and distribution
 
 - `mirage` CLI (the `memenu` tool grown): new mod from a template (Lua or native), build, package, install into the

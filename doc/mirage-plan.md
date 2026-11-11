@@ -317,6 +317,15 @@ Left for later in this step: sounds, meshes and T3D map edits.
 **Milestone:** 100% byte-identical encode round trip over the Mirror's Edge corpus; an example mod changes a script
 function's behaviour (for example the jump logic in TdPawn) with no native detour, and turning it off restores it.
 
+**Status (2026-11-11): done.** UnrealLib (branch `bytecode-encoder`) has `encode_script`, the decoder's inverse: all
+13,770 scripts of the game (477,343 tokens) round-trip byte-identical, and `assemble_script`, which lays an edited tree
+out again (jump targets follow their statements, relative skips keep the compiler's own slack; checked over the corpus by
+inserting and removing tokens everywhere). In the game, `runtime/script_patch` decodes a live function's bytecode, and
+mods edit it through the API (`script_open` ... `script_apply`, Lua `mirage.script`). `examples/mods/higher-jumps`
+patches `TdMove_Jump.StartMove` and a standing jump goes 2.25 times as high (self-test "Mirage script patch"); off, the
+original bytecode is back. Not done: mixin-style injection (calling a mod's code from inside bytecode; function hooks
+cover before/after), and patches baked into packages.
+
 ### 9. The menu becomes mods, and a mod manager
 
 - The current features move into first-party mods (`memenu-trainer`, `memenu-tas`, `memenu-visual`, ...) that use only

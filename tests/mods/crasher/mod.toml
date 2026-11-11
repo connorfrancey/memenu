@@ -1,0 +1,4 @@
+id = "crasher"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): crashes on purpose when switched on"
+entry = "crasher.dll"

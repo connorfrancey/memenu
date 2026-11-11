@@ -5,6 +5,7 @@ description = "A native example mod: one module that draws a greeting"
 authors = ["Mirror's Edge Menu"]
 mirage = "^0.1"
 entry = "hello.dll"
+hot_reload = true         # Rebuilt while the game runs, it is reloaded (it runs from a copy in .mirage)
 
 # Settings, declared here and shown in the module's panel; the menu's config keeps their values.
 # The code reads them by key: mirage::Get<std::string>("greeting")

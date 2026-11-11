@@ -1,4 +1,6 @@
 #include <Windows.h>
+#include <atomic>
+#include <functional>
 #include <spdlog/spdlog.h>
 
 #include "config.h"
@@ -61,10 +63,12 @@ static void Run(HMODULE module)
     STARTUP_STEP(theme::Init());              // themes/ folder + built-in theme files
     STARTUP_STEP(modules::Init());            // Every module registered with MEM_MODULE
 #if MEMENU_GAME
-    // Mirage mods (mods\<id>\mod.toml): their modules join the list before the config and the scheduler see it. The
-    // self-test also loads its test mods, put next to the menu by `memenu game-test` and removed after.
-    STARTUP_STEP(mirage::mods::LoadAll(paths::Dir() / "mods"));
-    if (selfTest) STARTUP_STEP(mirage::mods::LoadAll(paths::Dir() / "selftest-mods"));
+    // Mirage mods (mods\<id>\mod.toml): found and ordered now, the early phase loaded before the config and the
+    // scheduler see the modules. The self-test also loads its test mods (selftest-mods, put there by `memenu game-test`).
+    STARTUP_STEP(mirage::mods::Discover(selfTest ? std::vector{paths::Dir() / "mods", paths::Dir() / "selftest-mods"}
+                                                 : std::vector{paths::Dir() / "mods"}));
+    STARTUP_STEP(mirage::mods::LoadPhase(mirage::mods::Phase::Early));
+    diag::SetCrashAttributor([](const void* address, unsigned long code) { return mirage::mods::AttributeCrash(address, code); });
 #endif
     STARTUP_STEP(modules::ApplyDefaults());   // Modules flagged enabledByDefault
     STARTUP_STEP(config::Load());             // Saved state overrides the defaults
@@ -75,13 +79,28 @@ static void Run(HMODULE module)
     spdlog::info("Hardware: {}", hw::Get().Summary());   // After the hooks: they add the GPU
     if (installed)
     {
+        // From here modules added later (mods of the engine and world phases, hot reloads) join on the render thread,
+        // with their saved state and a place in the scheduler
+        modules::Start([](std::function<void()> fn) { hooks::RunOnRenderThread(std::move(fn)); }, [](Module& m) {
+            if (!config::ApplySaved(m) && m.enabledByDefault) m.SetEnabled(true);
+            sched::AddModule(m);
+        });
 #if MEMENU_GAME
         // Module logic runs on the game thread through the engine tick; the menu itself stays on the render thread.
         const bool gameReady = STARTUP_STEP(game::Init());
         if (gameReady)
         {
-            game::OnTick([](float) { modules::Tick(); });
+            // The world phase's mods load on the first tick after a level has loaded
+            static std::atomic<bool> levelLoaded{false}, worldLoaded{false};
+            game::OnLevelLoad([](bool finished) { if (finished) levelLoaded = true; });
+            game::OnTick([](float) {
+                if (levelLoaded && !worldLoaded.exchange(true)) mirage::mods::LoadPhase(mirage::mods::Phase::World);
+                modules::Tick();
+            });
             STARTUP_STEP(levels::Init());
+            STARTUP_STEP(mirage::mods::LoadPhase(mirage::mods::Phase::Engine));   // The game layer is up
+            // Hot reload: mods whose files changed, checked twice a second (game thread, between the modules' ticks)
+            sched::AddTask("Mirage mod reload", {0.5f, sched::Priority::Background, {}, {}}, [] { mirage::mods::ReloadChanged(); });
 #if MEMENU_FEATURE_TAS
             const bool tasReady = STARTUP_STEP(tas::Init());
             if (!tasReady) spdlog::warn("TAS unavailable: its patterns were not found");

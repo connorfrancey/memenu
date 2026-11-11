@@ -6,6 +6,9 @@
 #include "core/scheduler.h"
 
 #include <algorithm>
+#include <set>
+#include <functional>
+#include <atomic>
 #include <mutex>
 #include <spdlog/spdlog.h>
 
@@ -54,8 +57,53 @@ struct TabDecl {
 std::vector<modules::Factory>& Factories() { static std::vector<modules::Factory> v; return v; }
 std::vector<TabDecl>& TabDecls() { static std::vector<TabDecl> v; return v; }
 
+// The modules. Once the menu runs, the list only grows (a mod's modules join at its load phase) and is read from every
+// thread: its capacity is reserved up front so it never moves, and readers see the first g_count entries, published
+// after each new entry is in place.
+constexpr std::size_t kCapacity = 1024;
 std::vector<std::unique_ptr<Module>> g_modules;
-std::vector<std::unique_ptr<modules::Tab>> g_tabs;
+std::atomic<std::size_t> g_count{0};
+std::vector<std::unique_ptr<modules::Tab>> g_tabs;     // Changed only on the render thread once started
+
+bool g_started = false;
+std::function<void(std::function<void()>)> g_runOnRender;
+std::function<void(Module&)> g_onAdded;
+std::mutex g_pendingMutex;
+std::set<std::string> g_pendingNames;                  // Published, not in the list yet
+
+template <class F>
+void EachModule(F&& f)
+{
+    const std::size_t n = g_count.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < n; ++i) f(*g_modules[i]);
+}
+
+void InsertInTab(Module* m)
+{
+    auto it = std::find_if(g_tabs.begin(), g_tabs.end(), [&](const auto& t) { return t->name == m->Tab(); });
+    if (it == g_tabs.end()) {
+        auto tab = std::make_unique<modules::Tab>();
+        tab->name = m->Tab();
+        g_tabs.push_back(std::move(tab));
+        it = g_tabs.end() - 1;
+    }
+    auto& list = (*it)->modules;
+    const auto at = std::find_if(list.begin(), list.end(), [&](const Module* o) {
+        return o->Order() != m->Order() ? m->Order() < o->Order() : m->Name() < o->Name();
+    });
+    list.insert(at, m);
+}
+
+bool Append(std::unique_ptr<Module> module)
+{
+    if (g_modules.size() >= g_modules.capacity()) {
+        spdlog::error("Too many modules ({}): {} is left out", g_modules.size(), module->Name());
+        return false;
+    }
+    g_modules.push_back(std::move(module));
+    g_count.store(g_modules.size(), std::memory_order_release);
+    return true;
+}
 
 } // namespace
 
@@ -72,7 +120,9 @@ void modules::Init()
 {
     if (!g_modules.empty()) return;
 
+    g_modules.reserve(std::max(kCapacity, Factories().size() * 2));
     for (Factory make : Factories()) g_modules.push_back(make());
+    g_count.store(g_modules.size(), std::memory_order_release);
 
     // Tabs: the declared ones first (by their order), then any tab only modules mention, in the order they first appear.
     std::vector<TabDecl> decls = TabDecls();
@@ -107,60 +157,93 @@ void modules::Init()
 
 Module* modules::Add(std::unique_ptr<Module> module)
 {
-    if (!module || Find(module->Name())) return nullptr;     // Names are unique: the config saves by name
+    if (!module || g_started || NameTaken(module->Name())) return nullptr;     // Names are unique: the config saves by name
     Module* m = module.get();
-    g_modules.push_back(std::move(module));
-    auto it = std::find_if(g_tabs.begin(), g_tabs.end(), [&](const auto& t) { return t->name == m->Tab(); });
-    if (it == g_tabs.end()) {
-        auto tab = std::make_unique<Tab>();
-        tab->name = m->Tab();
-        g_tabs.push_back(std::move(tab));
-        it = g_tabs.end() - 1;
-    }
-    auto& list = (*it)->modules;
-    const auto at = std::find_if(list.begin(), list.end(), [&](const Module* o) {
-        return o->Order() != m->Order() ? m->Order() < o->Order() : m->Name() < o->Name();
-    });
-    list.insert(at, m);
+    if (!Append(std::move(module))) return nullptr;
+    InsertInTab(m);
     return m;
 }
 
 void modules::Remove(Module* module)
 {
+    if (g_started) return;
     // Its tab goes too when this was its last module (a tab only a mod's modules used)
     std::erase_if(g_tabs, [&](const auto& t) { return std::erase(t->modules, module) > 0 && t->modules.empty(); });
     std::erase_if(g_modules, [&](const auto& m) { return m.get() == module; });
+    g_count.store(g_modules.size(), std::memory_order_release);
+}
+
+void modules::Start(std::function<void(std::function<void()>)> runOnRender, std::function<void(Module&)> onAdded)
+{
+    g_runOnRender = std::move(runOnRender);
+    g_onAdded = std::move(onAdded);
+    g_started = true;
+}
+
+void modules::Publish(std::vector<std::unique_ptr<Module>> list)
+{
+    if (!g_started) {
+        for (auto& m : list) Add(std::move(m));
+        return;
+    }
+    {
+        std::lock_guard lock(g_pendingMutex);
+        for (auto& m : list) g_pendingNames.insert(m->Name());
+    }
+    auto holder = std::make_shared<std::vector<std::unique_ptr<Module>>>(std::move(list));
+    g_runOnRender([holder] {
+        for (auto& owned : *holder) {
+            Module* m = owned.get();
+            {
+                std::lock_guard lock(g_pendingMutex);
+                g_pendingNames.erase(m->Name());
+            }
+            if (!Append(std::move(owned))) continue;
+            InsertInTab(m);
+            if (g_onAdded) g_onAdded(*m);
+        }
+    });
+}
+
+bool modules::NameTaken(std::string_view name)
+{
+    if (Find(name)) return true;
+    std::lock_guard lock(g_pendingMutex);
+    return g_pendingNames.count(std::string(name)) > 0;
 }
 
 Module* modules::Find(std::string_view name)
 {
-    for (auto& m : g_modules)
-        if (m->Name() == name) return m.get();
-    return nullptr;
+    Module* found = nullptr;
+    EachModule([&](Module& m) {
+        if (!found && m.Name() == name) found = &m;
+    });
+    return found;
 }
 
 void modules::ApplyDefaults()
 {
-    for (auto& m : g_modules)
-        if (m->enabledByDefault) m->SetEnabled(true);
+    EachModule([](Module& m) {
+        if (m.enabledByDefault) m.SetEnabled(true);
+    });
 }
 
 void modules::DisableAll()
 {
-    for (auto& m : g_modules) m->SetEnabled(false);
+    EachModule([](Module& m) { m.SetEnabled(false); });
 }
 
 void modules::Tick() { sched::Tick(); }
 
 void modules::Render()
 {
-    for (auto& m : g_modules) {
-        if (!m->Enabled()) continue;
-        PROF_ZONE_NAMED(m->Name().c_str(), m->Name().size());
+    EachModule([](Module& m) {
+        if (!m.Enabled()) return;
+        PROF_ZONE_NAMED(m.Name().c_str(), m.Name().size());
         const clk::Ticks t0 = clk::Now();
-        m->OnRender();
-        sched::RecordRender(*m, clk::Micros(clk::Now() - t0));
-    }
+        m.OnRender();
+        sched::RecordRender(m, clk::Micros(clk::Now() - t0));
+    });
 }
 
 namespace {
@@ -187,27 +270,27 @@ void modules::OnKey(int vk)
     const auto consider = [&](int binding) {
         if (keys::Fires(binding, vk, mods)) best = std::max(best, keys::Specificity(binding));
     };
-    for (auto& m : g_modules) {
-        if (m->Hidden()) continue;
-        consider(m->key);
-        for (ctl::Setting* s : m->Settings()) {
+    EachModule([&](Module& m) {
+        if (m.Hidden()) return;
+        consider(m.key);
+        for (ctl::Setting* s : m.Settings()) {
             consider(s->key);
             consider(s->keyAlt);
         }
-    }
+    });
     if (best < 0) return;
     const auto fires = [&](int binding) { return keys::Fires(binding, vk, mods) && keys::Specificity(binding) == best; };
 
-    for (auto& m : g_modules) {
-        if (m->Hidden()) continue;
-        if (fires(m->key)) {
-            m->Toggle();
-            if (!m->IsAction()) notify::Push(m->Name() + ": " + (m->Enabled() ? "ON" : "OFF"));
+    EachModule([&](Module& m) {
+        if (m.Hidden()) return;
+        if (fires(m.key)) {
+            m.Toggle();
+            if (!m.IsAction()) notify::Push(m.Name() + ": " + (m.Enabled() ? "ON" : "OFF"));
         }
         // Control keys work whether or not the module is on: that is what makes "bind a key to this slider" useful.
-        for (ctl::Setting* s : m->Settings()) {
+        for (ctl::Setting* s : m.Settings()) {
             if (fires(s->key)) s->Press(0);
             if (fires(s->keyAlt)) s->Press(1);
         }
-    }
+    });
 }

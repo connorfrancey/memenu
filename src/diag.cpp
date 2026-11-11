@@ -115,6 +115,7 @@ namespace {
     }
 
     std::atomic<unsigned long long> g_gameCrashesUntil{0};
+    std::string (*g_attribute)(const void*, unsigned long) = nullptr;     // diag::SetCrashAttributor
     std::string (*g_released)(std::uintptr_t) = nullptr;
 
     LONG CALLBACK CrashLogger(EXCEPTION_POINTERS* ep)
@@ -128,6 +129,17 @@ namespace {
                 return EXCEPTION_CONTINUE_SEARCH;
         }
         const bool game = GetTickCount64() < g_gameCrashesUntil.load(std::memory_order_relaxed);
+        // A mod's code outside the calls the runtime guards (a thread it started): named, recorded, logged
+        if (g_attribute) {
+            static thread_local bool attributing = false;
+            if (!attributing) {
+                attributing = true;
+                const std::string mod = g_attribute(ep->ExceptionRecord->ExceptionAddress, ep->ExceptionRecord->ExceptionCode);
+                if (!mod.empty()) diag::LogFatal(ep, ("Crash in the mod " + mod).c_str());
+                attributing = false;
+                if (!mod.empty()) return EXCEPTION_CONTINUE_SEARCH;
+            }
+        }
         if (!InSelf(ep->ExceptionRecord->ExceptionAddress) && !game) return EXCEPTION_CONTINUE_SEARCH;   // The game's business
         static thread_local bool inside = false;
         if (inside) return EXCEPTION_CONTINUE_SEARCH;
@@ -171,6 +183,8 @@ void diag::RemoveCrashLogger()
     if (g_veh) RemoveVectoredExceptionHandler(g_veh);
     g_veh = nullptr;
 }
+
+void diag::SetCrashAttributor(std::string (*attribute)(const void* address, unsigned long code)) { g_attribute = attribute; }
 
 long diag::LogFatal(const EXCEPTION_POINTERS* ep, const char* where)
 {

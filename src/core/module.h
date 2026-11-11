@@ -120,10 +120,16 @@ namespace modules
 	void Init();				// Creates every registered module and the tabs
 	void ApplyDefaults();		// Turns on modules flagged enabledByDefault (after Init, before the config is loaded)
 	void DisableAll();			// On unload, so modules can undo their changes
-	// Modules made at run time (Mirage mods): after Init, before config::Load and sched::Init, so their saved state is
-	// read and the scheduler runs them. Remove only before sched::Init (a mod that failed to load).
+	// Modules made at run time (Mirage mods). Before Start (startup): Add puts one in the list at once, Remove takes
+	// one back (a mod that failed to load), and config::Load / sched::Init pick them up like the others.
 	Module* Add(std::unique_ptr<Module> module);
 	void Remove(Module* module);
+	// From then on (the menu runs): the list only grows. Publish hands a batch of finished modules (their settings
+	// made) to the render thread, which adds them to the list and their tab, then calls `onAdded` (their saved config,
+	// the scheduler). Before Start, Publish just Adds them.
+	void Start(std::function<void(std::function<void()>)> runOnRender, std::function<void(Module&)> onAdded);
+	void Publish(std::vector<std::unique_ptr<Module>> list);
+	bool NameTaken(std::string_view name);		// In the list, or published and about to be
 
 	// ---- Per frame -----------------------------------------------------------------------------------------------------------------
 	void Tick();				// Game thread: runs the scheduler (OnTick of the enabled modules that are due)

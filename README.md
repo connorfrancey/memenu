@@ -723,8 +723,12 @@ MirrorsEdge.exe
    works; Lua mods get the same API as a `mirage` table. Their modules show in the menu's Mods column and save their
    settings like built-in ones. See `examples/mods/` (self-test "Mirage mods").
 
-**Next:** the loader and mod lifecycle (dependency order, load phases, hot reload, crash attribution), hooks and
-events, content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
+5. **Loader and mod lifecycle:** mods load in dependency order across three phases (early, engine, world), and
+   ones that can't load are left out with the reason. Lua mods hot reload when their files change, keeping their
+   settings and state; native ones do too with `hot_reload = true`. A mod that crashes is stopped and named, the rest go
+   on, and it isn't loaded next time (`crashes.toml`). Self-test "Mirage lifecycle".
+
+**Next:** hooks and events, content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
 
 ### Testing
 

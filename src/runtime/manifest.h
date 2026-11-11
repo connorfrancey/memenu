@@ -10,7 +10,10 @@
 //     game = "1.0"                       # Game build it was made for (informative for now)
 //     entry = "hello.dll"                # Native code: a DLL in the mod's folder
 //     lua = "main.lua"                   # Lua code (default: main.lua when it exists)
-//     phase = "engine"                   # When it loads: early, engine (default) or world
+//     phase = "engine"                   # When it loads: early (menu start), engine (default: the game layer is
+//                                        # ready) or world (the first level has loaded)
+//     hot_reload = true                  # Reloaded when its files change (default: true for Lua only mods, false
+//                                        # when it has a DLL: native code must undo everything in its unload)
 //     content = ["content"]              # Folders with packages, textures, script patches (step 7)
 //
 //     [dependencies]                     # Required, with version ranges
@@ -77,6 +80,7 @@ namespace mirage::mods
 		std::string entry;				// "" = no native code
 		std::string lua;				// "" = no Lua code (resolved against the folder by Load)
 		Phase phase = Phase::Engine;
+		bool hotReload = false;			// Default: true when there is no entry DLL
 		std::vector<std::string> content;
 		std::vector<Dependency> required, optional, incompatible;
 		std::vector<SettingDecl> settings;	// In the order of the file

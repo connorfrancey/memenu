@@ -1116,14 +1116,13 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
     if devtest.game_pids():
         console.print("[red]Mirror's Edge is running.[/] Close it first.")
         ctx.exit(1)
-    # The example mods, for the self-test step "Mirage mods": hello built like a mod author would (its own CMake
-    # project, clang-cl when installed), hello-lua as it is
-    hello, how = em.build_native(_toolchain(ctx))
-    if hello is None:
-        console.print(f"[red]The example mod hello didn't build:[/]\n{escape(how)}")
+    # The mods the self-test loads (steps "Mirage mods" and "Mirage lifecycle"): the native ones built like a mod
+    # author would (their own CMake project, clang-cl when installed), the Lua ones as they are
+    test_mods, how = em.for_self_test(_toolchain(ctx))
+    if test_mods is None:
+        console.print(f"[red]A test mod didn't build:[/]\n{escape(how)}")
         ctx.exit(1)
-    test_mods = [hello, em.EXAMPLES / "hello-lua"]
-    console.print(f"Example mods: {how}, hello-lua")
+    console.print(f"Test mods: {how}")
     if (game_dir / "memenu" / "disabled").exists():
         console.print("[yellow]memenu\\disabled exists: the loader would skip the menu. Removed it.[/]")
         (game_dir / "memenu" / "disabled").unlink()

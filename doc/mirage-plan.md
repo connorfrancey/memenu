@@ -182,6 +182,38 @@ of step 6, where Lua first gets game objects.
 a set of test mods loads in the right order, a deliberately crashing mod is caught, named and disabled, and the rest
 keep running; a hot reload round trip works ten times in a row.
 
+**Status (2026-11-11): done, except two parts.** `src/runtime/resolve` decides what loads and in what order:
+dependencies first, then phase, then id. A mod is left out, with the reason, for a runtime out of range, being off or
+having crashed, a missing, out-of-range, left-out or later-phase requirement, an incompatible mod, or a cycle of
+required mods, and that spreads to the mods that need it. Optional dependencies only order (with warnings when they
+can't), and optional cycles are broken. 13 unit tests cover chains, cycles, version conflicts, optional deps, phases and
+the off list.
+
+Phases: early at the menu's start, engine once the game layer is up, world on the first tick after a level loaded.
+Mods of the later phases publish their modules as a batch: the menu's module list only grows once it runs (reserved,
+count published atomically), the render thread adds them, gives them their saved config and the scheduler takes
+them. The config now keeps the entries of modules not loaded this time.
+
+Crash isolation: every call into native code is guarded. A crash stops the whole mod and logs its name, callback,
+exception and `dll+offset`. It also writes `crashes.toml` next to the mods, which leaves the mod out at the next start
+until its entry is deleted. The menu's crash handler names a mod whose code crashed on a thread it started.
+
+Hot reload: Lua mods by default, native ones with `hot_reload = true` (their DLL runs from a copy in `.mirage`). A
+watcher on the game thread checks the files twice a second and waits until they stop changing. A reload switches the
+mod's modules off (its old `on_disable` undoes its changes), waits for calls still running, unloads, and loads again.
+The modules it registers again are the same menu modules, so settings, keys and on/off state carry over.
+
+Self-test "Mirage lifecycle" (`tests/mods`, deployed by `game-test`): order across the early and engine phases, the
+cycle and missing-dependency mods left out, a world-phase mod, `crasher` (native, clang-cl) caught at
+`crasher.dll+0x14E0` while the others go on and left out by the next resolution, Lua hot reload 10 times (new code
+each time, setting and on state kept, 1 KB left after the first), the watcher, and native hot reload 10 times. One full
+run of the five with this code crashed the game in `ntdll` during the "Speedrun timer" level restart, with no mod
+involved; the four after it passed. Not explained yet.
+
+Left: TAS memory classification for mods (the snapshot memory map; mods opting in to being rewound) waits for step 6,
+where mods get game objects. Attributing crashes on a mod's own thread is in place but not covered by a test (it would
+take the game down).
+
 ### 6. Hooks and events
 
 - Event bus: tick, render, level load, death, input, player state change, script events (the existing hooks, now

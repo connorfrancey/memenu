@@ -121,7 +121,7 @@ namespace mirage::mods
 		};
 
 		static const std::set<std::string> known = {"id", "name", "version", "description", "authors", "mirage", "game",
-			"entry", "lua", "phase", "content", "dependencies", "optional", "incompatible", "settings"};
+			"entry", "lua", "phase", "content", "dependencies", "optional", "incompatible", "settings", "hot_reload"};
 		for (const auto& [key, value] : root.as_table())
 			if (!known.count(key)) warn("unknown key '" + key + "' (ignored)");
 
@@ -159,6 +159,12 @@ namespace mirage::mods
 		else if (phase == "engine") m.phase = Phase::Engine;
 		else if (phase == "world") m.phase = Phase::World;
 		else error("phase '" + phase + "' must be early, engine or world");
+
+		m.hotReload = m.entry.empty();
+		if (root.contains("hot_reload")) {
+			if (root.at("hot_reload").is_boolean()) m.hotReload = root.at("hot_reload").as_boolean();
+			else error("hot_reload must be true or false");
+		}
 
 		m.content = strings("content");
 		for (const std::string& c : m.content)

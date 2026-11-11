@@ -24,5 +24,7 @@ set_target_properties(hello PROPERTIES
 if(MSVC)
   target_compile_options(hello PRIVATE /W4 /utf-8)
 endif()
-add_custom_command(TARGET hello POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/mod.toml ${CMAKE_BINARY_DIR}/mod/hello/mod.toml)
+# mod.toml next to the DLL, on every build (it can change without the DLL being relinked)
+add_custom_target(hello_manifest ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/mod.toml ${CMAKE_BINARY_DIR}/mod/hello/mod.toml
+        DEPENDS hello)

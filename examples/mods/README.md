@@ -83,3 +83,15 @@ Greeting = m:text("Greeting", "Hello from Lua")
 
 `on_tick` runs on the game thread and `on_render` on the render thread. If a callback raises an error, the error is
 logged and its module is switched off.
+
+## Load order, phases and hot reload
+
+- Mods load after the mods in their `[dependencies]` and `[optional]` lists, within their `phase`. A mod that can't
+  load (a missing dependency, a cycle, a runtime it doesn't support) is left out, and the menu's log says why.
+- `phase = "early"` loads at the menu's start, `"engine"` (the default) once the game layer is ready, and `"world"` when
+  the first level has loaded.
+- Save a Lua mod's file and the mod reloads by itself: its modules stay on, and their settings keep their values. A
+  native mod does the same with `hot_reload = true`. Its DLL runs from a copy, so a new build can replace it while the
+  game runs. Its `OnDisable` must undo everything the mod changed.
+- If a mod crashes, it is stopped and named in the log, and the rest of the menu goes on. The crash is written to
+  `mods\crashes.toml`, and the mod isn't loaded again until its entry there is deleted.

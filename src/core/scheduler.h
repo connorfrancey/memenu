@@ -41,6 +41,8 @@ namespace sched
 	void AddTask(std::string name, Schedule schedule, std::function<void()> run, std::function<bool()> needsUpdate = {});
 	
 	void Init();		// After modules::Init(): builds the run order
+	// A module added after Init (a mod's): joins the run order at the next tick. Any thread.
+	void AddModule(Module& module);
 	void Tick();		// Game thread, once per engine tick
 	
 	void SetBudget(double milliseconds);	// Per-tick time for Low/Background work (default 1.5 ms)

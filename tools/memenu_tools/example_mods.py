@@ -15,6 +15,7 @@ from .toolchain import Toolchain
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "examples" / "mods"
+TEST_MODS = ROOT / "tests" / "mods"          # The self-test's own mods (load order, phases, hot reload, a crash)
 OUT = ROOT / "build" / "example-mods"
 
 
@@ -22,12 +23,15 @@ def clang_cl() -> str | None:
     return shutil.which("clang-cl")
 
 
-def build_native(tc: Toolchain, name: str = "hello", compiler: str | None = None) -> tuple[Path | None, str]:
-    """Builds examples/mods/<name> in its own build folder. Returns (the built mod's folder, a log tail)."""
+def build_native(tc: Toolchain, name: str = "hello", compiler: str | None = None,
+                 source: Path | None = None) -> tuple[Path | None, str]:
+    """Builds the native mod in `source` (default examples/mods/<name>) in its own build folder.
+    Returns (the built mod's folder, a log tail)."""
+    source = source or EXAMPLES / name
     compiler = compiler if compiler is not None else (clang_cl() or "")
     tag = "clang" if compiler and "clang" in Path(compiler).name.lower() else "msvc"
     build = OUT / f"{name}-{tag}"
-    configure = [tc.cmake, "-S", str(EXAMPLES / name), "-B", str(build), "-G", "Ninja",
+    configure = [tc.cmake, "-S", str(source), "-B", str(build), "-G", "Ninja",
                  f"-DCMAKE_MAKE_PROGRAM={tc.ninja}", "-DCMAKE_BUILD_TYPE=Release"]
     if tag == "clang":
         configure += [f"-DCMAKE_CXX_COMPILER={compiler}", "-DCMAKE_CXX_FLAGS=-m32"]
@@ -40,6 +44,18 @@ def build_native(tc: Toolchain, name: str = "hello", compiler: str | None = None
         if r.returncode != 0:
             return None, log[-3000:]
     return build / "mod" / name, f"{name} built with {tag}"
+
+
+def for_self_test(tc: Toolchain) -> tuple[list[Path] | None, str]:
+    """Every mod the self-test loads: the examples and tests/mods, the native ones built. (folders, what was built)"""
+    hello, how = build_native(tc, "hello")
+    if hello is None:
+        return None, how
+    crasher, how2 = build_native(tc, "crasher", source=TEST_MODS / "crasher")
+    if crasher is None:
+        return None, how2
+    lua = [d for d in sorted(TEST_MODS.iterdir()) if d.is_dir() and (d / "main.lua").exists()]
+    return [hello, EXAMPLES / "hello-lua", crasher, *lua], f"{how}, {how2}, {len(lua) + 1} Lua mods"
 
 
 def install_for_test(game_dir: Path, folders: list[Path]) -> Path:

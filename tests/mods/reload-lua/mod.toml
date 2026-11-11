@@ -1,0 +1,9 @@
+id = "reload-lua"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): hot reload, rewritten by the self-test"
+# hot_reload = true is the default for a Lua mod
+
+[settings.kept]
+type = "string"
+name = "Kept"
+default = "default"

@@ -22,7 +22,9 @@
 #include "runtime/engine_calls.h"
 #include "runtime/layout.h"
 #include "runtime/lua_vm.h"
+#include "runtime/memory.h"
 #include "runtime/mods.h"
+#include "runtime/resolve.h"
 #include "runtime/packages.h"
 #if MEMENU_FEATURE_SPEEDRUN_TIMER
 #include "speedrun/live.h"
@@ -75,6 +77,7 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -601,11 +604,16 @@ public:
         logging::CopySince(logId_, entries);
         for (const auto& e : entries) {
             if (e.text.rfind("Self-test", 0) == 0) continue;
-            if (e.level >= logging::Level::Error) Problem("log: " + e.text);
-            else if (e.level == logging::Level::Warn) step_.notes.push_back("log warning: " + e.text);
+            const bool expected = std::any_of(expected_.begin(), expected_.end(),
+                                              [&](const std::string& part) { return e.text.find(part) != std::string::npos; });
+            if (e.level >= logging::Level::Error && !expected) Problem("log: " + e.text);
+            else if (e.level >= logging::Level::Warn) step_.notes.push_back("log " + std::string(expected ? "(expected)" : "warning") + ": " + e.text);
         }
         step_.seconds = static_cast<double>(GetTickCount64() - start_) / 1000.0;
     }
+
+    // An error the step causes on purpose (a crash it provokes): log lines containing `part` aren't problems
+    void Expect(std::string part) { expected_.push_back(std::move(part)); }
 
     void Problem(std::string text)
     {
@@ -617,6 +625,7 @@ public:
 
 private:
     Step& step_;
+    std::vector<std::string> expected_;
     unsigned frames_ = 0;
     unsigned long long ticks_ = 0;
     std::uint64_t logId_ = 0;
@@ -3155,6 +3164,178 @@ void TestMirageMods()
     p.Check(1, true);
     End(s);
 }
+
+// Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
+// what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
+// hot reload ten times in a row (Lua and native, settings and state kept, no memory left behind), and the file watcher.
+void TestMirageLifecycle()
+{
+    Step& s = Begin("Mirage lifecycle");
+    Probe p(s);
+    namespace mm = mirage::mods;
+    const auto find = [](const std::string& id) {
+        const auto all = mm::List();
+        const auto it = std::find_if(all.begin(), all.end(), [&](const mm::Info& i) { return i.id == id; });
+        return it == all.end() ? std::optional<mm::Info>{} : std::optional<mm::Info>{*it};
+    };
+    const auto has = [](const std::string& text, const char* part) { return text.find(part) != std::string::npos; };
+
+    // ---- Order: order-c (early), then order-b (wants order-c), then order-a (needs order-b)
+    {
+        const auto a = find("order-a"), b = find("order-b"), c = find("order-c");
+        if (!a || !b || !c || !a->loaded || !b->loaded || !c->loaded) {
+            p.Problem("order-a, order-b and order-c should all be loaded");
+        } else {
+            if (!(c->loadIndex < b->loadIndex && b->loadIndex < a->loadIndex))
+                p.Problem("load order " + std::to_string(c->loadIndex) + "/" + std::to_string(b->loadIndex) + "/" +
+                          std::to_string(a->loadIndex) + ": expected order-c, then order-b, then order-a");
+            s.notes.push_back("order: order-c #" + std::to_string(c->loadIndex) + " (early), order-b #" +
+                              std::to_string(b->loadIndex) + ", order-a #" + std::to_string(a->loadIndex));
+        }
+        for (const auto& [id, why] : {std::pair{"order-missing", "isn't installed"}, {"cycle-1", "cycle"}, {"cycle-2", "cycle"}}) {
+            const auto m = find(id);
+            if (!m) p.Problem(std::string(id) + " was not found");
+            else if (m->loaded || !has(m->problem, why))
+                p.Problem(std::string(id) + " should be left out (" + why + "), it is: " + (m->loaded ? "loaded" : m->problem));
+        }
+    }
+
+    // ---- World phase: loaded once the level was in, its module joined the menu on the render thread
+    {
+        const auto w = find("world-lua");
+        if (!w || !w->loaded) p.Problem("world-lua (world phase) didn't load: " + (w ? w->problem : std::string("not found")));
+        else if (!WaitFor(5.0, [] { return modules::Find("Test world-lua") != nullptr; }))
+            p.Problem("world-lua's module never joined the menu");
+        else s.notes.push_back("world phase: world-lua loaded #" + std::to_string(w->loadIndex));
+    }
+
+    // ---- A crash: caught, named, the mod stopped, the others go on, and it won't load next time
+    {
+        Module* crasher = modules::Find("Crasher");
+        Module* hello = modules::Find("Hello (Lua)");
+        if (!crasher || !hello) {
+            p.Problem("the Crasher or Hello (Lua) module is missing");
+        } else {
+            p.Expect("[mod crasher] CRASHED");
+            OnRenderThread([crasher] { crasher->SetEnabled(true); });
+            WaitTicks(3);
+            const auto c = find("crasher");
+            if (!c || c->loaded || !has(c->problem, "crashed") || !has(c->problem, "crasher.dll+0x"))
+                p.Problem("the crash wasn't caught and named: " + (c ? c->problem : std::string("crasher not found")));
+            else s.notes.push_back("crasher: " + c->problem);
+            if (crasher->Enabled()) p.Problem("Crasher is still on after crashing");
+            if (!crasher->Hidden()) p.Problem("Crasher is still listed after crashing");
+            const auto crashed = mm::CrashedMods(paths::Dir() / "selftest-mods");
+            const auto it = crashed.find("crasher");
+            if (it == crashed.end()) p.Problem("crashes.toml doesn't name crasher");
+            else {
+                // The next start: the same mods, resolved with that list, leave crasher out
+                std::vector<mm::Manifest> manifests;
+                for (const auto& e : std::filesystem::directory_iterator(paths::Dir() / "selftest-mods"))
+                    if (auto parsed = mm::Load(e.path()); parsed.manifest) manifests.push_back(*parsed.manifest);
+                const auto next = mm::Resolve(manifests, *mirage::semver::Version::Parse(mm::kRuntimeVersion), crashed);
+                if (!next.excluded.count("crasher") || !has(next.excluded.at("crasher"), "crashed the last time"))
+                    p.Problem("crasher would load again next time");
+            }
+            // The rest go on
+            auto* ticks = dynamic_cast<ctl::Value<int>*>(hello->FindSetting("Ticks"));
+            const int before = ticks ? ticks->Get() : 0;
+            OnRenderThread([hello] { hello->SetEnabled(true); });
+            WaitTicks(10);
+            if (!ticks || ticks->Get() <= before) p.Problem("Hello (Lua) stopped running after crasher crashed");
+            OnRenderThread([hello] { hello->SetEnabled(false); });
+        }
+    }
+
+    // ---- Hot reload, Lua, ten times: new code each time, the setting and the on state kept, no memory left behind
+    {
+        Module* m = modules::Find("Reload (Lua)");
+        const auto file = paths::Dir() / "selftest-mods" / "reload-lua" / "main.lua";
+        std::string code;
+        {
+            std::ifstream in(file, std::ios::binary);
+            std::stringstream t;
+            t << in.rdbuf();
+            code = t.str();
+        }
+        const auto write = [&](int version) {
+            std::string c = code;
+            const auto at = c.find("local VERSION = 0");
+            if (at != std::string::npos) c.replace(at, 17, "local VERSION = " + std::to_string(version));
+            std::ofstream(file, std::ios::binary | std::ios::trunc) << c;
+        };
+        auto* kept = m ? dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Kept")) : nullptr;
+        if (!m || !kept || code.find("local VERSION = 0") == std::string::npos) {
+            p.Problem("Reload (Lua) or its Kept setting is missing");
+        } else {
+            kept->Set("kept across reloads");
+            OnRenderThread([m] { m->SetEnabled(true); });
+            WaitTicks(3);
+            std::int64_t memoryAfterFirst = 0;
+            for (int i = 1; i <= 10; ++i) {
+                write(i);
+                std::string result = "timed out";
+                OnGameThread([&] { result = mm::Reload("reload-lua"); }, 10.0);
+                if (i == 1) memoryAfterFirst = mirage::memory::LiveBytes();
+                auto* status = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Status"));
+                if (!result.empty()) { p.Problem("reload " + std::to_string(i) + ": " + result); break; }
+                if (modules::Find("Reload (Lua)") != m) { p.Problem("reload " + std::to_string(i) + ": a different module"); break; }
+                if (!status || status->Get() != "v" + std::to_string(i)) {
+                    p.Problem("reload " + std::to_string(i) + ": the new code didn't run (Status '" + (status ? status->Get() : "") + "')");
+                    break;
+                }
+                if (!m->Enabled()) { p.Problem("reload " + std::to_string(i) + ": the module isn't on any more"); break; }
+                if (kept->Get() != "kept across reloads") { p.Problem("reload " + std::to_string(i) + ": the setting was reset"); break; }
+            }
+            const std::int64_t grown = mirage::memory::LiveBytes() - memoryAfterFirst;
+            if (grown > 512 * 1024) p.Problem("9 more Lua reloads left " + std::to_string(grown / 1024) + " KB behind");
+            s.notes.push_back("Lua: 10 reloads, memory " + std::to_string(grown / 1024) + " KB after the first");
+
+            // The watcher: a changed file reloads it by itself
+            const int reloadsBefore = find("reload-lua")->reloads;
+            write(42);
+            if (!WaitFor(5.0, [&] { return find("reload-lua")->reloads > reloadsBefore; }))
+                p.Problem("changing main.lua didn't reload the mod by itself");
+            else {
+                auto* status = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Status"));
+                if (!status || status->Get() != "v42") p.Problem("the watcher's reload didn't run the new code");
+                else s.notes.push_back("watcher: main.lua changed, reloaded by itself");
+            }
+            write(0);
+            OnRenderThread([m] { m->SetEnabled(false); });
+        }
+    }
+
+    // ---- Hot reload, native (from a copy of its DLL), ten times with the module on
+    {
+        Module* m = modules::Find("Hello (native)");
+        auto* ticks = m ? dynamic_cast<ctl::Value<int>*>(m->FindSetting("Ticks")) : nullptr;
+        if (!m || !ticks) {
+            p.Problem("Hello (native) is missing");
+        } else {
+            OnRenderThread([m] { m->SetEnabled(true); });
+            WaitTicks(3);
+            for (int i = 1; i <= 10; ++i) {
+                std::string result = "timed out";
+                OnGameThread([&] { result = mm::Reload("hello"); }, 10.0);
+                const int before = ticks->Get();
+                WaitTicks(3);
+                if (!result.empty()) { p.Problem("native reload " + std::to_string(i) + ": " + result); break; }
+                if (!m->Enabled()) { p.Problem("native reload " + std::to_string(i) + ": the module isn't on"); break; }
+                if (ticks->Get() <= before) { p.Problem("native reload " + std::to_string(i) + ": its on_tick doesn't run"); break; }
+            }
+            std::size_t copies = 0;
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(paths::Dir() / "selftest-mods" / "hello" / ".mirage", ec))
+                copies += e.path().extension() == ".dll";
+            if (copies != 1) p.Problem(std::to_string(copies) + " copies of hello.dll in .mirage (one is loaded)");
+            OnRenderThread([m] { m->SetEnabled(false); });
+            s.notes.push_back("native: 10 reloads of hello, ticks " + std::to_string(ticks->Get()));
+        }
+    }
+    p.Check(1, true);
+    End(s);
+}
 #endif
 
 void TestModule(Module& m)
@@ -3398,6 +3579,7 @@ const Named* FeatureList()
         {"Mirage layouts", &TestMirageLayouts, false},
         {"Mirage calls", &TestMirageCalls, false},
         {"Mirage mods", &TestMirageMods, false},
+        {"Mirage lifecycle", &TestMirageLifecycle, false},
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},
@@ -3536,7 +3718,8 @@ static void RunTests(bool fromMenu)
         }
 #endif
         std::vector<Module*> mods;
-        modules::ForEach([&](modules::Tab&, Module& m) { if (Selected(m)) mods.push_back(&m); });
+        // Hidden ones aren't in the menu (a crashed mod's, developer-only ones while developer mode is off)
+        modules::ForEach([&](modules::Tab&, Module& m) { if (Selected(m) && !m.Hidden()) mods.push_back(&m); });
         // Actions that leave the level go last
         std::stable_partition(mods.begin(), mods.end(), [](Module* m) { return m->Name() != "Main Menu"; });
         for (Module* m : mods) {

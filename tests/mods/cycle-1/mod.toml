@@ -1,0 +1,6 @@
+id = "cycle-1"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): needs cycle-2, which needs it: left out"
+phase = "engine"
+[dependencies]
+cycle-2 = "*"

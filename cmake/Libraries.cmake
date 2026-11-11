@@ -228,9 +228,9 @@ CPMAddPackage(
 )
 endif()
 
-# toml11 (https://github.com/ToruNiina/toml11): TOML for Mirage's own files: mod manifests (mod.toml, step 4: the
-# runtime will need it too) and the SDK generator's configuration (tools/sdkgen/sdkgen.toml). Header only.
-if(MEMENU_BUILD_SDKGEN)
+# toml11 (https://github.com/ToruNiina/toml11): TOML for Mirage's own files: mod manifests (mod.toml, read by the
+# runtime and the unit tests) and the SDK generator's configuration (tools/sdkgen/sdkgen.toml). Header only.
+if(MEMENU_GAME OR MEMENU_BUILD_SDKGEN OR MEMENU_BUILD_TESTS)
 CPMAddPackage(
         NAME toml11
         GITHUB_REPOSITORY ToruNiina/toml11
@@ -320,7 +320,8 @@ endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE
         imgui imjson minhook d3d9 shell32 spdlog::spdlog zstd_compress nlohmann_json::nlohmann_json winmm)
 if(MEMENU_GAME)
-  target_link_libraries(${PROJECT_NAME} PRIVATE mirage::sdk UnrealLib::Linker lua::lua)
+  target_link_libraries(${PROJECT_NAME} PRIVATE mirage::sdk UnrealLib::Linker lua::lua toml11::toml11)
+  target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/api)   # mirage/api.h: the mod ABI
 endif()
 
 # -------------------------------------------------------------------------------------------------

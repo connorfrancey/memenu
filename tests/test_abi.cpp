@@ -1,0 +1,76 @@
+// The Mirage mod ABI (api/mirage/api.h) is frozen: these are the sizes and offsets of ABI v1 on the game's 32-bit
+// target. A failure here means a change that breaks mods already built: append to MirageApi instead (and add the new
+// fields' offsets below), never insert, remove, reorder or retype.
+#include "mirage/api.h"
+
+#include <gtest/gtest.h>
+
+#include <cstddef>
+
+static_assert(sizeof(void*) == 4, "the ABI is frozen for the game's 32-bit target");
+
+// ---- ABI v1 ------------------------------------------------------------------------------------------------------------
+static_assert(MIRAGE_ABI_VERSION >= 1);
+static_assert(MIRAGE_LOG_DEBUG == 0 && MIRAGE_LOG_INFO == 1 && MIRAGE_LOG_WARN == 2 && MIRAGE_LOG_ERROR == 3);
+static_assert(MIRAGE_MODULE_ACTION == 0x1u && MIRAGE_MODULE_ENABLED_BY_DEFAULT == 0x2u);
+
+static_assert(sizeof(MirageModuleDesc) == 52);
+static_assert(offsetof(MirageModuleDesc, size) == 0);
+static_assert(offsetof(MirageModuleDesc, name) == 4);
+static_assert(offsetof(MirageModuleDesc, tab) == 8);
+static_assert(offsetof(MirageModuleDesc, description) == 12);
+static_assert(offsetof(MirageModuleDesc, order) == 16);
+static_assert(offsetof(MirageModuleDesc, key) == 20);
+static_assert(offsetof(MirageModuleDesc, flags) == 24);
+static_assert(offsetof(MirageModuleDesc, user) == 28);
+static_assert(offsetof(MirageModuleDesc, on_enable) == 32);
+static_assert(offsetof(MirageModuleDesc, on_disable) == 36);
+static_assert(offsetof(MirageModuleDesc, on_tick) == 40);
+static_assert(offsetof(MirageModuleDesc, on_render) == 44);
+static_assert(offsetof(MirageModuleDesc, on_trigger) == 48);
+
+#define MIRAGE_AT(field, offset) static_assert(offsetof(MirageApi, field) == (offset), #field " moved")
+MIRAGE_AT(size, 0);
+MIRAGE_AT(abi_version, 4);
+MIRAGE_AT(runtime_version, 8);
+MIRAGE_AT(log, 12);
+MIRAGE_AT(mod_id, 16);
+MIRAGE_AT(mod_version, 20);
+MIRAGE_AT(mod_dir, 24);
+MIRAGE_AT(module_register, 28);
+MIRAGE_AT(module_enabled, 32);
+MIRAGE_AT(module_set_enabled, 36);
+MIRAGE_AT(setting_checkbox, 40);
+MIRAGE_AT(setting_slider, 44);
+MIRAGE_AT(setting_slider_int, 48);
+MIRAGE_AT(setting_text, 52);
+MIRAGE_AT(setting_key, 56);
+MIRAGE_AT(setting_get_int, 60);
+MIRAGE_AT(setting_get_float, 64);
+MIRAGE_AT(setting_set_int, 68);
+MIRAGE_AT(setting_set_float, 72);
+MIRAGE_AT(setting_get_text, 76);
+MIRAGE_AT(setting_set_text, 80);
+MIRAGE_AT(key_down, 84);
+MIRAGE_AT(config_get, 88);
+MIRAGE_AT(config_set, 92);
+MIRAGE_AT(screen_size, 96);
+MIRAGE_AT(draw_text, 100);
+MIRAGE_AT(draw_line, 104);
+MIRAGE_AT(draw_rect, 108);
+MIRAGE_AT(draw_rect_filled, 112);
+MIRAGE_AT(text_size, 116);
+// Size of ABI v1's table: a later version only makes it larger
+static_assert(sizeof(MirageApi) >= 120);
+
+TEST(Abi, NewerRuntimeTableCoversOlderMods)
+{
+	// A runtime whose table stops before a field doesn't have it, as a mod built against a newer header sees it
+	MirageApi api{};
+	api.size = offsetof(MirageApi, text_size);
+	api.text_size = nullptr;
+	EXPECT_FALSE(MIRAGE_API_HAS(&api, text_size));
+	api.size = sizeof(MirageApi);
+	api.text_size = [](const char*, float*, float*) {};
+	EXPECT_TRUE(MIRAGE_API_HAS(&api, text_size));
+}

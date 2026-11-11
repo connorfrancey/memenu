@@ -3830,6 +3830,9 @@ void TestMirageLifecycle()
 void TestModule(Module& m)
 {
     Step& s = Begin("module " + m.Tab() + "/" + m.Name());
+    // Its column drawn open, however the player left it (a collapsed column draws none of its panels)
+    gui::OpenColumnForTest(m.Tab().c_str());
+    struct CloseColumn { ~CloseColumn() { gui::OpenColumnForTest(""); } } closeColumn;
     const unsigned n = g_options.ticks;
     Probe p(s);
     const bool drawsHud = kDrawsHud.count(m.Name()) != 0;

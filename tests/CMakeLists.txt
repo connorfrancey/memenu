@@ -3,6 +3,7 @@
 
 add_executable(memenu_tests
         test_math.cpp
+        test_cache_system.cpp
         test_mesh.cpp
         test_replay.cpp
         test_timeline.cpp
@@ -45,6 +46,8 @@ add_executable(memenu_tests
         ${CMAKE_SOURCE_DIR}/src/core/scheduler.cpp
         ${CMAKE_SOURCE_DIR}/src/core/clock.cpp
         ${CMAKE_SOURCE_DIR}/src/core/cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cache_evict.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cache_sched.cpp
         ${CMAKE_SOURCE_DIR}/src/core/memory_cache.cpp
         ${CMAKE_SOURCE_DIR}/src/core/signature_cache.cpp
         ${CMAKE_SOURCE_DIR}/src/core/address_cache.cpp

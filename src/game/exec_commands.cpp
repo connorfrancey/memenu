@@ -1,4 +1,5 @@
 #include "exec_commands.h"
+#include "game/object_query.h"
 
 #include "game/uobject.h"
 
@@ -49,10 +50,8 @@ std::vector<game::ExecCommand> Scan()
     struct Fn { Classes::UObject* fn; std::string name, owner; };
     std::vector<Fn> fns;
     std::unordered_map<std::string, Classes::UObject*> anchors;   // "Owner.Name" of the calibration functions
-    const auto& objects = Classes::UObject::GetGlobalObjects();
-    for (std::size_t i = 0; i < objects.Num(); ++i) {
-        Classes::UObject* o = objects.GetByIndex(i);
-        if (!o || o->Class != fnClass || !o->Outer) continue;
+    for (Classes::UObject* o : game::ObjectsOf(fnClass)) {     // The object index (game/object_query.h)
+        if (o->Class != fnClass || !o->Outer) continue;
         Fn f{o, o->GetName(), o->Outer->GetName()};
         // Lower case: the engine spells them its own way (SloMo)
         const std::string key = Lower(f.owner + "." + f.name);

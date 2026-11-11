@@ -1,5 +1,6 @@
 #pragma once
 #include "core/cache.h"
+#include "core/cache_evict.h"
 #include "core/negative_cache.h"
 #include "core/string_cache.h"
 
@@ -24,10 +25,20 @@
 // Without optimizations (MEMENU_OPTIMIZATIONS off) every Find() asks the SDK again.
 namespace game
 {
-	class ObjectCache
+	// Under the eviction manager (core/cache_evict.h): trimmed, it forgets what it found (found again when asked).
+	class ObjectCache : public cache::Evictor::Member
 	{
 	public:
 		explicit ObjectCache(std::string name, std::uint32_t retryTicks = 120);
+
+		std::size_t Bytes() const override { return found_.size() * (sizeof(Entry) + 6 * sizeof(void*)); }
+		std::size_t Trim(std::size_t) override
+		{
+			const std::size_t n = Bytes();
+			Clear();
+			return n;
+		}
+		std::uint64_t Hits() const override { return stats_->hits.load(std::memory_order_relaxed); }
 
 		Classes::UObject* Find(std::string_view fullName);
 		template <class T>

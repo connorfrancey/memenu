@@ -32,6 +32,12 @@
 //   core/string_cache.h      str::Intern         one shared copy of each name; compared by pointer
 //   core/hardware.h          hw::Get             CPU, memory, OS and GPU, queried once
 //   game/object_cache.h      game::FindObject    game objects by full name, checked alive on every use
+//   game/object_query.h      game::ObjectsOf     the query cache: an index of the game's objects by class and name
+//                            game::FindByPath    (built in slices), and game::ActorsOf, the levels' actors per tick
+//
+// Over all of them:
+//   core/cache_evict.h       cache::Evictions    one memory budget: the coldest caches give memory back first
+//   core/cache_sched.h       cache::Maintenance  the caches' upkeep in a small time slice of each tick, jobs in turn
 namespace cache
 {
 	// Tick/Level/Timed/Manual: when a value goes stale (see above). Lru and Persistent only label statistics: an LRU

@@ -22,7 +22,8 @@ namespace game
 	}
 
 	ObjectCache::ObjectCache(std::string name, std::uint32_t retryTicks)
-		: stats_(&cache::Register(name, cache::Scope::Level)), missing_(name + " (not found)", RetryPolicy(retryTicks)) {}
+		: cache::Evictor::Member(name), stats_(&cache::Register(name, cache::Scope::Level)),
+		  missing_(name + " (not found)", RetryPolicy(retryTicks)) {}
 
 	Classes::UObject* ObjectCache::Find(std::string_view fullName)
 	{

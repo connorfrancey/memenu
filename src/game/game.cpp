@@ -1,4 +1,5 @@
 #include "game.h"
+#include "game/object_query.h"
 #include "game/object_cache.h"
 #include "game/object_ref.h"
 #include "game/uobject.h"
@@ -625,6 +626,7 @@ bool game::Init()
         HookProcessEvent();
     }
     spdlog::info("Game integration ready");
+    InitObjectQueries();    // The object index and actor cache, the cache scheduler's jobs (game/object_query.h)
     return true;
 }
 

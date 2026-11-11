@@ -24,6 +24,9 @@
 #include "runtime/fhooks.h"
 #include "runtime/file_redirect.h"
 #include "runtime/texture_overlays.h"
+#include "core/cache_evict.h"
+#include "core/cache_sched.h"
+#include "game/object_query.h"
 #include "runtime/script_patch.h"
 #include "runtime/reflect.h"
 #include "runtime/layout.h"
@@ -3416,6 +3419,105 @@ void TestMirageModHooks()
     End(s);
 }
 
+// The cache system (core/cache_evict.h, core/cache_sched.h, game/object_query.h): the object index is built in slices by
+// the cache scheduler; its answers are the same as a scan of the whole object list, and faster (timed here against the
+// scans it replaced); the actor cache reads the levels' own actor lists; everything is under the eviction manager.
+void TestCacheSystem()
+{
+    Step& s = Begin("Cache system");
+    Probe p(s);
+    // A pass made in slices by the cache scheduler (not one a query made at once)
+    if (!WaitFor(20.0, [] { const auto st = game::GetQueryStats(); return st.passes > st.exactPasses; }))
+        p.Problem("the cache scheduler didn't complete an object index pass in 20 s");
+    const auto ms = [](clk::Ticks t) { return clk::Seconds(t) * 1000.0; };
+    char line[240];
+    OnGameThread([&] {
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        // ---- By class: every UFunction
+        Classes::UClass* fnClass = Classes::UFunction::StaticClass();
+        clk::Ticks t0 = clk::Now();
+        std::size_t scanned = 0;
+        for (std::size_t i = 0; i < objects.Num(); ++i)
+            if (auto* o = objects.GetByIndex(i); o && o->Class == fnClass) ++scanned;
+        const double scanMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        std::size_t indexed = 0;
+        for (auto* o : game::ObjectsOf(fnClass)) indexed += o->Class == fnClass;
+        const double indexMs = ms(clk::Now() - t0);
+        if (indexed != scanned) p.Problem("ObjectsOf(Function) found " + std::to_string(indexed) + ", a scan " + std::to_string(scanned));
+        std::snprintf(line, sizeof line, "by class: %zu functions in %.3f ms (a scan: %.3f ms)", indexed, indexMs, scanMs);
+        s.notes.push_back(line);
+
+        // ---- By path: the old fallback built every object's name
+        const std::string path = "TdGame.Default__TdPawn";
+        t0 = clk::Now();
+        Classes::UObject* slow = nullptr;
+        for (std::size_t i = 0; i < objects.Num() && !slow; ++i)
+            if (auto* o = objects.GetByIndex(i); o && o->GetName() == "Default__TdPawn" && o->GetPathName() == path) slow = o;
+        const double slowMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        Classes::UObject* fast = game::FindByPath(path);
+        const double fastMs = ms(clk::Now() - t0);
+        if (!slow || fast != slow) p.Problem("FindByPath(" + path + ") isn't what a scan finds");
+        std::snprintf(line, sizeof line, "by path: %s in %.3f ms (a name scan: %.3f ms, x%.0f)", path.c_str(), fastMs, slowMs,
+                      fastMs > 0 ? slowMs / fastMs : 0.0);
+        s.notes.push_back(line);
+
+        // ---- Actors: the pawns in play
+        Classes::UClass* pawnClass = Classes::APawn::StaticClass();
+        t0 = clk::Now();
+        std::vector<Classes::UObject*> all;
+        for (std::size_t i = 0; i < objects.Num(); ++i)
+            if (auto* o = objects.GetByIndex(i); o && game::IsA(o, pawnClass) && o->GetName().rfind("Default__", 0) != 0) all.push_back(o);
+        const double pawnScanMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        const auto pawns = game::ActorsOf(pawnClass);
+        const double actorsMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        game::ActorsOf(pawnClass);
+        const double againMs = ms(clk::Now() - t0);
+        const auto st = game::GetQueryStats();
+        if (!st.levelListsOk) p.Problem("the levels' actor lists weren't usable (ULevel::Actors at 0x3C, WorldInfo first)");
+        if (std::find(pawns.begin(), pawns.end(), static_cast<Classes::AActor*>(game::Pawn())) == pawns.end())
+            p.Problem("ActorsOf(Pawn) hasn't the player's pawn");
+        for (auto* a : pawns) {
+            if (!game::IsA(a, pawnClass)) { p.Problem("ActorsOf(Pawn) returned a " + a->Class->GetName()); break; }
+            if (std::find(all.begin(), all.end(), a) == all.end()) { p.Problem("ActorsOf(Pawn) returned an object a scan doesn't find"); break; }
+        }
+        std::snprintf(line, sizeof line, "actors: %zu pawns of %zu actors in %zu levels in %.3f ms, %.4f ms again this tick (a scan: "
+                      "%.3f ms, %zu pawn objects)", pawns.size(), st.actors, st.levels, actorsMs, againMs, pawnScanMs, all.size());
+        s.notes.push_back(line);
+        std::snprintf(line, sizeof line, "index: %zu slots, %zu classes, %zu names; %llu passes (%llu at once for a query, "
+                      "%llu sliced ones restarted), the last %.2f ms of scanning", st.slots, st.classes, st.names,
+                      static_cast<unsigned long long>(st.passes), static_cast<unsigned long long>(st.exactPasses),
+                      static_cast<unsigned long long>(st.restarts), st.lastPassMs);
+        s.notes.push_back(line);
+
+        // ---- The managers
+        const auto pass = cache::Evictions().Enforce();
+        const auto caches = cache::Evictions().Snapshot();
+        if (std::none_of(caches.begin(), caches.end(), [](const auto& v) { return v.name == "Object index"; }))
+            p.Problem("the object index isn't under the eviction manager");
+        if (pass.after > cache::Evictions().Budget()) p.Problem("over the cache budget after an eviction pass");
+        std::snprintf(line, sizeof line, "eviction: %zu caches, %.1f KB of %.0f KB budget", caches.size(), pass.after / 1024.0,
+                      cache::Evictions().Budget() / 1024.0);
+        s.notes.push_back(line);
+    });
+    const auto jobs = cache::Maintenance().Snapshot(clk::Seconds(clk::Now()));
+    for (const char* name : {"Object index", "Eviction"}) {
+        const auto it = std::find_if(jobs.begin(), jobs.end(), [&](const auto& j) { return j.name == name; });
+        if (it == jobs.end() || it->runs == 0) p.Problem(std::string("the cache scheduler never ran ") + name);
+        else {
+            std::snprintf(line, sizeof line, "job %s: %llu runs, %llu done, %.2f ms in total", name,
+                          static_cast<unsigned long long>(it->runs), static_cast<unsigned long long>(it->completions), it->totalMs);
+            s.notes.push_back(line);
+        }
+    }
+    WaitTicks(5);       // The measurements ran in one game-thread call: frames go on meanwhile
+    p.Check(1, true);
+    End(s);
+}
+
 // Mirage step 7: a content mod (examples/mods/high-steps, data only) overrides a default property. Its module turns it
 // on and off: on, the class's default object and the player's pawn have the mod's value, and a respawned pawn gets it;
 // off, the exact original is back, on the pawn now and on the next one. No game file is written.
@@ -4074,6 +4176,7 @@ const Named* FeatureList()
         {"Mirage mods", &TestMirageMods, false},
         {"Mirage lifecycle", &TestMirageLifecycle, false},
         {"Mirage hooks from mods", &TestMirageModHooks, false},
+        {"Cache system", &TestCacheSystem, false},
         {"Mirage content", &TestMirageContent, false},
         {"Mirage textures", &TestMirageTextures, false},
 #if MEMENU_FEATURE_TAS

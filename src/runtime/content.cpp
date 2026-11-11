@@ -1,6 +1,7 @@
 #include "runtime/content.h"
 
 #include "game/object_cache.h"
+#include "game/object_query.h"
 #include "game/uobject.h"
 #include "runtime/reflect.h"
 #include "runtime/texture_overlays.h"
@@ -97,10 +98,7 @@ namespace mirage::content
 			const std::string name = key.substr(key.find_last_of('.') + 1);
 			if (name.rfind("Default__", 0) == 0)
 				if (auto* o = game::FindObject<Classes::UObject>(name.substr(9) + " " + key)) return o;
-			const auto& objects = Classes::UObject::GetGlobalObjects();
-			for (std::size_t i = 0; i < objects.Num(); ++i)
-				if (auto* o = objects.GetByIndex(i); o && o->GetName() == name && o->GetPathName() == key) return o;
-			return nullptr;
+			return game::FindByPath(key);		// The object index: by name, no string built per object
 		}
 
 		bool IsDefaultObject(const Classes::UObject* o) { return o->GetName().rfind("Default__", 0) == 0; }
@@ -213,10 +211,8 @@ namespace mirage::content
 			std::vector<Classes::UObject*> objects{object};
 			if (t.instances && IsDefaultObject(object)) {
 				// Every object of the default object's class, as it is now
-				const auto& all = Classes::UObject::GetGlobalObjects();
-				for (std::size_t i = 0; i < all.Num(); ++i)
-					if (auto* o = all.GetByIndex(i); o && o != object && o->Class == object->Class && !IsDefaultObject(o))
-						objects.push_back(o);
+				for (Classes::UObject* o : game::ObjectsOf(object->Class, game::Freshness::Exact))
+					if (o != object && o->Class == object->Class && !IsDefaultObject(o)) objects.push_back(o);
 			}
 			for (Classes::UObject* o : objects) {		// The default object first: the instances' originals come from it
 				++set.stats.objects;

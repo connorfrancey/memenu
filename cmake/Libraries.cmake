@@ -261,6 +261,22 @@ if(MEMENU_GAME)
     endif()
     add_library(lua::lua ALIAS lua_static)
   endif()
+
+  # mimalloc: the allocator behind the DLL's operator new / delete (src/runtime/memory.cpp). Static, without
+  # MI_OVERRIDE: malloc / free stay the CRT's, so nothing of the game's (or a library's malloc) goes through it. Its
+  # memory comes from VirtualAlloc called by this DLL, which the TAS's memory map counts as the menu's (never rewound).
+  CPMAddPackage(
+      NAME mimalloc
+      GITHUB_REPOSITORY microsoft/mimalloc
+      GIT_TAG ${MIMALLOC_VERSION}
+      OPTIONS
+          "MI_OVERRIDE OFF"
+          "MI_BUILD_SHARED OFF"
+          "MI_BUILD_OBJECT OFF"
+          "MI_BUILD_TESTS OFF"
+          "MI_INSTALL_TOPLEVEL OFF"
+          "MI_WIN_REDIRECT OFF"
+  )
 endif()
 
 # GoogleTest (only needed for the unit tests)
@@ -316,7 +332,7 @@ endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE
         imgui imjson minhook d3d9 shell32 spdlog::spdlog zstd_compress nlohmann_json::nlohmann_json winmm Threads::Threads)
 if(MEMENU_GAME)
-  target_link_libraries(${PROJECT_NAME} PRIVATE mirage::sdk UnrealLib::Linker lua::lua toml11::toml11)
+  target_link_libraries(${PROJECT_NAME} PRIVATE mirage::sdk UnrealLib::Linker lua::lua toml11::toml11 mimalloc-static)
   target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/api)   # mirage/api.h: the mod ABI
 endif()
 

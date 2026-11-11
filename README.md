@@ -734,7 +734,12 @@ MirrorsEdge.exe
    on the game's code. An unhooked call costs under a nanosecond; a Lua hook adds about 1 us. Self-tests "Mirage
    function hooks" and "Mirage hooks from mods".
 
-**Next:** content and script-patch mods, then moving the menu's features into mods with an in-game mod manager.
+7. **Content mods:** data, no code. `content/defaults.toml` overrides default properties (undone exactly when turned
+   off), and `content/textures/<texture path>.png` (or `.dds`) replaces a texture: the packages holding it open as
+   rewritten copies, made the first time the game loads them and cached, so the game's files are never written. See
+   [`examples/mods/README.md`](examples/mods/README.md). Self-tests "Mirage content" and "Mirage textures".
+
+**Next:** script-patch mods (bytecode), then moving the menu's features into mods with an in-game mod manager.
 
 ### Testing
 

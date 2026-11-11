@@ -2,7 +2,7 @@
 #include "game/game.h"
 #include "game/uobject.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <spdlog/spdlog.h>
 
 #include <vector>

@@ -44,6 +44,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import build as b
+from . import example_mods as em
 from . import features as feat
 from .game import INSTALLER, LAUNCHER, detected_installs, is_elevated, project_version, run_elevated
 from .toolchain import ROOT, Toolchain, ToolchainError, cmake_version, find_toolchain
@@ -727,7 +728,7 @@ def test(ctx: click.Context, config: str, no_build: bool, name_filter: str | Non
     ctx.exit(code and 1)
 
 
-@cli.command("bench")
+@cli.command("bench", context_settings={"ignore_unknown_options": True})
 @click.option("-c", "--config", type=click.Choice(sorted(b.CONFIGS)), default="release", show_default=True,
               help="Build configuration (debug timings say little about the real thing).")
 @click.option("--no-build", is_flag=True, help="Run the benchmarks as they were last built.")
@@ -738,9 +739,10 @@ def test(ctx: click.Context, config: str, no_build: bool, name_filter: str | Non
 @click.pass_context
 def bench(ctx: click.Context, config: str, no_build: bool, list_groups: bool, csv: bool, groups: tuple[str, ...],
           verbose: bool) -> None:
-    """Build and run the benchmarks (nanobench): replays, macros, math, meshes.
+    """Build and run the benchmarks (Google Benchmark): replays, macros, math, meshes.
 
     GROUPS limits the run to the groups whose name contains one of them (case-insensitive), e.g. `memenu bench replay`.
+    Google Benchmark's own flags pass through, e.g. `memenu bench replay --benchmark_repetitions=5`.
     """
     if not no_build:
         _enable_parts(ctx, config, ["benchmarks"], verbose)
@@ -786,6 +788,46 @@ def unreallib(ctx: click.Context, config: str, no_build: bool, cooked_pc: Path |
     console.rule("UnrealLib")
     code = subprocess.run([str(exe), *([str(cooked_pc)] if cooked_pc else [])], cwd=ROOT).returncode
     ctx.exit(code and 1)
+
+
+@cli.command("sdk")
+@config_option
+@click.option("--no-build", is_flag=True, help="Run mirage_sdkgen as it was last built.")
+@click.option("--no-check", is_flag=True, help="Don't compile the generated SDK afterwards (its layout checks).")
+@click.option("--no-report", is_flag=True, help="Don't compare with the old (mmultiplayer) SDK.")
+@click.argument("sdkgen_args", nargs=-1, type=click.UNPROCESSED)
+@verbose_option
+@click.pass_context
+def sdk(ctx: click.Context, config: str, no_build: bool, no_check: bool, no_report: bool,
+        sdkgen_args: tuple[str, ...], verbose: bool) -> None:
+    """Generate the Mirage SDK (sdk/) from the game's packages with mirage_sdkgen, then compile it.
+
+    Settings are in tools/sdkgen/sdkgen.toml; SDKGEN_ARGS go to mirage_sdkgen (after --, e.g. `memenu sdk --
+    --cooked D:/Games/MirrorsEdge/TdGame/CookedPC`). The report of what the old SDK has wrong goes to
+    build/sdk-reference/old-sdk-report.md, with the decompiled script and the Lua stubs.
+    """
+    if not no_build:
+        _enable_parts(ctx, config, ["sdkgen"], verbose)
+        if _build(ctx, config, ("mirage_sdkgen",), verbose=verbose).returncode != 0:
+            ctx.exit(1)
+    exe = _artifact(config, "bin/mirage_sdkgen.exe")
+    if not exe.exists():
+        console.print(f"[red]{exe} not found[/]: build it first (without --no-build).")
+        ctx.exit(1)
+    args = [str(exe)]
+    old = b.cache_value(config, "CPM_PACKAGE_mmultiplayer_SOURCE_DIR")
+    if not no_report and old and (Path(old) / "Client" / "sdk").is_dir():
+        args += ["--old-sdk", str(Path(old) / "Client" / "sdk")]
+    console.rule("mirage_sdkgen")
+    if subprocess.run([*args, *sdkgen_args], cwd=ROOT).returncode != 0:
+        ctx.exit(1)
+    if no_check:
+        return
+    # The SDK's CMakeLists is picked up by tools/sdkgen when it exists: configure again the first time
+    console.rule("Compiling the SDK (every offset and size is a static_assert)")
+    result = b.configure(console, _toolchain(ctx), config, verbose=verbose)
+    if result.returncode != 0 or _build(ctx, config, ("mirage_sdk",), verbose=verbose).returncode != 0:
+        ctx.exit(1)
 
 
 def _remove_build_dir(config: str) -> None:
@@ -1075,6 +1117,13 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
     if devtest.game_pids():
         console.print("[red]Mirror's Edge is running.[/] Close it first.")
         ctx.exit(1)
+    # The mods the self-test loads (steps "Mirage mods" and "Mirage lifecycle"): the native ones built like a mod
+    # author would (their own CMake project, clang-cl when installed), the Lua ones as they are
+    test_mods, how = em.for_self_test(_toolchain(ctx))
+    if test_mods is None:
+        console.print(f"[red]A test mod didn't build:[/]\n{escape(how)}")
+        ctx.exit(1)
+    console.print(f"Test mods: {how}")
     if (game_dir / "memenu" / "disabled").exists():
         console.print("[yellow]memenu\\disabled exists: the loader would skip the menu. Removed it.[/]")
         (game_dir / "memenu" / "disabled").unlink()
@@ -1089,6 +1138,7 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
     attempt = 0
     while True:
         gt.install(game_dir, dll, loader)
+        em.install_for_test(game_dir, test_mods)
         gt.write_options(game_dir, {"map": map_name, "checkpoint": str(checkpoint), "ticks": str(ticks), "only": only,
                                     "skip": skip, "fast": "0" if real_speed else "1",
                                     # The menu never closes the game itself: gt.run does, once the menu has unloaded
@@ -1101,6 +1151,7 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
             ctx.exit(1)
         finally:
             gt.cleanup(game_dir)
+            em.remove_test_mods(game_dir)
         if res.ok or not res.environment or attempt >= retries:
             break
         attempt += 1

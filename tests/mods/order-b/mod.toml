@@ -1,0 +1,6 @@
+id = "order-b"
+version = "1.2.0"
+description = "Self-test mod (tests/mods): loads after order-c, an optional early mod"
+phase = "engine"
+[optional]
+order-c = "*"

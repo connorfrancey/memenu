@@ -25,10 +25,11 @@ option(MEMENU_BUILD_INSTALLER "Build the dinput8.dll loader and memenu_installer
 option(MEMENU_BUILD_LAUNCHER  "Build medge_launcher.exe (injects the DLL into a running game)" OFF)
 option(MEMENU_BUILD_TESTHOST  "Build memenu_testhost.exe (loads the DLL into a D3D9 test app: memenu verbose-build)" OFF)
 option(MEMENU_UNREALLIB       "Build UnrealLib's tests and status tool (unreallib_tests). The DLL links UnrealLib whenever it has the game layer" ${MEMENU_BUILD_TESTS})
+option(MEMENU_BUILD_SDKGEN    "Build mirage_sdkgen.exe (writes the Mirage SDK from the game's packages: memenu sdk)" OFF)
 # Developer mode (`memenu --dev`): the DLL switches its stored developer mode on at every start, which shows the Test
 # module (in-game self-tests). A normal build keeps what the menu stored (Misc > Developer Mode).
 option(MEMENU_DEV_MODE        "Developer build: developer mode on at every start (Test module)" OFF)
-option(MEMENU_BUILD_BENCHMARKS "Build the nanobench benchmarks (memenu_bench: memenu bench)" OFF)
+option(MEMENU_BUILD_BENCHMARKS "Build the Google Benchmark benchmarks (memenu_bench: memenu bench)" OFF)
 # Dev tooling packages (CPMLicenses, Format.cmake): not needed to build the DLL
 option(MEMENU_DEV_TOOLS       "Fetch CPMLicenses.cmake and Format.cmake" OFF)
 # ccache (https://ccache.dev): reuses compiled objects across rebuilds, clean builds and build folders. Needs ccache
@@ -196,7 +197,13 @@ if(MEMENU_BUILD_TESTS)
 endif()
 
 # -------------------------------------------------------------------------------------------------
-# Benchmarks (nanobench)
+# SDK generator (Mirage, step 3): a host tool, run at development time, not part of the DLL
+if(MEMENU_BUILD_SDKGEN)
+  add_subdirectory(tools/sdkgen)
+endif()
+
+# -------------------------------------------------------------------------------------------------
+# Benchmarks (Google Benchmark)
 if(MEMENU_BUILD_BENCHMARKS)
   add_subdirectory(bench)
 endif()

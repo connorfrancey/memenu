@@ -2,7 +2,7 @@
 #include <cstdint>
 
 // The engine-side pieces a TAS needs, found the same way mtas finds them (same byte patterns, same game build as the
-// mmultiplayer SDK):
+// Mirage SDK):
 //
 //   - The engine's frame timing function, which computes the frame's delta time and caps the frame rate. While a
 //     session runs it is replaced: every frame gets exactly the time step the session chooses.

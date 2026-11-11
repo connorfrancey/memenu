@@ -1,0 +1,5 @@
+id = "order-c"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): early phase, needed by nobody, wanted by order-b"
+phase = "early"
+

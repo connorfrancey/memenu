@@ -1,33 +1,27 @@
 #pragma once
-#include <nanobench.h>
+#include <benchmark/benchmark.h>
 
 #include <string>
+#include <utility>
 
-// Every benchmark file registers its groups with MEMENU_BENCH; bench_main.cpp runs the ones the command line asks for.
+// Benchmarks are Google Benchmark functions named "Group/what it measures": bench_main.cpp picks groups by the start of
+// that name (memenu_bench Replay Mesh), the rest of Google Benchmark's flags (--benchmark_*) pass through.
 //
-//     MEMENU_BENCH(Replay) { ankerl::nanobench::Bench b; b.title("Replay"); ... ; return b; }
+//     BENCHMARK(InputHash)->Name("Replay/InputHash (10 min)");
 namespace bench {
 
-struct Group {
-    const char* name;
-    void (*run)(ankerl::nanobench::Bench& bench);
-    Group* next;
-};
+// Keeps a result alive without the deprecated const& DoNotOptimize
+template <class T> void Keep(T&& value)
+{
+    auto copy = std::forward<T>(value);
+    benchmark::DoNotOptimize(copy);
+}
 
-Group*& Groups();
-
-struct Register {
-    Register(Group& g)
-    {
-        g.next = Groups();
-        Groups() = &g;
-    }
-};
+// Reports the time per item too ("t/frame"): what a benchmark that handles `items` things per iteration costs each
+inline void PerItem(benchmark::State& state, double items, const char* unit)
+{
+    state.counters[std::string("t/") + unit] =
+        benchmark::Counter(items, benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kInvert);
+}
 
 } // namespace bench
-
-#define MEMENU_BENCH(name)                                                         \
-    static void Bench_##name(ankerl::nanobench::Bench& bench);                     \
-    static bench::Group g_group_##name{#name, &Bench_##name, nullptr};             \
-    static bench::Register g_register_##name{g_group_##name};                      \
-    static void Bench_##name(ankerl::nanobench::Bench& bench)

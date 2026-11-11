@@ -1,77 +1,69 @@
-// memenu_bench: runs every benchmark group, or the ones named on the command line.
+// memenu_bench: runs every benchmark, or the groups named on the command line (Google Benchmark).
 //
-//     memenu_bench                    all groups
-//     memenu_bench Replay Mesh        only these (case-insensitive substring of the group name)
-//     memenu_bench --list             the groups
-//     memenu_bench --csv         results as CSV (stdout), instead of nanobench's table
-#define ANKERL_NANOBENCH_IMPLEMENT
+//     memenu_bench                    all of them
+//     memenu_bench Replay Mesh        only these groups (case-insensitive substring of the group name)
+//     memenu_bench --list             the benchmarks
+//     memenu_bench --csv              results as CSV (stdout), instead of the table
+//     memenu_bench --benchmark_...    any of Google Benchmark's own flags (--benchmark_repetitions=5, ...)
 #include "bench.h"
 
-#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
-#include <iostream>
 #include <string>
 #include <vector>
 
-bench::Group*& bench::Groups()
-{
-    static Group* head = nullptr;
-    return head;
-}
-
 namespace {
 
-bool Matches(const char* name, const std::vector<std::string>& filters)
+// A group filter as a case-insensitive regex part: letters become [aA], everything else is escaped
+std::string Pattern(const std::string& text)
 {
-    if (filters.empty()) return true;
-    std::string lower = name;
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
-    for (std::string f : filters) {
-        std::transform(f.begin(), f.end(), f.begin(), [](unsigned char c) { return std::tolower(c); });
-        if (lower.find(f) != std::string::npos) return true;
+    std::string out;
+    for (unsigned char c : text) {
+        if (std::isalpha(c)) {
+            out += '[';
+            out += static_cast<char>(std::tolower(c));
+            out += static_cast<char>(std::toupper(c));
+            out += ']';
+        } else if (std::isalnum(c) || c == ' ' || c == '_') {
+            out += static_cast<char>(c);
+        } else {
+            out += '\\';
+            out += static_cast<char>(c);
+        }
     }
-    return false;
+    return out;
 }
 
 } // namespace
 
 int main(int argc, char** argv)
 {
-    std::vector<std::string> filters;
-    bool list = false, csv = false;
+    std::vector<std::string> args{argv[0]}, groups;
     for (int i = 1; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--list")) list = true;
-        else if (!std::strcmp(argv[i], "--csv")) csv = true;
+        if (!std::strcmp(argv[i], "--list")) args.emplace_back("--benchmark_list_tests=true");
+        else if (!std::strcmp(argv[i], "--csv")) args.emplace_back("--benchmark_format=csv");
         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
-            std::puts("usage: memenu_bench [--list] [--csv] [group...]");
+            std::puts("usage: memenu_bench [--list] [--csv] [--benchmark_...] [group...]");
             return 0;
-        } else filters.emplace_back(argv[i]);
+        } else if (!std::strncmp(argv[i], "--", 2)) args.emplace_back(argv[i]);
+        else groups.emplace_back(argv[i]);
+    }
+    if (!groups.empty()) {
+        std::string filter = "--benchmark_filter=^[^/]*(";
+        for (std::size_t i = 0; i < groups.size(); ++i) filter += (i ? "|" : "") + Pattern(groups[i]);
+        args.push_back(filter + ")[^/]*/");
     }
 
-    // Registration order is reversed by the list: collect, then sort by name for a stable output
-    std::vector<bench::Group*> groups;
-    for (bench::Group* g = bench::Groups(); g; g = g->next) groups.push_back(g);
-    std::sort(groups.begin(), groups.end(), [](auto* a, auto* b) { return std::strcmp(a->name, b->name) < 0; });
-
-    if (list) {
-        for (auto* g : groups) std::puts(g->name);
-        return 0;
-    }
-
-    int ran = 0;
-    for (auto* g : groups) {
-        if (!Matches(g->name, filters)) continue;
-        ankerl::nanobench::Bench b;
-        b.title(g->name).warmup(3).minEpochIterations(5).relative(false);
-        if (csv) b.output(nullptr);
-        g->run(b);
-        if (csv) b.render(ankerl::nanobench::templates::csv(), std::cout);
-        ++ran;
-    }
+    std::vector<char*> raw;
+    for (auto& a : args) raw.push_back(a.data());
+    int n = static_cast<int>(raw.size());
+    benchmark::Initialize(&n, raw.data());
+    if (benchmark::ReportUnrecognizedArguments(n, raw.data())) return 1;
+    const std::size_t ran = benchmark::RunSpecifiedBenchmarks();
+    benchmark::Shutdown();
     if (ran == 0) {
-        std::fprintf(stderr, "no benchmark group matches; --list shows them\n");
+        std::fprintf(stderr, "no benchmark matches; --list shows them\n");
         return 1;
     }
     return 0;

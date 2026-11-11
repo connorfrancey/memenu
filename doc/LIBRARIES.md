@@ -1,0 +1,6 @@
+# Libraries
+
+---
+
+ - https://github.com/max0x7ba/atomic_queue
+ - https://github.com/skypjack/entt/

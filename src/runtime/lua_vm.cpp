@@ -114,6 +114,26 @@ namespace mirage::lua
 		return r;
 	}
 
+	Result State::Call(int nargs, int nresults)
+	{
+		Result r;
+		if (!L_) {
+			r.error = "no Lua state (out of memory)";
+			return r;
+		}
+		executed_ = 0;
+		const int status = lua_pcall(L_, nargs, nresults, 0);
+		if (status == LUA_OK) {
+			r.ok = true;
+			return r;
+		}
+		r.error = lua_type(L_, -1) == LUA_TSTRING ? lua_tostring(L_, -1)
+				: status == LUA_ERRMEM ? std::string("not enough memory")
+				: "error (" + std::to_string(status) + ")";
+		lua_pop(L_, 1);
+		return r;
+	}
+
 	const char* Version() { return LUA_RELEASE; }
 
 	namespace

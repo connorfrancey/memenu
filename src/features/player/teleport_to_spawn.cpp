@@ -4,7 +4,7 @@
 #include "game/player_state.h"
 #include "runtime/engine_calls.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <spdlog/spdlog.h>
 
 namespace {

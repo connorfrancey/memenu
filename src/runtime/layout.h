@@ -33,6 +33,10 @@ namespace mirage::layout
 		std::uint32_t boolMask = 0;			// Bool: the bit in its dword
 		std::uint64_t flags = 0;			// CPF_* (Parm 0x80, OutParm 0x100, ReturnParm 0x400, ...)
 		std::string type;					// Struct, class or enum it refers to ("" if none)
+		std::string typePath;				// ... its full path ("Core.Object.Vector", "Engine.Actor")
+		// Array: the element (its kind, and the struct, class or enum it refers to). Interface: type is the interface.
+		Kind innerKind = Kind::Unknown;
+		std::string innerType, innerPath;
 	};
 
 	struct Struct
@@ -42,6 +46,7 @@ namespace mirage::layout
 		std::string super;					// Path of the struct it extends ("" if none)
 		std::uint32_t size = 0;				// PropertySize
 		std::uint32_t alignment = 0;		// Computed only (the engine's MinAlignment is not read)
+		std::uint32_t functionFlags = 0;	// Function: FUNC_* (Static 0x2000, Native 0x400, Event 0x800, ...)
 		std::vector<Property> properties;	// Its own, in link order
 		bool complete = true;				// Computed: every property's type was known (false: offsets after it guessed)
 		std::string note;					// Computed: why not complete
@@ -77,4 +82,11 @@ namespace mirage::layout
 		std::map<std::string, std::size_t> byCause;	// Counted by the kind of the first differing property
 	};
 	Report Compare(const Layouts& live, const Layouts& computed);
+
+	// The packages the SDK is generated for (all the game loads), in dependency order
+	const std::vector<std::string>& SdkPackages();
+
+	// Layouts as JSON and back (FromJson: empty with `error` set when the text isn't valid)
+	std::string ToJson(const Layouts& layouts);
+	Layouts FromJson(const std::string& text, std::string* error = nullptr);
 }

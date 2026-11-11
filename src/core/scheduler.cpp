@@ -49,7 +49,8 @@ namespace sched
 		std::vector<std::unique_ptr<Entry>> g_entries;
 		std::vector<std::unique_ptr<Entry>> g_pending;	// Tasks added since the last tick
 		std::vector<int> g_order;						// Indices into g_entries, run order (game thread)
-		std::unordered_map<const Module*, Entry*> g_byModule;	// Built once by Init, read-only afterwards
+		std::unordered_map<const Module*, Entry*> g_byModule;	// Built by Init, grown by AddModule (g_byModuleMutex)
+		std::mutex g_byModuleMutex;
 		std::atomic<bool> g_initialized{false};			// RenderRecord (render thread) checks it
 		
 		std::atomic<double> g_budgetMs{1.5};
@@ -222,6 +223,21 @@ namespace sched
 		g_pending.push_back(std::move(e));
 	}
 
+	void AddModule(Module& m)
+	{
+		auto e = std::make_unique<Entry>();
+		e->name = m.Name();
+		e->module = &m;
+		e->schedule = m.schedule;
+		e->effectiveInterval.store(m.schedule.interval, std::memory_order_relaxed);
+		{
+			std::lock_guard byModule(g_byModuleMutex);
+			g_byModule.emplace(&m, e.get());
+		}
+		std::lock_guard lock(g_mutex);
+		g_pending.push_back(std::move(e));	// Joins the run order at the next tick (AdoptPending)
+	}
+
 	void Init()
 	{
 		if (g_initialized.load(std::memory_order_acquire)) return;
@@ -233,7 +249,10 @@ namespace sched
 				e->module = &m;
 				e->schedule = m.schedule;
 				e->effectiveInterval.store(m.schedule.interval, std::memory_order_relaxed);
-				g_byModule.emplace(&m, e.get());
+				{
+					std::lock_guard byModule(g_byModuleMutex);
+					g_byModule.emplace(&m, e.get());
+				}
 				g_entries.push_back(std::move(e));
 			});
 			for (auto& e : g_pending) g_entries.push_back(std::move(e));
@@ -412,10 +431,15 @@ namespace sched
 	void RecordRender(const Module& module, double microseconds)
 	{
 		if (!g_initialized.load(std::memory_order_acquire)) return;
-		const auto it = g_byModule.find(&module);
-		if (it == g_byModule.end()) return;
-		Ema(it->second->renderAvgUs, static_cast<float>(microseconds));
-		Max(it->second->renderMaxUs, static_cast<float>(microseconds));
+		Entry* e = nullptr;
+		{
+			std::lock_guard lock(g_byModuleMutex);
+			const auto it = g_byModule.find(&module);
+			if (it == g_byModule.end()) return;
+			e = it->second;
+		}
+		Ema(e->renderAvgUs, static_cast<float>(microseconds));
+		Max(e->renderMaxUs, static_cast<float>(microseconds));
 	}
 
 	const char* PriorityName(Priority p)

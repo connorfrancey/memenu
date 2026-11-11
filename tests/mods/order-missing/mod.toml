@@ -1,0 +1,6 @@
+id = "order-missing"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): needs a mod that isn't there: left out"
+phase = "engine"
+[dependencies]
+not-installed = "*"

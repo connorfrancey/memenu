@@ -16,12 +16,18 @@
 #include "game/game.h"
 #include "game/uobject.h"
 #include "game/levels.h"
+#include "game/object_cache.h"
 #include "game/player_state.h"
 #include "game/save_library.h"
 #include "runtime/call.h"
 #include "runtime/engine_calls.h"
+#include "runtime/fhooks.h"
+#include "runtime/reflect.h"
 #include "runtime/layout.h"
 #include "runtime/lua_vm.h"
+#include "runtime/memory.h"
+#include "runtime/mods.h"
+#include "runtime/resolve.h"
 #include "runtime/packages.h"
 #if MEMENU_FEATURE_SPEEDRUN_TIMER
 #include "speedrun/live.h"
@@ -54,7 +60,7 @@
 #include "tas/tas.h"
 #endif
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <cmath>
 #include <cstdio>
 #endif
@@ -74,6 +80,7 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -600,11 +607,16 @@ public:
         logging::CopySince(logId_, entries);
         for (const auto& e : entries) {
             if (e.text.rfind("Self-test", 0) == 0) continue;
-            if (e.level >= logging::Level::Error) Problem("log: " + e.text);
-            else if (e.level == logging::Level::Warn) step_.notes.push_back("log warning: " + e.text);
+            const bool expected = std::any_of(expected_.begin(), expected_.end(),
+                                              [&](const std::string& part) { return e.text.find(part) != std::string::npos; });
+            if (e.level >= logging::Level::Error && !expected) Problem("log: " + e.text);
+            else if (e.level >= logging::Level::Warn) step_.notes.push_back("log " + std::string(expected ? "(expected)" : "warning") + ": " + e.text);
         }
         step_.seconds = static_cast<double>(GetTickCount64() - start_) / 1000.0;
     }
+
+    // An error the step causes on purpose (a crash it provokes): log lines containing `part` aren't problems
+    void Expect(std::string part) { expected_.push_back(std::move(part)); }
 
     void Problem(std::string text)
     {
@@ -616,6 +628,7 @@ public:
 
 private:
     Step& step_;
+    std::vector<std::string> expected_;
     unsigned frames_ = 0;
     unsigned long long ticks_ = 0;
     std::uint64_t logId_ = 0;
@@ -2391,14 +2404,18 @@ void TestMirageLayouts()
 {
     Step& s = Begin("Mirage layouts");
     Probe p(s);
-    const std::vector<std::string> packages{"Core", "Engine", "TdGame"};
+    // Every package the SDK covers. The native-only ones have no .u file: Compute skips what it can't find
+    const std::vector<std::string>& packages = mirage::layout::SdkPackages();
+    std::vector<std::string> scripts;
+    for (const auto& name : packages)
+        if (std::filesystem::exists(mirage::packages::CookedDir() / (name + ".u"))) scripts.push_back(name);
 
     mirage::layout::Layouts live;
     const clk::Ticks t0 = clk::Now();
     if (!OnGameThread([&] { live = mirage::layout::Live(packages); }, 30.0)) p.Problem("reading the live layouts timed out");
     const double liveSeconds = clk::SecondsSince(t0);
     const clk::Ticks t1 = clk::Now();
-    const mirage::layout::Computed computed = mirage::layout::Compute(mirage::packages::CookedDir(), packages);
+    const mirage::layout::Computed computed = mirage::layout::Compute(mirage::packages::CookedDir(), scripts);
     const double computeSeconds = clk::SecondsSince(t1);
     if (!computed.error.empty()) p.Problem("UnrealLib: " + computed.error);
 
@@ -2456,6 +2473,24 @@ void TestMirageLayouts()
                 }
             }
         }
+    }
+    // What only the engine knows (intrinsic classes, native-only packages): the SDK generator's second input
+    {
+        mirage::layout::Layouts onlyLive;
+        for (const auto& [path, l] : live)
+            if (!computed.layouts.count(path)) onlyLive.emplace(path, l);
+        std::ofstream(paths::Dir() / "mirage-live-layouts.json", std::ios::trunc) << mirage::layout::ToJson(onlyLive);
+        s.notes.push_back(std::to_string(onlyLive.size()) + " engine-only layouts saved to mirage-live-layouts.json");
+    }
+    // The generated SDK's checks the compiler can't make (each bool's bit in its dword; offsets and sizes are
+    // static_asserts): its bitfields as MSVC packs them, against the masks the engine uses
+    {
+        std::string first;
+        if (const int failures = Classes::detail::CheckLayouts(&first))
+            p.Problem("the SDK has " + std::to_string(failures) + " bool bits where the engine doesn't (first: " +
+                      first + ")");
+        else
+            s.notes.push_back("SDK bitfields match the engine");
     }
     if (!r.mismatches.empty())
         p.Problem(std::to_string(r.mismatches.size()) + " structs differ from the engine (first: " +
@@ -3023,10 +3058,594 @@ const std::set<std::string> kDrawsHud = {"Crosshair", "Show FPS", "Watermark", "
 // What the menu draws with its window closed (the modules' HUDs), a few frames after a change.
 unsigned HudVertices()
 {
+    hooks::DescribeDrawLists(true);
     OnRenderThread([] { gui::visible = false; });
+    // Until the count settles: in fast mode a few ticks can pass before the next frame is drawn, and the frame drawn
+    // just before a module switched off still holds what it drew (a HUD that changes every frame, like the speedometer's
+    // digits, never settles: then the last count)
     WaitTicks(3);
-    return hooks::MenuVertices();
+    unsigned last = hooks::MenuVertices();
+    for (int i = 0; i < 20; ++i) {
+        WaitTicks(3);
+        const unsigned now = hooks::MenuVertices();
+        if (now == last) break;
+        last = now;
+    }
+    return last;
 }
+
+#if MEMENU_GAME
+// Mirage step 4: the example mods (examples/mods: hello built by its own CMake project with clang-cl, hello-lua), put in
+// selftest-mods by `memenu game-test`, are loaded; their modules are in the menu, run, draw, save and load their
+// settings like built-in ones, and keep their own config.
+void TestMirageMods()
+{
+    Step& s = Begin("Mirage mods");
+    Probe p(s);
+    const auto mods = mirage::mods::List();
+    for (const char* id : {"hello", "hello-lua"}) {
+        const auto it = std::find_if(mods.begin(), mods.end(), [&](const auto& m) { return m.id == id; });
+        if (it == mods.end()) {
+            p.Problem(std::string(id) + " was not found (is selftest-mods there? memenu game-test puts it)");
+            continue;
+        }
+        if (!it->loaded) p.Problem(std::string(id) + " was not loaded: " + it->problem);
+        else s.notes.push_back(it->id + " " + it->version + " (" + it->kind + "): " + std::to_string(it->modules.size()) + " module(s)");
+        for (const auto& w : it->warnings) p.Problem(std::string(id) + ": " + w);
+    }
+
+    for (const char* name : {"Hello (native)", "Hello (Lua)"}) {
+        Module* m = modules::Find(name);
+        if (!m) {
+            p.Problem(std::string(name) + " is not in the menu");
+            continue;
+        }
+        if (m->Tab() != "Mods") p.Problem(std::string(name) + " is in the " + m->Tab() + " column, not Mods");
+        auto* greeting = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Greeting"));
+        auto* height = dynamic_cast<ctl::Value<float>*>(m->FindSetting("Height"));
+        auto* ticks = dynamic_cast<ctl::Value<int>*>(m->FindSetting("Ticks"));
+        auto* status = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Status"));
+        if (!greeting || !height || !ticks || !status) {
+            p.Problem(std::string(name) + ": its settings are missing or of the wrong type");
+            continue;
+        }
+        // Greeting, Height and Color come from mod.toml ([settings.*]): first in the panel, in the file's order
+        auto* color = dynamic_cast<ctl::Combo*>(m->FindSetting("Color"));
+        if (!color) p.Problem(std::string(name) + ": the choice setting Color from mod.toml is missing");
+        else if (m->Settings().size() < 3 || m->Settings()[0]->Name() != "Greeting" || m->Settings()[2]->Name() != "Color")
+            p.Problem(std::string(name) + ": the mod.toml settings aren't first, in the file's order");
+
+        // Settings save and load like the menu's own (the config writes each with Save, reads it with Load)
+        {
+            nlohmann::ordered_json saved;
+            const std::string before = greeting->Get();
+            greeting->Set("saved greeting");
+            greeting->Save(saved["Greeting"]);
+            height->Set(0.5f);
+            height->Save(saved["Height"]);
+            greeting->Set("changed");
+            height->Set(0.1f);
+            greeting->Load(saved["Greeting"]);
+            height->Load(saved["Height"]);
+            if (greeting->Get() != "saved greeting" || std::fabs(height->Get() - 0.5f) > 1e-6f)
+                p.Problem(std::string(name) + ": settings didn't load back what was saved");
+            height->Set(2.0f);
+            if (height->Get() > 0.95f) p.Problem(std::string(name) + ": Height isn't clamped to its range");
+            greeting->Set(before);
+            height->Set(0.3f);
+        }
+
+        // On: on_enable, on_tick (Ticks counts) and on_render (it draws); off: on_disable
+        const int ticksBefore = ticks->Get();
+        OnRenderThread([] { gui::visible = false; });
+        WaitTicks(3);
+        const unsigned drawnBefore = hooks::MenuVertices();
+        OnRenderThread([m] { m->SetEnabled(true); });
+        WaitTicks(10);
+        const unsigned drawnOn = hooks::MenuVertices();
+        if (!m->Enabled()) p.Problem(std::string(name) + " didn't switch on");
+        if (status->Get().rfind("on (", 0) != 0) p.Problem(std::string(name) + ": on_enable didn't run (Status '" + status->Get() + "')");
+        if (ticks->Get() <= ticksBefore) p.Problem(std::string(name) + ": on_tick didn't run");
+        if (drawnOn <= drawnBefore) p.Problem(std::string(name) + ": on_render drew nothing");
+        OnRenderThread([m] { m->SetEnabled(false); });
+        OnRenderThread([] { gui::visible = true; });
+        WaitTicks(3);
+        if (status->Get() != "off") p.Problem(std::string(name) + ": on_disable didn't run");
+        s.notes.push_back(std::string(name) + ": " + std::to_string(ticks->Get() - ticksBefore) + " ticks, drew " +
+                          std::to_string(drawnOn - drawnBefore) + " vertices, " + status->Get());
+    }
+
+    // Each mod's own config (config.toml in its folder, written by mirage.config.set / mirage::SetConfig)
+    for (const char* id : {"hello", "hello-lua"}) {
+        const auto file = paths::Dir() / "selftest-mods" / id / "config.toml";
+        std::ifstream in(file);
+        std::stringstream text;
+        text << in.rdbuf();
+        if (text.str().find("times_enabled") == std::string::npos)
+            p.Problem(std::string(id) + ": config.toml has no times_enabled");
+    }
+    p.Check(1, true);
+    End(s);
+}
+
+// Mirage step 6: UnrealScript function hooks (runtime/fhooks.h). The offsets they need are found (UFunction::Func,
+// the frame's Locals); a script function called through ProcessEvent (CheckMaxEffectDistance, whose answer depends on
+// its parameters) runs hooks in priority order, sees and changes its parameters, can be replaced; a script function
+// called from script every tick (UpdateMomentumStats) is caught too; removing the hooks puts the function back.
+void TestMirageFunctionHooks()
+{
+    Step& s = Begin("Mirage function hooks");
+    Probe p(s);
+    namespace mh = mirage::hooks;
+    struct Seen
+    {
+        std::vector<std::string> order;
+        float cull = -1.f, z = 0.f;
+        bool after = false, afterResult = false;
+        int momentumCalls = 0;
+        float momentumDelta = 0.f;
+        Classes::UObject* momentumObject = nullptr;
+    } seen;
+    const char* kCheck = "Engine.Actor.CheckMaxEffectDistance";
+    const auto checkOnce = [&](bool& answer, std::string& error) {
+        auto* pc = game::Controller();
+        auto* pawn = game::Pawn();
+        if (!pc || !pawn) { error = "no player"; return false; }
+        mirage::call::Params params(pawn, "CheckMaxEffectDistance");
+        params.Set("P", static_cast<Classes::UObject*>(pc));
+        Classes::FVector at = pc->ViewTarget ? pc->ViewTarget->Location : pawn->Location;
+        params.SetRaw("SpawnLocation", &at, sizeof at);
+        params.Set("CullDistance", 0.f);
+        if (!mirage::call::Call(pawn, params, &error)) return false;
+        answer = params.GetBool("ReturnValue");
+        return true;
+    };
+
+    std::string why;
+    std::vector<int> ids;
+    OnGameThread([&] {
+        if (!mh::Ready(&why)) return;
+        std::string error;
+        // Two before hooks: priority 20 first. The second moves the spawn point far away and sets a cull distance, so
+        // the function answers false where it would answer true
+        ids.push_back(mh::Add(kCheck, mh::When::Before, 10, [](void* u, mh::Call& c) {
+            auto& sn = *static_cast<Seen*>(u);
+            sn.order.push_back("low");
+            sn.cull = mirage::reflect::GetFloat(c.Param("CullDistance"));
+            const auto z = c.Param("SpawnLocation.Z");
+            mirage::reflect::SetFloat(z, mirage::reflect::GetFloat(z) + 100000.f);
+            sn.z = mirage::reflect::GetFloat(z);
+            mirage::reflect::SetFloat(c.Param("CullDistance"), 1.f);
+        }, &seen, &error));
+        ids.push_back(mh::Add(kCheck, mh::When::Before, 20, [](void* u, mh::Call&) { static_cast<Seen*>(u)->order.push_back("high"); },
+                              &seen, &error));
+        ids.push_back(mh::Add(kCheck, mh::When::After, 0, [](void* u, mh::Call& c) {
+            auto& sn = *static_cast<Seen*>(u);
+            sn.after = true;
+            sn.afterResult = mirage::reflect::GetInt(c.Param("ReturnValue")) != 0;
+        }, &seen, &error));
+        ids.push_back(mh::Add("TdGame.TdPlayerController.UpdateMomentumStats", mh::When::Before, 0, [](void* u, mh::Call& c) {
+            auto& sn = *static_cast<Seen*>(u);
+            ++sn.momentumCalls;
+            sn.momentumDelta = mirage::reflect::GetFloat(c.Param("DeltaTime"));
+            sn.momentumObject = c.object;
+        }, &seen, &error));
+        if (!error.empty()) why = error;
+    });
+    if (!why.empty()) {
+        p.Problem("hooks: " + why);
+    } else {
+        bool plain = false, hooked = true;
+        std::string error;
+        // Hooked: the before hooks change its parameters, so it answers false
+        OnGameThread([&] { checkOnce(hooked, error); });
+        if (!error.empty()) p.Problem("CheckMaxEffectDistance: " + error);
+        if (seen.order != std::vector<std::string>{"high", "low"}) p.Problem("before hooks didn't run high priority first");
+        if (seen.cull != 0.f) p.Problem("the hook read CullDistance " + std::to_string(seen.cull) + ", not 0");
+        if (!seen.after) p.Problem("the after hook didn't run");
+        if (hooked) p.Problem("changing its parameters didn't change its answer (true with the point 100000 away)");
+        if (seen.afterResult != hooked) p.Problem("the after hook saw another return value than the caller");
+
+        // Replace: it answers what the hook says, its own code doesn't run
+        int replaceId = 0;
+        OnGameThread([&] {
+            replaceId = mh::Add(kCheck, mh::When::Replace, 30, [](void*, mh::Call& c) {
+                mirage::reflect::SetInt(c.Param("ReturnValue"), 1);
+            }, nullptr, &error);
+        });
+        bool replaced = false;
+        OnGameThread([&] { checkOnce(replaced, error); });
+        if (!replaced) p.Problem("the replace hook's return value didn't reach the caller");
+
+        // Called from script every tick
+        WaitTicks(5);
+        if (seen.momentumCalls == 0) p.Problem("UpdateMomentumStats (called from script) never reached its hook");
+        else if (seen.momentumDelta <= 0.f || seen.momentumObject != game::Controller())
+            p.Problem("UpdateMomentumStats's hook saw DeltaTime " + std::to_string(seen.momentumDelta) + " on the wrong object");
+
+        // Removed: the function as it was
+        OnGameThread([&] {
+            mh::Remove(replaceId);
+            for (int id : ids) mh::Remove(id);
+        });
+        seen.order.clear();
+        OnGameThread([&] { checkOnce(plain, error); });
+        if (!seen.order.empty()) p.Problem("hooks still ran after they were removed");
+        if (!plain) p.Problem("unhooked, CheckMaxEffectDistance at the view target answered false");
+        const auto st = mh::GetStats();
+        if (st.functions != 0 || st.hooks != 0) p.Problem(std::to_string(st.hooks) + " hooks left after removing them");
+        s.notes.push_back(std::to_string(st.calls) + " hooked calls, " +
+                          std::to_string(st.calls ? st.microseconds / static_cast<double>(st.calls) : 0.0) +
+                          " us each around the original (native hooks); UpdateMomentumStats seen " +
+                          std::to_string(seen.momentumCalls) + " times");
+    }
+    p.Check(1, true);
+    End(s);
+}
+
+// Mirage step 6's milestone, with the self-test's own mods: hook-native (C++, priority 20) and hook-lua (priority 10)
+// hook the same function while their modules are on, and run in priority order (each turns CullDistance into
+// x * 10 + its number: 1 then 12); they read game objects by name and get events; reloading them keeps that up and
+// switching them off leaves no hook behind. Measured: what an unhooked script call pays for the detour (its lookup),
+// and what a native and a Lua hook add to a call.
+void TestMirageModHooks()
+{
+    Step& s = Begin("Mirage hooks from mods");
+    Probe p(s);
+    namespace mm = mirage::mods;
+    Module* native = modules::Find("Hook (native)");
+    Module* lua = modules::Find("Hook (Lua)");
+    if (!native || !lua) {
+        p.Problem("the Hook (native) or Hook (Lua) module is missing (tests/mods)");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    const auto value = [](Module* m, const char* name) {
+        auto* v = dynamic_cast<ctl::Value<float>*>(m->FindSetting(name));
+        return v ? v->Get() : -999.f;
+    };
+    // One call of CheckMaxEffectDistance from 0, `count` times: the time per call (us)
+    const auto calls = [&](int count) {
+        double us = -1.0;
+        OnGameThread([&] {
+            auto* pc = game::Controller();
+            auto* pawn = game::Pawn();
+            if (!pc || !pawn) return;
+            mirage::call::Params params(pawn, "CheckMaxEffectDistance");
+            const Classes::FVector at = pawn->Location;
+            const clk::Ticks start = clk::Now();
+            for (int i = 0; i < count; ++i) {
+                params.Set("P", static_cast<Classes::UObject*>(pc));
+                params.SetRaw("SpawnLocation", &at, sizeof at);
+                params.Set("CullDistance", 0.f);
+                mirage::call::Call(pawn, params);
+            }
+            us = clk::Micros(clk::Now() - start) / count;
+        }, 30.0);
+        return us;
+    };
+    const auto set = [](Module* m, bool on) { OnRenderThread([m, on] { m->SetEnabled(on); }); };
+    constexpr int kCalls = 2000;
+
+    set(native, false);
+    set(lua, false);
+    const double bare = calls(kCalls);
+    set(native, true);
+    const double withNative = calls(kCalls);
+    if (value(native, "Saw") != 1.f) p.Problem("hook-native alone saw " + std::to_string(value(native, "Saw")) + ", not 1");
+    set(native, false);
+    set(lua, true);
+    const double withLua = calls(kCalls);
+    if (value(lua, "Saw") != 2.f) p.Problem("hook-lua alone saw " + std::to_string(value(lua, "Saw")) + ", not 2");
+
+    // Both: priority 20 (native) first
+    set(native, true);
+    calls(1);
+    if (value(native, "Saw") != 1.f || value(lua, "Saw") != 12.f)
+        p.Problem("both on: native saw " + std::to_string(value(native, "Saw")) + ", Lua " + std::to_string(value(lua, "Saw")) +
+                  " (expected 1 then 12: priority order)");
+
+    // Reloaded with their hooks on: the same order, no hook doubled or lost
+    for (int i = 1; i <= 3; ++i) {
+        for (const char* id : {"hook-native", "hook-lua"}) {
+            std::string result = "timed out";
+            OnGameThread([&] { result = mm::Reload(id); }, 10.0);
+            if (!result.empty()) p.Problem(std::string("reload of ") + id + ": " + result);
+        }
+        calls(1);
+        const auto st = mirage::hooks::GetStats();
+        if (st.hooks != 2) p.Problem("reload " + std::to_string(i) + ": " + std::to_string(st.hooks) + " hooks, not 2");
+        if (value(native, "Saw") != 1.f || value(lua, "Saw") != 12.f)
+            p.Problem("reload " + std::to_string(i) + ": the order changed (native " + std::to_string(value(native, "Saw")) +
+                      ", Lua " + std::to_string(value(lua, "Saw")) + ")");
+    }
+
+    // Objects by name, events
+    WaitTicks(5);
+    float pawnZ = 0.f;
+    OnGameThread([&] { if (auto* pawn = game::Pawn()) pawnZ = pawn->Location.Z; });
+    if (std::fabs(value(native, "Pawn Z") - pawnZ) > 50.f || std::fabs(value(lua, "Pawn Z") - pawnZ) > 50.f)
+        p.Problem("the pawn's Location.Z read by name: native " + std::to_string(value(native, "Pawn Z")) + ", Lua " +
+                  std::to_string(value(lua, "Pawn Z")) + ", the pawn " + std::to_string(pawnZ));
+    auto* ticks = dynamic_cast<ctl::Value<int>*>(lua->FindSetting("Ticks"));
+    auto* lastMap = dynamic_cast<ctl::Value<std::string>*>(lua->FindSetting("Last map"));
+    if (!ticks || ticks->Get() == 0) p.Problem("hook-lua got no tick events");
+    if (!lastMap || lastMap->Get().empty()) p.Problem("hook-lua got no level load event (with the map)");
+
+    // Off: nothing left hooked
+    set(native, false);
+    set(lua, false);
+    if (mirage::hooks::GetStats().hooks != 0)
+        p.Problem(std::to_string(mirage::hooks::GetStats().hooks) + " hooks left with both modules off");
+
+    // Costs. The calls go through ProcessEvent and run the function, so the hooks' share is the difference.
+    const double lookupNs = mirage::hooks::UnhookedLookupNanoseconds();
+    const double nativeUs = withNative - bare, luaUs = withLua - bare;
+    char line[256];
+    std::snprintf(line, sizeof line, "a call: %.2f us; a native hook adds %.2f us, a Lua hook %.2f us; an unhooked script "
+                  "call pays %.1f ns for the detour's lookup", bare, nativeUs, luaUs, lookupNs);
+    s.notes.push_back(line);
+    if (lookupNs > 100.0) p.Problem("the detour's lookup costs " + std::to_string(lookupNs) + " ns (budget 100)");
+    if (nativeUs > 5.0) p.Problem("a native hook adds " + std::to_string(nativeUs) + " us a call (budget 5)");
+    if (luaUs > 50.0) p.Problem("a Lua hook adds " + std::to_string(luaUs) + " us a call (budget 50)");
+    s.notes.push_back("map " + (lastMap ? lastMap->Get() : std::string()) + ", " + std::to_string(ticks ? ticks->Get() : 0) + " tick events");
+#if MEMENU_FEATURE_TAS
+    // A TAS rewind puts back the game's memory only: no mod's code or data is ever counted as the game's
+    {
+        std::size_t mods = 0;
+        for (const auto& m : tas::memmap::Modules()) {
+            if (m.path.find("\\selftest-mods\\") == std::string::npos) continue;
+            ++mods;
+            if (m.game) p.Problem(m.name + " (a mod) is counted as the game's memory: a TAS rewind would put it back");
+        }
+        if (mods == 0) p.Problem("no mod DLL was found among the process's modules");
+        else s.notes.push_back(std::to_string(mods) + " mod DLLs, none in TAS snapshots");
+    }
+#endif
+    p.Check(1, true);
+    End(s);
+}
+
+// Mirage step 7: a content mod (examples/mods/high-steps, data only) overrides a default property. Its module turns it
+// on and off: on, the class's default object and the player's pawn have the mod's value, and a respawned pawn gets it;
+// off, the exact original is back, on the pawn now and on the next one. No game file is written.
+void TestMirageContent()
+{
+    Step& s = Begin("Mirage content");
+    Probe p(s);
+    Module* m = modules::Find("High Steps");
+    if (!m) {
+        p.Problem("the High Steps module (examples/mods/high-steps) is missing");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    // MaxStepHeight of the default object and of the pawn the player has now
+    const auto readSteps = [&](float& cdo, float& pawn, void** which) {
+        OnGameThread([&] {
+            auto* d = game::FindObject<Classes::UObject>("TdPlayerPawn TdGame.Default__TdPlayerPawn");
+            auto* pw = game::Pawn();
+            cdo = d ? mirage::reflect::GetFloat(mirage::reflect::Resolve(d->Class, d, "MaxStepHeight")) : -1.f;
+            pawn = pw ? pw->MaxStepHeight : -1.f;
+            if (which) *which = pw;
+        });
+    };
+    const auto set = [&](bool on) {
+        OnRenderThread([m, on] { m->SetEnabled(on); });
+        WaitTicks(3);       // Applied / put back on the game thread
+    };
+    const auto respawn = [&] {
+        void* before = nullptr;
+        float c = 0, pw = 0;
+        readSteps(c, pw, &before);
+        OnGameThread([] { levels::RestartFromLastCheckpoint(); });
+        void* after = before;
+        WaitFor(30.0, [&] { readSteps(c, pw, &after); return after && after != before; });
+        WaitTicks(10);      // Not WaitPlayerReady: after a restart the controller's bFrozen stays set (engine leftover)
+        return after != before;
+    };
+
+    set(false);
+    float cdo = 0, pawn = 0;
+    readSteps(cdo, pawn, nullptr);
+    const float original = cdo;
+    if (pawn != original) p.Problem("off: the pawn's MaxStepHeight " + std::to_string(pawn) + " isn't the default " + std::to_string(original));
+
+    set(true);
+    readSteps(cdo, pawn, nullptr);
+    if (cdo != 105.f || pawn != 105.f)
+        p.Problem("on: MaxStepHeight is " + std::to_string(cdo) + " (default object) and " + std::to_string(pawn) + " (pawn), not 105");
+    if (!respawn()) p.Problem("the player wasn't respawned");
+    readSteps(cdo, pawn, nullptr);
+    if (pawn != 105.f) p.Problem("on: a respawned pawn has MaxStepHeight " + std::to_string(pawn) + ", not 105");
+
+    set(false);
+    readSteps(cdo, pawn, nullptr);
+    if (cdo != original || pawn != original)
+        p.Problem("off: MaxStepHeight is " + std::to_string(cdo) + " / " + std::to_string(pawn) + ", not the original " + std::to_string(original));
+    respawn();
+    readSteps(cdo, pawn, nullptr);
+    if (pawn != original) p.Problem("off: a respawned pawn has " + std::to_string(pawn) + ", not the original " + std::to_string(original));
+    s.notes.push_back("MaxStepHeight " + std::to_string(original) + " -> 105 with the mod on, back to " + std::to_string(pawn) + " off");
+
+    set(true);      // As the player would have it
+    p.Check(1, true);
+    End(s);
+}
+
+// Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
+// what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
+// hot reload ten times in a row (Lua and native, settings and state kept, no memory left behind), and the file watcher.
+void TestMirageLifecycle()
+{
+    Step& s = Begin("Mirage lifecycle");
+    Probe p(s);
+    namespace mm = mirage::mods;
+    const auto find = [](const std::string& id) {
+        const auto all = mm::List();
+        const auto it = std::find_if(all.begin(), all.end(), [&](const mm::Info& i) { return i.id == id; });
+        return it == all.end() ? std::optional<mm::Info>{} : std::optional<mm::Info>{*it};
+    };
+    const auto has = [](const std::string& text, const char* part) { return text.find(part) != std::string::npos; };
+
+    // ---- Order: order-c (early), then order-b (wants order-c), then order-a (needs order-b)
+    {
+        const auto a = find("order-a"), b = find("order-b"), c = find("order-c");
+        if (!a || !b || !c || !a->loaded || !b->loaded || !c->loaded) {
+            p.Problem("order-a, order-b and order-c should all be loaded");
+        } else {
+            if (!(c->loadIndex < b->loadIndex && b->loadIndex < a->loadIndex))
+                p.Problem("load order " + std::to_string(c->loadIndex) + "/" + std::to_string(b->loadIndex) + "/" +
+                          std::to_string(a->loadIndex) + ": expected order-c, then order-b, then order-a");
+            s.notes.push_back("order: order-c #" + std::to_string(c->loadIndex) + " (early), order-b #" +
+                              std::to_string(b->loadIndex) + ", order-a #" + std::to_string(a->loadIndex));
+        }
+        for (const auto& [id, why] : {std::pair{"order-missing", "isn't installed"}, {"cycle-1", "cycle"}, {"cycle-2", "cycle"}}) {
+            const auto m = find(id);
+            if (!m) p.Problem(std::string(id) + " was not found");
+            else if (m->loaded || !has(m->problem, why))
+                p.Problem(std::string(id) + " should be left out (" + why + "), it is: " + (m->loaded ? "loaded" : m->problem));
+        }
+    }
+
+    // ---- World phase: loaded once the level was in, its module joined the menu on the render thread
+    {
+        const auto w = find("world-lua");
+        if (!w || !w->loaded) p.Problem("world-lua (world phase) didn't load: " + (w ? w->problem : std::string("not found")));
+        else if (!WaitFor(5.0, [] { return modules::Find("Test world-lua") != nullptr; }))
+            p.Problem("world-lua's module never joined the menu");
+        else s.notes.push_back("world phase: world-lua loaded #" + std::to_string(w->loadIndex));
+    }
+
+    // ---- A crash: caught, named, the mod stopped, the others go on, and it won't load next time
+    {
+        Module* crasher = modules::Find("Crasher");
+        Module* hello = modules::Find("Hello (Lua)");
+        if (!crasher || !hello) {
+            p.Problem("the Crasher or Hello (Lua) module is missing");
+        } else {
+            p.Expect("[mod crasher] CRASHED");
+            OnRenderThread([crasher] { crasher->SetEnabled(true); });
+            WaitTicks(3);
+            const auto c = find("crasher");
+            if (!c || c->loaded || !has(c->problem, "crashed") || !has(c->problem, "crasher.dll+0x"))
+                p.Problem("the crash wasn't caught and named: " + (c ? c->problem : std::string("crasher not found")));
+            else s.notes.push_back("crasher: " + c->problem);
+            if (crasher->Enabled()) p.Problem("Crasher is still on after crashing");
+            if (!crasher->Hidden()) p.Problem("Crasher is still listed after crashing");
+            const auto crashed = mm::CrashedMods(paths::Dir() / "selftest-mods");
+            const auto it = crashed.find("crasher");
+            if (it == crashed.end()) p.Problem("crashes.toml doesn't name crasher");
+            else {
+                // The next start: the same mods, resolved with that list, leave crasher out
+                std::vector<mm::Manifest> manifests;
+                for (const auto& e : std::filesystem::directory_iterator(paths::Dir() / "selftest-mods"))
+                    if (auto parsed = mm::Load(e.path()); parsed.manifest) manifests.push_back(*parsed.manifest);
+                const auto next = mm::Resolve(manifests, *mirage::semver::Version::Parse(mm::kRuntimeVersion), crashed);
+                if (!next.excluded.count("crasher") || !has(next.excluded.at("crasher"), "crashed the last time"))
+                    p.Problem("crasher would load again next time");
+            }
+            // The rest go on
+            auto* ticks = dynamic_cast<ctl::Value<int>*>(hello->FindSetting("Ticks"));
+            const int before = ticks ? ticks->Get() : 0;
+            OnRenderThread([hello] { hello->SetEnabled(true); });
+            WaitTicks(10);
+            if (!ticks || ticks->Get() <= before) p.Problem("Hello (Lua) stopped running after crasher crashed");
+            OnRenderThread([hello] { hello->SetEnabled(false); });
+        }
+    }
+
+    // ---- Hot reload, Lua, ten times: new code each time, the setting and the on state kept, no memory left behind
+    {
+        Module* m = modules::Find("Reload (Lua)");
+        const auto file = paths::Dir() / "selftest-mods" / "reload-lua" / "main.lua";
+        std::string code;
+        {
+            std::ifstream in(file, std::ios::binary);
+            std::stringstream t;
+            t << in.rdbuf();
+            code = t.str();
+        }
+        const auto write = [&](int version) {
+            std::string c = code;
+            const auto at = c.find("local VERSION = 0");
+            if (at != std::string::npos) c.replace(at, 17, "local VERSION = " + std::to_string(version));
+            std::ofstream(file, std::ios::binary | std::ios::trunc) << c;
+        };
+        auto* kept = m ? dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Kept")) : nullptr;
+        if (!m || !kept || code.find("local VERSION = 0") == std::string::npos) {
+            p.Problem("Reload (Lua) or its Kept setting is missing");
+        } else {
+            kept->Set("kept across reloads");
+            OnRenderThread([m] { m->SetEnabled(true); });
+            WaitTicks(3);
+            std::int64_t memoryAfterFirst = 0;
+            for (int i = 1; i <= 10; ++i) {
+                write(i);
+                std::string result = "timed out";
+                OnGameThread([&] { result = mm::Reload("reload-lua"); }, 10.0);
+                if (i == 1) memoryAfterFirst = mirage::memory::LiveBytes();
+                auto* status = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Status"));
+                if (!result.empty()) { p.Problem("reload " + std::to_string(i) + ": " + result); break; }
+                if (modules::Find("Reload (Lua)") != m) { p.Problem("reload " + std::to_string(i) + ": a different module"); break; }
+                if (!status || status->Get() != "v" + std::to_string(i)) {
+                    p.Problem("reload " + std::to_string(i) + ": the new code didn't run (Status '" + (status ? status->Get() : "") + "')");
+                    break;
+                }
+                if (!m->Enabled()) { p.Problem("reload " + std::to_string(i) + ": the module isn't on any more"); break; }
+                if (kept->Get() != "kept across reloads") { p.Problem("reload " + std::to_string(i) + ": the setting was reset"); break; }
+            }
+            const std::int64_t grown = mirage::memory::LiveBytes() - memoryAfterFirst;
+            if (grown > 512 * 1024) p.Problem("9 more Lua reloads left " + std::to_string(grown / 1024) + " KB behind");
+            s.notes.push_back("Lua: 10 reloads, memory " + std::to_string(grown / 1024) + " KB after the first");
+
+            // The watcher: a changed file reloads it by itself
+            const int reloadsBefore = find("reload-lua")->reloads;
+            write(42);
+            if (!WaitFor(5.0, [&] { return find("reload-lua")->reloads > reloadsBefore; }))
+                p.Problem("changing main.lua didn't reload the mod by itself");
+            else {
+                auto* status = dynamic_cast<ctl::Value<std::string>*>(m->FindSetting("Status"));
+                if (!status || status->Get() != "v42") p.Problem("the watcher's reload didn't run the new code");
+                else s.notes.push_back("watcher: main.lua changed, reloaded by itself");
+            }
+            write(0);
+            OnRenderThread([m] { m->SetEnabled(false); });
+        }
+    }
+
+    // ---- Hot reload, native (from a copy of its DLL), ten times with the module on
+    {
+        Module* m = modules::Find("Hello (native)");
+        auto* ticks = m ? dynamic_cast<ctl::Value<int>*>(m->FindSetting("Ticks")) : nullptr;
+        if (!m || !ticks) {
+            p.Problem("Hello (native) is missing");
+        } else {
+            OnRenderThread([m] { m->SetEnabled(true); });
+            WaitTicks(3);
+            for (int i = 1; i <= 10; ++i) {
+                std::string result = "timed out";
+                OnGameThread([&] { result = mm::Reload("hello"); }, 10.0);
+                const int before = ticks->Get();
+                WaitTicks(3);
+                if (!result.empty()) { p.Problem("native reload " + std::to_string(i) + ": " + result); break; }
+                if (!m->Enabled()) { p.Problem("native reload " + std::to_string(i) + ": the module isn't on"); break; }
+                if (ticks->Get() <= before) { p.Problem("native reload " + std::to_string(i) + ": its on_tick doesn't run"); break; }
+            }
+            std::size_t copies = 0;
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(paths::Dir() / "selftest-mods" / "hello" / ".mirage", ec))
+                copies += e.path().extension() == ".dll";
+            if (copies != 1) p.Problem(std::to_string(copies) + " copies of hello.dll in .mirage (one is loaded)");
+            OnRenderThread([m] { m->SetEnabled(false); });
+            s.notes.push_back("native: 10 reloads of hello, ticks " + std::to_string(ticks->Get()));
+        }
+    }
+    p.Check(1, true);
+    End(s);
+}
+#endif
 
 void TestModule(Module& m)
 {
@@ -3035,9 +3654,22 @@ void TestModule(Module& m)
     Probe p(s);
     const bool drawsHud = kDrawsHud.count(m.Name()) != 0;
     unsigned hudBefore = 0;
+    std::string listsBefore;
+    // While a HUD is measured, the other HUDs whose text changes as the game runs (Game Status counts ticks, events and
+    // health, Collision View the volumes the player is in) are off: they made "still draws after switching off" fail
+    // with nothing left of the module's own
+    std::vector<Module*> quieted;
+    if (drawsHud) {
+        std::set<std::string> noisy(kDrawsHud.begin(), kDrawsHud.end());
+        noisy.insert({"Game Status", "Info Lines", "Tool Overlay", "Collision View"});
+        for (const std::string& name : noisy)
+            if (Module* other = modules::Find(name); other && other != &m && other->Enabled()) quieted.push_back(other);
+        OnRenderThread([&quieted] { for (Module* q : quieted) q->SetEnabled(false); });
+    }
     if (drawsHud) {
         OnRenderThread([&m] { if (m.Enabled()) m.SetEnabled(false); });
         hudBefore = HudVertices();
+        listsBefore = hooks::MenuDrawLists();
         OnRenderThread([] { gui::visible = true; });
     }
     const auto runsBefore = [&] { const auto e = sched::Snapshot(); const auto* v = FindEntry(e, m.Name()); return v ? v->runs : 0; }();
@@ -3124,8 +3756,10 @@ void TestModule(Module& m)
         const unsigned hudOff = HudVertices();
         if (hudOff > hudBefore)
             p.Problem("still draws after switching off (" + std::to_string(hudOff) + " vertices, " +
-                      std::to_string(hudBefore) + " before it was on)");
+                      std::to_string(hudBefore) + " before it was on; now: " + hooks::MenuDrawLists() +
+                      "; before: " + listsBefore + ")");
         OnRenderThread([] { gui::visible = true; });
+        OnRenderThread([&quieted] { for (Module* q : quieted) q->SetEnabled(true); });
     }
     OnRenderThread([&m] { m.expanded = false; });
     WaitTicks(3);   // OnDisable hands its cleanup to the next tick
@@ -3253,6 +3887,11 @@ const Named* FeatureList()
         {"Mirage runtime", &TestMirageRuntime, false},
         {"Mirage layouts", &TestMirageLayouts, false},
         {"Mirage calls", &TestMirageCalls, false},
+        {"Mirage function hooks", &TestMirageFunctionHooks, false},
+        {"Mirage mods", &TestMirageMods, false},
+        {"Mirage lifecycle", &TestMirageLifecycle, false},
+        {"Mirage hooks from mods", &TestMirageModHooks, false},
+        {"Mirage content", &TestMirageContent, false},
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},
@@ -3391,7 +4030,8 @@ static void RunTests(bool fromMenu)
         }
 #endif
         std::vector<Module*> mods;
-        modules::ForEach([&](modules::Tab&, Module& m) { if (Selected(m)) mods.push_back(&m); });
+        // Hidden ones aren't in the menu (a crashed mod's, developer-only ones while developer mode is off)
+        modules::ForEach([&](modules::Tab&, Module& m) { if (Selected(m) && !m.Hidden()) mods.push_back(&m); });
         // Actions that leave the level go last
         std::stable_partition(mods.begin(), mods.end(), [](Module* m) { return m->Name() != "Main Menu"; });
         for (Module* m : mods) {

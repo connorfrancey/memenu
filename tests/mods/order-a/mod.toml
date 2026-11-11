@@ -1,0 +1,6 @@
+id = "order-a"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): loads after order-b"
+phase = "engine"
+[dependencies]
+order-b = "^1"

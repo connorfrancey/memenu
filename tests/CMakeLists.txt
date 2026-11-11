@@ -18,6 +18,15 @@ add_executable(memenu_tests
         test_cache2.cpp
         test_shell.cpp
         test_hud_template.cpp
+        test_semver.cpp
+        test_manifest.cpp
+        test_abi.cpp
+        test_resolve.cpp
+        test_detours.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/detours.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/resolve.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/semver.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/manifest.cpp
         ${CMAKE_SOURCE_DIR}/src/render/mesh.cpp
         ${CMAKE_SOURCE_DIR}/src/render/static_scene.cpp
         ${CMAKE_SOURCE_DIR}/src/tas/replay.cpp
@@ -43,10 +52,10 @@ add_executable(memenu_tests
         ${CMAKE_SOURCE_DIR}/src/core/hardware.cpp
         ${CMAKE_SOURCE_DIR}/src/core/shell.cpp
         ${CMAKE_SOURCE_DIR}/src/hud/template.cpp)
-target_include_directories(memenu_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(memenu_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/api)
 target_compile_definitions(memenu_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         MEMENU_EXAMPLES_DIR="${CMAKE_SOURCE_DIR}/examples")
-target_link_libraries(memenu_tests PRIVATE GTest::gtest_main nlohmann_json::nlohmann_json imgui spdlog::spdlog)
+target_link_libraries(memenu_tests PRIVATE GTest::gtest_main nlohmann_json::nlohmann_json imgui spdlog::spdlog toml11::toml11 minhook magic_enum::magic_enum unordered_dense::unordered_dense)
 if(MSVC)
   target_compile_options(memenu_tests PRIVATE /W4 /permissive- /utf-8)
 endif()

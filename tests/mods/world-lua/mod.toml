@@ -1,0 +1,5 @@
+id = "world-lua"
+version = "1.0.0"
+description = "Self-test mod (tests/mods): loads once the first level is in"
+phase = "world"
+

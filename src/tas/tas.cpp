@@ -19,7 +19,7 @@
 #include <Windows.h>
 #include <timeapi.h>
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <spdlog/spdlog.h>
 
 #include <algorithm>

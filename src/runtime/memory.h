@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-// What the menu's own code has allocated with new (this DLL replaces operator new / delete with counting versions; the
+// What the menu's own code has allocated with new (this DLL replaces operator new / delete with counting versions on mimalloc; the
 // game's allocations are never counted). Precise where the process's memory isn't: the game allocates and frees all
 // the time, so a leak in the menu doesn't show in the process's numbers.
 namespace mirage::memory

@@ -15,7 +15,7 @@
 #include <Windows.h>
 #include <shellapi.h>
 #include <imgui.h>
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <spdlog/spdlog.h>
 
 #include <algorithm>

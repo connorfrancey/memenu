@@ -254,6 +254,44 @@ TEST(Replay, ImportsHandWrittenJson)
     ExpectConsistent(r);
 }
 
+// The words of the start kinds and camera eases are the enumerators' names (core/enum_names.h): renaming one would
+// change the file format, so they are pinned here.
+TEST(Replay, JsonWordsForStartAndEase)
+{
+    EXPECT_STREQ(StartName(StartKind::Now), "now");
+    EXPECT_STREQ(StartName(StartKind::Command), "command");
+    EXPECT_STREQ(StartName(StartKind::Checkpoint), "checkpoint");
+    EXPECT_STREQ(EaseName(Ease::Linear), "linear");
+    EXPECT_STREQ(EaseName(Ease::Smooth), "smooth");
+    EXPECT_STREQ(EaseName(Ease::Hold), "hold");
+
+    const auto path = TempFile("words.json");
+    {
+        std::ofstream out(path);
+        out << R"json({"framerate": 60, "start": {"kind": "checkpoint", "map": "Prologue (edge_p)"},
+            "inputs": [{"frame": 3, "key": "W"}],
+            "camera": [{"frame": 0, "yaw": 0, "ease": "linear"}, {"frame": 1, "yaw": 10, "ease": "hold"},
+                       {"frame": 2, "yaw": 20}]})json";
+    }
+    Replay r;
+    std::string error;
+    const bool ok = r.ImportJson(path, &error);
+    ASSERT_TRUE(ok) << error;
+    EXPECT_EQ(r.start, StartKind::Checkpoint);
+    ASSERT_EQ(r.camera.size(), 3u);
+    EXPECT_EQ(r.camera[0].ease, Ease::Linear);
+    EXPECT_EQ(r.camera[1].ease, Ease::Hold);
+    EXPECT_EQ(r.camera[2].ease, Ease::Smooth);   // the default
+
+    {
+        std::ofstream out(path);
+        out << R"({"start": {"kind": "Checkpoint"}, "inputs": []})";   // exact words only
+    }
+    EXPECT_FALSE(r.ImportJson(path, &error));
+    std::filesystem::remove(path);
+    EXPECT_NE(error.find("now, command or checkpoint"), std::string::npos) << error;
+}
+
 TEST(Replay, ImportRejectsBadJson)
 {
     const auto path = TempFile("bad.json");

@@ -12,7 +12,7 @@
 
 #include <MinHook.h>
 #include <spdlog/spdlog.h>
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 
 #include <algorithm>
 #include <atomic>

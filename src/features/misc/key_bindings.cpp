@@ -4,7 +4,7 @@
 #include "game/game.h"
 #include "paths.h"
 
-#include <ME_SDK.hpp>
+#include "sdk/SDK.hpp"
 #include <Windows.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>

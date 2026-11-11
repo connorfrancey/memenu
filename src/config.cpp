@@ -26,6 +26,8 @@ static int ReadKey(const json& obj, const char* name, int fallback)
 
 namespace {
     bool g_autoSave = true;
+    json g_fileModules = json::object();    // The modules section as loaded: what mods not loaded now keep, and what
+                                            // a module added later (a mod's, at its load phase) is given
     std::string g_written;          // What the file holds (as far as this session knows): autosave skips equal configs
     unsigned long long g_lastCheck = 0;
 
@@ -50,6 +52,9 @@ namespace {
             if (!keys.empty()) mt["keys"] = std::move(keys);
             mods[ModuleKey(t, m)] = std::move(mt);
         });
+        // Modules the file had that aren't here this time (a mod left out, or not loaded yet): kept as they were
+        for (const auto& [k, v] : g_fileModules.items())
+            if (!mods.contains(k)) mods[k] = v;
 
         json root = json::object();
         root["theme"]   = theme::Current();
@@ -96,36 +101,8 @@ bool config::Load()
         const auto mods = root.find("modules");
         if (mods == root.end() || !mods->is_object()) return true;
 
-        modules::ForEach([&](modules::Tab& t, Module& m)
-        {
-            const auto mi = mods->find(ModuleKey(t, m));
-            if (mi == mods->end() || !mi->is_object()) return;
-
-            m.key = ReadKey(*mi, "key", m.key);
-
-            if (const auto sj = mi->find("settings"); sj != mi->end() && sj->is_object())
-            {
-                for (ctl::Setting* s : m.Settings())
-                {
-                    const auto v = sj->find(s->Name());
-                    if (v == sj->end()) continue;
-                    if (s->Persistent()) s->Load(*v);   // Wrong types are ignored, values clamped by the control
-                }
-            }
-            if (const auto kj = mi->find("keys"); kj != mi->end() && kj->is_object())
-            {
-                for (ctl::Setting* s : m.Settings())
-                {
-                    const auto k = kj->find(s->Name());
-                    if (k == kj->end() || !k->is_object()) continue;
-                    s->key = ReadKey(*k, "key", s->key);
-                    s->keyAlt = ReadKey(*k, "keyAlt", s->keyAlt);
-                }
-            }
-
-            // After the settings, so OnEnable sees them
-            if (const auto e = mi->find("enabled"); e != mi->end() && e->is_boolean()) m.SetEnabled(e->get<bool>());
-        });
+        g_fileModules = *mods;
+        modules::ForEach([&](modules::Tab&, Module& m) { ApplySaved(m); });
 
         spdlog::info("Config loaded");
         g_written = Build();    // As loaded: autosave writes only what changes after this
@@ -136,6 +113,36 @@ bool config::Load()
         spdlog::error("Config error: {}", e.what());
         return false;
     }
+}
+
+bool config::ApplySaved(Module& m)
+{
+    const auto mi = g_fileModules.find(m.Tab() + "/" + m.Name());
+    if (mi == g_fileModules.end() || !mi->is_object()) return false;
+
+    m.key = ReadKey(*mi, "key", m.key);
+    if (const auto sj = mi->find("settings"); sj != mi->end() && sj->is_object())
+    {
+        for (ctl::Setting* s : m.Settings())
+        {
+            const auto v = sj->find(s->Name());
+            if (v == sj->end()) continue;
+            if (s->Persistent()) s->Load(*v);   // Wrong types are ignored, values clamped by the control
+        }
+    }
+    if (const auto kj = mi->find("keys"); kj != mi->end() && kj->is_object())
+    {
+        for (ctl::Setting* s : m.Settings())
+        {
+            const auto k = kj->find(s->Name());
+            if (k == kj->end() || !k->is_object()) continue;
+            s->key = ReadKey(*k, "key", s->key);
+            s->keyAlt = ReadKey(*k, "keyAlt", s->keyAlt);
+        }
+    }
+    // After the settings, so OnEnable sees them
+    if (const auto e = mi->find("enabled"); e != mi->end() && e->is_boolean()) m.SetEnabled(e->get<bool>());
+    return true;
 }
 
 bool config::Save()

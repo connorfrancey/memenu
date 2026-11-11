@@ -26,7 +26,7 @@ MirrorsEdge.exe
      └─ mirage.dll ......... runtime: engine layer, reflection, hooks, events, VFS, mod manager UI
          ├─ Lua 5.4 ....... one sandboxed state per Lua mod
          ├─ mods\memenu\ ... the current features, as first-party mods (trainer, TAS, Info Lines, ...)
-         └─ mods\<id>\ ..... mod.json + main.lua and/or <id>.dll + content\ (packages, textures, script patches)
+         └─ mods\<id>\ ..... mod.toml + main.lua and/or <id>.dll + content\ (packages, textures, script patches)
 ```
 
 - **Stable C ABI** (`mirage/api.h`: a versioned function table, plain structs, no STL across the boundary) with a
@@ -106,10 +106,28 @@ Flight's collision mode calls MoveSmooth, which now runs, not yet covered by a t
 **Milestone:** the generated SDK compiles with zero warnings; the menu builds on it with no mmultiplayer headers left;
 `game-test` passes; a report lists every layout the old SDK had wrong.
 
+**Status (2026-11-10): done.** `memenu sdk` builds and runs
+`mirage_sdkgen` (`tools/sdkgen/`, configured by `sdkgen.toml`, read with toml11) and compiles what it writes. Inputs:
+the layouts computed from the packages (the same `runtime/computed_layout.cpp` the self-test proves) plus
+`engine-layouts.json`, what only the engine knows (601 intrinsic and native-only types, saved by the self-test "Mirage
+layouts"). Output, in 1.5 s: `sdk/` with 2,354 classes, 515 structs and all 11,310 functions (static array parameters
+included), with every offset and size a `static_assert`. It compiles with no warnings at /W4. Bits are checked at run
+time (`detail::CheckLayouts`). `build/sdk-reference/` holds the decompiled script of the 2,110 classes (2,107 with no
+placeholders), the LuaLS stubs and `old-sdk-report.md`. The report lays out the old SDK's C++ the way MSVC does under
+its `pack(4)` and compares it with the engine: 197 classes, 16 structs and 6,002 parameter structs wrong (IsInState's
+return value at 0x9 instead of 0xC, SetMove's parameters 4 bytes instead of 16, the intrinsic classes too small).
+Known gap: two HTTPDownload properties lie inside its native base's opaque block and can't be declared. The menu builds on
+`sdk/` (committed; mmultiplayer is only downloaded for the report), with one source change (`StaticMesh` is now typed:
+intrinsic classes are named by their import). The full `game-test` passes, and "Mirage layouts" also runs the SDK's
+bitfield checks in the game. The "still draws after switching off" check had been failing for Kickglitch Helper
+before this step too: Game Status and Collision View text changed under it, so they are switched off while a HUD is
+measured.
+
 ### 4. Mod format and ABI v1
 
-- `mod.json`: id, semver version, name, authors, runtime version range, game build, dependencies (required / optional /
-  incompatible, with version ranges), entry DLL, load phase, settings schema, content folders.
+- `mod.toml` (TOML, read with toml11): id, semver version, name, authors, runtime version range, game build,
+  dependencies (required / optional / incompatible, with version ranges), entry DLL, load phase, settings schema,
+  content folders.
 - `mirage/api.h` v1: logging, the module and settings system (today's `ctl::` controls) and per-mod config, exposed
   through the ABI; the C++ wrapper gives mods the same `MEM_MODULE` / `ctl::Slider` style as today.
 - The Lua API (`mirage` table) over the same calls: `mirage.module{...}`, settings, log, config, plus game object
@@ -120,6 +138,31 @@ Flight's collision mode calls MoveSmooth, which now runs, not yet covered by a t
 **Milestone:** a "hello" mod built in a separate CMake project (and with another MSVC toolset) and the same mod
 written in Lua are both loaded, register a module with settings that save and load, and show in the menu; the ABI
 tests pass.
+
+**Status (2026-11-11): done, with two items moved on.** `api/mirage/api.h` is ABI v1: a `MirageApi` function table
+that starts with its size and only grows, a size-prefixed module description with five callbacks, settings
+(checkbox, slider, int slider, text, key), per-mod `config.toml`, and drawing primitives (a native mod can't share the
+menu's ImGui). `mirage.hpp` wraps it in the menu's own `Module` / `ctl::` style. `src/runtime/manifest` reads `mod.toml`
+with toml11 and warns about unknown keys; `semver` handles versions and npm/Cargo ranges. `src/runtime/mods` runs each
+mod module as a normal menu `Module`. Every call into native code is under SEH: a crash is logged and the module
+stopped. The Lua binding (`mod_lua`) is written only against `MirageApi`. Its callbacks hold the mod's lock and get the
+instruction budget, and `require` stays inside the mod's folder. Mods load in id order after their runtime range and
+required and incompatible mods are checked; topological order is step 5.
+
+The check: `tests/test_abi.cpp` freezes every offset; semver and manifest have unit tests. The in-game self-test
+"Mirage mods" covers `examples/mods/hello`, built by its own CMake project with **clang-cl** instead of a second MSVC
+toolset (only one is installed, and another compiler is the stronger proof), and `examples/mods/hello-lua`. Both load,
+show in the Mods column, run `on_enable` / `on_tick` / `on_render` / `on_disable`, save, load and clamp their
+settings, and keep their own config. `memenu game-test` builds and deploys them.
+
+Settings can be declared in `mod.toml`, as Geode does in `mod.json` (2026-11-11): one `[settings.<key>]` table each,
+with type (bool, int, float, string, choice, key), name, description, default and range, options or format. The runtime
+makes them when their module registers, first in its panel, and the menu's config saves their values. Code finds them
+by key: `setting_find` and `setting_type` are appended to ABI v1, Lua has `mirage.setting("key")`, C++ has
+`mirage::Get<T>("key")`. Settings made in code still work alongside them.
+
+Moved on: game object access from Lua through reflection (`player.Location.Z = 500`) goes with the hooks and events
+of step 6, where Lua first gets game objects.
 
 ### 5. Loader and mod lifecycle
 
@@ -139,6 +182,38 @@ tests pass.
 a set of test mods loads in the right order, a deliberately crashing mod is caught, named and disabled, and the rest
 keep running; a hot reload round trip works ten times in a row.
 
+**Status (2026-11-11): done, except two parts.** `src/runtime/resolve` decides what loads and in what order:
+dependencies first, then phase, then id. A mod is left out, with the reason, for a runtime out of range, being off or
+having crashed, a missing, out-of-range, left-out or later-phase requirement, an incompatible mod, or a cycle of
+required mods, and that spreads to the mods that need it. Optional dependencies only order (with warnings when they
+can't), and optional cycles are broken. 13 unit tests cover chains, cycles, version conflicts, optional deps, phases and
+the off list.
+
+Phases: early at the menu's start, engine once the game layer is up, world on the first tick after a level loaded.
+Mods of the later phases publish their modules as a batch: the menu's module list only grows once it runs (reserved,
+count published atomically), the render thread adds them, gives them their saved config and the scheduler takes
+them. The config now keeps the entries of modules not loaded this time.
+
+Crash isolation: every call into native code is guarded. A crash stops the whole mod and logs its name, callback,
+exception and `dll+offset`. It also writes `crashes.toml` next to the mods, which leaves the mod out at the next start
+until its entry is deleted. The menu's crash handler names a mod whose code crashed on a thread it started.
+
+Hot reload: Lua mods by default, native ones with `hot_reload = true` (their DLL runs from a copy in `.mirage`). A
+watcher on the game thread checks the files twice a second and waits until they stop changing. A reload switches the
+mod's modules off (its old `on_disable` undoes its changes), waits for calls still running, unloads, and loads again.
+The modules it registers again are the same menu modules, so settings, keys and on/off state carry over.
+
+Self-test "Mirage lifecycle" (`tests/mods`, deployed by `game-test`): order across the early and engine phases, the
+cycle and missing-dependency mods left out, a world-phase mod, `crasher` (native, clang-cl) caught at
+`crasher.dll+0x14E0` while the others go on and left out by the next resolution, Lua hot reload 10 times (new code
+each time, setting and on state kept, 1 KB left after the first), the watcher, and native hot reload 10 times. One full
+run of the five with this code crashed the game in `ntdll` during the "Speedrun timer" level restart, with no mod
+involved; the four after it passed. Not explained yet.
+
+Left: TAS memory classification for mods (the snapshot memory map; mods opting in to being rewound) waits for step 6,
+where mods get game objects. Attributing crashes on a mod's own thread is in place but not covered by a test (it would
+take the game down).
+
 ### 6. Hooks and events
 
 - Event bus: tick, render, level load, death, input, player state change, script events (the existing hooks, now
@@ -155,6 +230,45 @@ keep running; a hot reload round trip works ten times in a row.
 cleanly; the `ProcessEvent` hook costs under a set budget per call for unhooked functions and for a Lua hook (measured
 in the performance module).
 
+**Status (2026-11-11): done.** Function hooks (`src/runtime/fhooks`): every script function runs through
+`UObject::ProcessInternal`, whether it is called from script, from native code or through ProcessEvent, so that one
+function is detoured. A lock-free table keyed by the frame's function sends hooked calls to their hooks, and an
+unhooked call costs a hash and a load (measured: 0.7-0.8 ns). Hooks run before, after or instead of the function, in
+priority order, and see its parameters by name (`runtime/reflect`: properties, struct members and parameters through
+the engine's own UProperty objects, by dotted path). Native functions get a per-function thunk in `UFunction::Func`:
+before and after only, without parameters. One with a native index is called straight from bytecode and only reaches
+its hooks through ProcessEvent, so its code is detoured instead. The offsets are found in the game: `Func` at 0xAC
+(where every script function holds ProcessInternal's address), and the frame's `Node` at 0x4 and `Locals` at 0x10.
+
+Mods get these by appending to ABI v1: events (tick, level load, death, player state, key, and a TAS rewind putting the
+game's memory back), function hooks, calls, game objects with values by path, and managed native detours
+(`runtime/detours`). Several mods can chain on one function in priority order; every `original` is relinked as
+detours come and go, two mods on one target is logged, and a function the menu hooks itself is refused. 3 unit tests
+cover the chains. A mod's hooks, events and detours run like its module callbacks: only while it runs, counted for
+reloads, guarded against crashes, and removed when it unloads, reloads or crashes. In Lua: `mirage.on`, `mirage.hook`
+(`call.params.CullDistance = 1`, `call:skip()`), `mirage.pawn() / controller() / world() / find()` with object and
+struct proxies (`pawn.Location.Z = 500`), and `mirage.call`. In C++: `mirage::On`, `mirage::Hook`,
+`mirage::Object`, `mirage::Call`, `mirage::Detour`, `mirage::FindPattern`.
+
+TAS: snapshots never hold a mod's memory. Its DLLs, the copies hot reload runs, its heaps and its allocations are under
+`memenu\`, which the memory map leaves out (checked by the self-test). Its changes to the game's own memory are rewound
+with the game. The `state_restored` event tells mods to look their objects up again. Rewinding a mod's own state was
+the "opt in" idea; it isn't done, because a mod can rebuild its state from that event.
+
+The check, self-test "Mirage hooks from mods" (`tests/mods/hook-native`, `hook-lua`): both hook
+`CheckMaxEffectDistance` while their modules are on, and run in priority order (each turns `CullDistance` into
+x * 10 + its number: 1, then 12). They keep that through three hot reloads of both, leave no hook behind when off, read
+the pawn's `Location.Z` by name, and get tick and level load events. Costs, also shown in the Performance module: a
+call through ProcessEvent takes 0.18 us, a native hook adds 0.28 us (budget 5) and a Lua hook 1.12 us (budget 50).
+Self-test "Mirage function hooks" covers the core: priority, parameters read and changed, after hooks, replace, a
+call from script, removal.
+
+Seen while testing: 2 of about 12 full runs this session crashed the game in `ntdll`'s heap code. One was during the
+Speedrun timer level restart, the other during the TAS workflow, a free in the game's CRT heap (MSVCR80) with the AMD
+driver on the stack, before any hook or detour existed. The runs around them passed. Not explained yet; a TAS rewind of
+the game's CRT heap while the driver holds memory in it is the first suspect. To look into separately, against a build
+from before Mirage.
+
 ### 7. Content mods through UnrealLib
 
 - A virtual file system for `TdGame\CookedPC`: the engine's package opens are redirected to overlay packages that
@@ -166,6 +280,16 @@ in the performance module).
 **Milestone:** an example mod that replaces a texture and one that changes default properties work in the game with
 no game file touched; turning them off restores the original on the next level load; UnrealLib's corpus sweeps still
 pass.
+
+**Status (2026-11-11): half done.** Default property overrides work, as data applied at runtime rather than baked
+into overlay packages. `content/defaults.toml` holds the overrides (`runtime/content`). They are applied through
+reflection on the game thread, re-applied after level loads and undone exactly, and a module named after the mod turns
+them on and off. `examples/mods/high-steps` and the self-test "Mirage content" show this, with no game file touched.
+Left: texture replacement. A rewritten package moves every byte, but other packages' streamed mips point into it by
+raw file offset. The plan is an append-only overlay: keep the original file's bytes, write the changed chunk(s) and
+the new texture (all mips inline) at the end, and redirect the engine's opens of that file. That needs a Texture2D
+native-data writer (layout: UnrealLib `read_texture2d`) and a DXT encoder. Sounds, meshes and T3D map edits come after
+that.
 
 ### 8. Script mods: bytecode assembly and patching
 
@@ -228,6 +352,8 @@ waits for 3 and 6 because the features need the generated SDK and shared hooks.
 ## Decisions
 
 - Scripting: Lua 5.4, compiled as C++ (2026-11-09).
+- Mod manifest: `mod.toml` (TOML, read with toml11), not JSON (2026-11-10).
+- Mod settings are declared in `mod.toml` (`[settings.<key>]`), like Geode's `mod.json` (2026-11-11).
 
 ## Open questions
 

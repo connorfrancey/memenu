@@ -1,0 +1,30 @@
+# mirage_sdkgen: what it reads and where it writes. Relative paths are relative to this file; the command line
+# overrides any of them (mirage_sdkgen --help).
+
+[game]
+# The game's TdGame\CookedPC (the script packages): the first one that exists is used
+cooked = [
+    "C:/Program Files (x86)/Steam/steamapps/common/mirrors edge/TdGame/CookedPC",
+    "C:/Program Files/Steam/steamapps/common/mirrors edge/TdGame/CookedPC",
+    "C:/Program Files (x86)/Origin Games/Mirror's Edge/TdGame/CookedPC",
+    "C:/Program Files (x86)/EA Games/Mirror's Edge/TdGame/CookedPC",
+]
+
+[input]
+# What only the engine knows (intrinsic classes, native-only packages): the in-game self-test "Mirage layouts" saves it
+# as mirage-live-layouts.json; copy it here when the engine side changes
+engine_layouts = "engine-layouts.json"
+# The hand-written parts of the SDK (Basic.hpp, Basic.cpp, UObject.inl, CMakeLists.txt)
+static = "static"
+
+[output]
+# The C++ SDK: include/sdk/*.hpp, src/*.cpp and a CMakeLists.txt (library mirage_sdk)
+sdk = "../../sdk"
+# The reference for mod authors: script/<Package>/<Class>.uc (decompiled UnrealScript) and lua/<Package>.lua (LuaLS
+# annotations). "" = not written
+reference = "../../build/sdk-reference"
+
+[report]
+# The old (mmultiplayer) SDK's folder, to list every layout it has wrong. "" = no report
+old_sdk = ""
+file = "../../build/sdk-reference/old-sdk-report.md"

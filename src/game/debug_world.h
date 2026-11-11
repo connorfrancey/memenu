@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-// Collects trigger, kill, checkpoint, blocking and other volumes from the game (through the mmultiplayer SDK), and the
+// Collects trigger, kill, checkpoint, blocking and other volumes from the game (through the Mirage SDK, sdk/), and the
 // actors placed with them (player starts, pickups, AI-only volumes and areas, navigation points), and publishes them to
 // the debug renderer as solid, optionally textured shapes. Everything here runs on the game thread.
 //

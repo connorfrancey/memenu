@@ -1,0 +1,30 @@
+id = "hello-lua"
+name = "Hello (Lua)"
+version = "1.0.0"
+description = "The Hello example written in Lua: no compiler, just this folder"
+authors = ["Mirror's Edge Menu"]
+mirage = "^0.1"
+# lua = "main.lua" is the default
+
+# Settings, declared here and shown in the module's panel; main.lua reads them with mirage.setting("greeting")
+[settings.greeting]
+type = "string"
+name = "Greeting"
+description = "What it draws"
+default = "Hello from a Lua mod"
+
+[settings.height]
+type = "float"
+name = "Height"
+description = "Where on the screen, from the top"
+default = 0.25
+min = 0.0
+max = 0.95
+format = "%.2f"
+
+[settings.color]
+type = "choice"
+name = "Color"
+description = "The text's color"
+options = ["Blue", "Orange", "White"]
+default = "Orange"

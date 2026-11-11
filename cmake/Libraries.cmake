@@ -291,6 +291,19 @@ if(MEMENU_GAME)
     add_library(lua::lua ALIAS lua_static)
   endif()
 
+  # stb: stb_image (PNG / TGA / BMP / JPEG decoding) and stb_dxt (DXT1/5 blocks) for a mod's replacement textures
+  # (src/runtime/texture_files.cpp; the implementations are compiled once in src/runtime/stb_impl.cpp). Header only.
+  CPMAddPackage(
+      NAME stb
+      GITHUB_REPOSITORY nothings/stb
+      GIT_TAG ${STB_COMMIT}
+      DOWNLOAD_ONLY YES
+  )
+  if(stb_ADDED AND NOT TARGET stb_headers)
+    add_library(stb_headers INTERFACE)
+    target_include_directories(stb_headers SYSTEM INTERFACE ${stb_SOURCE_DIR})
+  endif()
+
   # mimalloc: the allocator behind the DLL's operator new / delete (src/runtime/memory.cpp). Static, without
   # MI_OVERRIDE: malloc / free stay the CRT's, so nothing of the game's (or a library's malloc) goes through it. Its
   # memory comes from VirtualAlloc called by this DLL, which the TAS's memory map counts as the menu's (never rewound).
@@ -363,7 +376,7 @@ endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE
         imgui imjson minhook d3d9 shell32 spdlog::spdlog zstd_compress nlohmann_json::nlohmann_json winmm Threads::Threads)
 if(MEMENU_GAME)
-  target_link_libraries(${PROJECT_NAME} PRIVATE mirage::sdk UnrealLib::Linker lua::lua toml11::toml11 mimalloc-static)
+  target_link_libraries(${PROJECT_NAME} PRIVATE mirage::sdk UnrealLib::Linker UnrealLib::Assets UnrealLib::Writer lua::lua toml11::toml11 mimalloc-static stb_headers)
   target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/api)   # mirage/api.h: the mod ABI
 endif()
 

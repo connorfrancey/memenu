@@ -83,3 +83,6 @@ set(NAMEOF_VERSION v0.11.0)
 set(MIMALLOC_VERSION v3.6.1)
 
 set(ATOMICQUEUE_VERSION v1.9.4)
+
+# stb (stb_image, stb_dxt) - https://github.com/nothings/stb (no tags: a commit)
+set(STB_COMMIT 4e9b368bfc071e97206ea5c6adba68dd0cbf8897)

@@ -56,16 +56,26 @@ class HangWatch:
         self._stacks: list[str] = []
         self._dialog_seen: float | None = None
         self.finished: bool | None = None           # The menu logged the end of the self-test: passed or not
+        self.last_line = ""                         # The menu's last log line (for a game that vanished)
+        self.popups: list[str] = []                 # Error popups seen and dealt with ("process: title: text")
+        # The log is the previous session's until the menu starts a new one: told apart by its "# started" line
+        self._old_session = _session_of(log)
+        self._session = ""
 
     # ---- Signals ----------------------------------------------------------------------------------------------------
 
     def _read_log(self) -> None:
+        session = _session_of(self.log)
+        if not session or session == self._old_session:
+            self._last_growth = time.monotonic()    # This run's log isn't there yet: not silent, just not started
+            return
+        if session != self._session:    # A new session's log (the menu rotated it): from its start
+            self._session = session
+            self._offset = self._size = 0
         try:
             size = self.log.stat().st_size
         except OSError:
             return
-        if size < self._offset:         # A new log (the menu rotated it): start over
-            self._offset = 0
         if size != self._size:
             self._size = size
             self._last_growth = time.monotonic()
@@ -83,6 +93,8 @@ class HangWatch:
         self._offset += end + 1
         for raw in chunk[:end].split(b"\n"):
             line = raw.decode("utf-8", "replace").rstrip("\r")
+            if line.strip():
+                self.last_line = line
             if "] Self-test PASSED: " in line or "] Self-test FAILED: " in line:
                 self.finished = "PASSED" in line    # Done: from now on the log going quiet is normal
             if "] Self-test: " in line:
@@ -101,6 +113,11 @@ class HangWatch:
         """None while the game makes progress; a Hang once it is stuck (call kill afterwards)."""
         self._read_log()
         now = time.monotonic()
+        # Windows' own crash popup (WerFault: "MirrorsEdge.exe has stopped working"): noted, then closed, which lets
+        # the crashed game end instead of waiting for someone to click
+        for popup in close_error_popups() if WINDOWS else []:
+            if popup not in self.popups:
+                self.popups.append(popup)
         dialog = _dialog_text(self.pid) if WINDOWS else ""
         if dialog:
             self._dialog_seen = self._dialog_seen or now
@@ -127,6 +144,59 @@ class HangWatch:
         return hang
 
 
+def _session_of(log: Path) -> str:
+    """The log's "# started <time>" line (which session wrote it), "" if there is none yet."""
+    try:
+        with log.open("rb") as f:
+            for _ in range(4):
+                line = f.readline().decode("utf-8", "replace").strip()
+                if line.startswith("# started"):
+                    return line
+    except OSError:
+        pass
+    return ""
+
+
+_EXIT_CODES = {
+    0xC0000005: "access violation",
+    0xC0000409: "fail-fast or stack buffer overrun (skips the menu's crash logger)",
+    0xC00000FD: "stack overflow",
+    0xC0000374: "heap corruption",
+    0xC000041D: "an exception in a callback the system couldn't unwind",
+    0x00000003: "abort() (a failed assert or a CRT error)",
+    0x0000DEAD: "the failsafe (Ctrl+Alt+Shift+F12)",
+    0x40010004: "killed by the debugger or the system",
+}
+
+
+def exit_code_meaning(code: int | None) -> str:
+    """What a game exit code means, "" if nothing known."""
+    return _EXIT_CODES.get((code or 0) & 0xFFFFFFFF, "")
+
+
+GAME_EXE = "mirrorsedge.exe"
+_WER = ("werfault.exe", "werfaultsecure.exe")
+
+
+def close_error_popups() -> list[str]:
+    """Windows' error popups about the game (WerFault's crash dialog, a "can't start" box): each one's text, after it
+    was closed (WerFault is ended, which lets the crashed game go). Windows only; [] elsewhere."""
+    if not WINDOWS:
+        return []
+    found: list[str] = []
+    for hwnd, pid, cls, title in _windows():
+        exe = _process_name(pid)
+        if exe not in _WER and not (exe == GAME_EXE and cls == "#32770" and _is_error_box(hwnd, title)):
+            continue
+        text = _window_text_all(hwnd)
+        if exe in _WER and GAME_EXE.split(".")[0] not in (title + text).lower():
+            continue        # A crash popup of another program: not ours to close
+        found.append(f"{exe}: {title}: {text}"[:600])
+        if exe in _WER:
+            _terminate(pid)
+    return found
+
+
 # ---- Windows ------------------------------------------------------------------------------------------------------------
 
 if WINDOWS:
@@ -141,6 +211,12 @@ if WINDOWS:
     _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                     ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 
 def _text(hwnd) -> str:
@@ -153,6 +229,64 @@ def _class(hwnd) -> str:
     buf = ctypes.create_unicode_buffer(256)
     _user32.GetClassNameW(hwnd, buf, 256)
     return buf.value
+
+
+def _windows() -> list[tuple[int, int, str, str]]:
+    """Visible top-level windows: (hwnd, owner pid, class, title)."""
+    out: list[tuple[int, int, str, str]] = []
+
+    @_EnumProc
+    def each(hwnd, _):
+        if _user32.IsWindowVisible(hwnd):
+            owner = wintypes.DWORD()
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            out.append((hwnd, owner.value, _class(hwnd), _text(hwnd)))
+        return True
+
+    _user32.EnumWindows(each, 0)
+    return out
+
+
+def _process_name(pid: int) -> str:
+    """The executable's file name, lowercase ("" if it can't be read)."""
+    handle = _kernel32.OpenProcess(0x1000, False, pid)     # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if not _kernel32.QueryFullProcessImageNameW(wintypes.HANDLE(handle), 0, buf, ctypes.byref(size)):
+            return ""
+        return buf.value.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+    finally:
+        _kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _terminate(pid: int) -> None:
+    handle = _kernel32.OpenProcess(0x0001, False, pid)     # PROCESS_TERMINATE
+    if handle:
+        _kernel32.TerminateProcess(wintypes.HANDLE(handle), 1)
+        _kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _window_text_all(hwnd) -> str:
+    """The texts of a window's Static children (a dialog's message), joined."""
+    parts: list[str] = []
+
+    @_EnumProc
+    def child(c, _):
+        if _class(c) == "Static" and _text(c).strip():
+            parts.append(" ".join(_text(c).split()))
+        return True
+
+    _user32.EnumChildWindows(hwnd, child, 0)
+    return " / ".join(parts)
+
+
+def _is_error_box(hwnd, title: str) -> bool:
+    """A system error box of the game itself (a missing DLL, an entry point not found): titled like one"""
+    t = title.lower()
+    return "error" in t or "system error" in t or t.endswith(".exe")
 
 
 def _dialog_text(pid: int) -> str:

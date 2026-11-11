@@ -102,6 +102,7 @@ class Result:
     log_errors: list[str] = field(default_factory=list)
     exit_reason: str = ""
     hang: "hangmon.Hang | None" = None   # The game stopped making progress and was ended (tools/memenu_tools/hangmon.py)
+    popups: list[str] = field(default_factory=list)   # Windows' error popups about the game, closed by the run
     seconds: float = 0.0
     environment: str = ""     # Not the menu's fault (the game or Steam didn't get going): worth another try
 
@@ -298,8 +299,16 @@ def run(game_dir: Path, timeout: float, on_progress=None, close: bool = True) ->
             res.finished, res.passed = True, watch.finished
         if proc.poll() is not None:
             finished = (_read(result_file) or {}).get("finished", False)
-            res.exit_reason = ("game closed by the self-test" if finished and proc.returncode == 0
-                               else f"game exited (code {proc.returncode:#x})")
+            if finished and proc.returncode == 0:
+                res.exit_reason = "game closed by the self-test"
+            else:
+                # Gone in the middle: what the exit code means, and the menu's last words (a fail-fast or a stack
+                # overflow skips the menu's crash logger, so this is all there is)
+                res.exit_reason = f"game exited (code {proc.returncode & 0xFFFFFFFF:#x}"
+                meaning = hangmon.exit_code_meaning(proc.returncode)
+                res.exit_reason += f": {meaning})" if meaning else ")"
+                if watch and watch.last_line:
+                    res.exit_reason += f"; the menu's last log line: {watch.last_line[:200]}"
             break
         if res.finished:
             if close:
@@ -328,6 +337,13 @@ def run(game_dir: Path, timeout: float, on_progress=None, close: bool = True) ->
             proc.kill()
             break
     res.seconds = time.monotonic() - t0
+    # Windows' error popups about the game (a crash dialog appears a moment after the process is gone): noted, closed
+    if not LINUX:
+        time.sleep(1.0)
+        res.popups = list(watch.popups) if watch else []
+        for popup in hangmon.close_error_popups():
+            if popup not in res.popups:
+                res.popups.append(popup)
     steam_error = _steam_error_window()
     clean = res.finished and proc.returncode == 0
     if not clean:

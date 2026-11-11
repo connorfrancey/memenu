@@ -1,4 +1,5 @@
 #include "runtime/mods.h"
+#include "core/notify.h"
 
 #include "core/module.h"
 #include "core/setting.h"
@@ -386,8 +387,11 @@ namespace mirage::mods
 				switch (d.type) {
 					case T::Bool: s = std::make_unique<ctl::Checkbox>(&m, d.name, d.boolDefault, d.description); break;
 					case T::Int:
-						s = std::make_unique<ctl::SliderInt>(&m, d.name, static_cast<int>(d.intDefault), static_cast<int>(d.min),
-															 static_cast<int>(d.max), std::string("%d"), 0, d.description);
+						// Within ImGui's int slider range (see SettingSliderInt)
+						s = std::make_unique<ctl::SliderInt>(&m, d.name, static_cast<int>(d.intDefault),
+															 static_cast<int>(std::clamp<double>(d.min, -(INT32_MAX / 2), INT32_MAX / 2)),
+															 static_cast<int>(std::clamp<double>(d.max, -(INT32_MAX / 2), INT32_MAX / 2)),
+															 std::string("%d"), 0, d.description);
 						break;
 					case T::Float:
 						s = std::make_unique<ctl::Slider>(&m, d.name, static_cast<float>(d.floatDefault), static_cast<float>(d.min),
@@ -478,6 +482,10 @@ namespace mirage::mods
 		MirageSetting* MIRAGE_CALL SettingSliderInt(MirageModule* m, const char* name, int32_t value, int32_t min,
 													int32_t max, const char* tooltip)
 		{
+			// ImGui's int sliders take at most half of int32's range (it asserts otherwise): 1 << 30 is one too many
+			constexpr int32_t kLimit = INT32_MAX / 2;
+			min = std::clamp(min, -kLimit, kLimit);
+			max = std::clamp(max, -kLimit, kLimit);
 			if (!(min < max)) return nullptr;
 			return MakeSetting<ctl::SliderInt>(m, name, int(value), int(min), int(max), std::string("%d"), 0,
 											   std::string(Str(tooltip)));
@@ -631,6 +639,13 @@ namespace mirage::mods
 			return MIRAGE_SETTING_UNKNOWN;
 		}
 
+		// A notification on screen (the menu's toasts), prefixed with nothing: the mod writes what the player reads
+		void MIRAGE_CALL Notify(MirageMod* mod, const char* text)
+		{
+			if (!mod || !text || !*text) return;
+			notify::Push(text);
+		}
+
 		const MirageApi kApi = {
 			sizeof(MirageApi), MIRAGE_ABI_VERSION, kRuntimeVersion,
 			Log, ModId, ModVersion, ModDir,
@@ -646,6 +661,10 @@ namespace mirage::mods
 			game_api::PlayerPawn, game_api::PlayerController, game_api::WorldInfo, game_api::ObjectFind,
 			game_api::ObjectGet, game_api::ObjectSet, game_api::ObjectName, game_api::ObjectClassName, game_api::ObjectIsA,
 			game_api::DetourCreate, game_api::DetourRemove, game_api::FindPattern,
+			game_api::ScriptOpen, game_api::ScriptClose, game_api::ScriptCount, game_api::ScriptGet, game_api::ScriptSet,
+			game_api::ScriptAdd, game_api::ScriptChildren, game_api::ScriptSetChildren, game_api::ScriptApply,
+			game_api::ScriptRestore, game_api::ScriptDump, game_api::ScriptKind, game_api::ScriptKindName,
+			Notify,
 		};
 
 		// ---- Loading -----------------------------------------------------------------------------------------------

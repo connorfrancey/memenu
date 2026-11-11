@@ -443,7 +443,7 @@ def build_cmd(ctx: click.Context, config: str, targets: tuple[str, ...], clean_f
     
     Feature toggles are remembered by the build folder, so later plain builds keep them:
       memenu build --disable all                    menu GUI only, no in-game functionality
-      memenu build --only levels --enable god_mode  the Levels tab and God Mode
+      memenu build --only levels --enable no_clip   the Levels tab and No Clip
       memenu build --enable debug --disable log_viewer
       memenu build --enable all                     everything, TAS included
       memenu build --default-features               back to the defaults (everything but TAS)
@@ -1171,6 +1171,12 @@ def game_test(ctx: click.Context, config: str, no_build: bool, build_dir: Path |
     if res.current:
         console.print(f"[bold red]Stopped in the middle of: {escape(res.current)}[/]")
     console.print(f"{res.exit_reason}, {res.seconds:.0f} s")
+    for popup in res.popups:
+        console.print(f"[bold red]Error popup[/] (closed): {escape(popup)}")
+    if res.hang and res.hang.stacks:
+        console.print("[yellow]The menu's last thread stacks before the hang:[/]")
+        for line in res.hang.stacks[-12:]:
+            console.print(f"  {escape(line[:300])}")
     for c in res.crashes:
         where = devtest.symbolize(game_dir / "memenu" / "medge_menu.dll", c.offset) if "medge_menu" in c.module.lower() else None
         console.print(f"[bold red]Crash[/] {c.time} {c.code} {c.description} in {c.module}+{c.offset:#x}"

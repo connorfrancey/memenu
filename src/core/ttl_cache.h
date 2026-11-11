@@ -18,12 +18,31 @@
 // Without optimizations (MEMENU_OPTIMIZATIONS off) nothing is ever found: Get() computes every time.
 namespace cache
 {
+	// Under the eviction manager (core/cache_evict.h): its expired entries go at each pass, and when memory is short
+	// the ones closest to expiring go first.
 	template <class K, class V, class Hash = std::hash<K>, class Eq = std::equal_to<K>>
-	class TtlMap
+	class TtlMap : public Evictor::Member
 	{
 	public:
 		TtlMap(std::string name, double ttlSeconds, std::size_t maxEntries = 0)
-			: stats_(&Register(std::move(name), Scope::Timed)), ttl_(clk::FromSeconds(ttlSeconds)), max_(maxEntries) {}
+			: Evictor::Member(name), stats_(&Register(std::move(name), Scope::Timed)), ttl_(clk::FromSeconds(ttlSeconds)),
+			  max_(maxEntries) {}
+
+		// ---- Evictable
+		static constexpr std::size_t kEntryBytes = sizeof(K) + sizeof(V) + sizeof(clk::Ticks) + 4 * sizeof(void*);
+		std::size_t Bytes() const override { return map_.size() * kEntryBytes; }
+		std::size_t Trim(std::size_t bytes) override
+		{
+			std::size_t freed = Purge() * kEntryBytes;
+			while (freed < bytes && !map_.empty()) {
+				EvictSoonest();
+				freed += kEntryBytes;
+			}
+			UpdateSize();
+			return freed;
+		}
+		std::size_t Expire() override { return Purge(); }
+		std::uint64_t Hits() const override { return stats_->hits.load(std::memory_order_relaxed); }
 
 		// The value for `key`, recomputed with `compute()` (returns a V) when missing or expired. The reference is
 		// valid until the next call that stores or drops entries.

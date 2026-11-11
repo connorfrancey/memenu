@@ -1,4 +1,5 @@
 #include "core/module.h"
+#include "game/object_query.h"
 #include "game/game.h"
 #include "game/uobject.h"
 
@@ -42,10 +43,7 @@ private:
     void Find()
     {
         found_ = true;
-        const auto& objects = Classes::UObject::GetGlobalObjects();
-        for (std::size_t i = 0; i < objects.Num(); ++i) {
-            auto* o = objects.GetByIndex(i);
-            if (!o || !game::IsA(o, Classes::UEngine::StaticClass())) continue;
+        for (Classes::UObject* o : game::ObjectsOf(Classes::UEngine::StaticClass())) {   // game/object_query.h
             auto* engine = static_cast<Classes::UEngine*>(o);
             engines_.push_back({engine, engine->bEnableColorClear != 0});
         }

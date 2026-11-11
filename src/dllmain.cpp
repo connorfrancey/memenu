@@ -25,9 +25,13 @@
 #include "runtime/content.h"
 #include "runtime/detours.h"
 #include "runtime/fhooks.h"
+#include "runtime/file_redirect.h"
 #include "runtime/mod_game.h"
 #include "runtime/mods.h"
 #include "runtime/reflect.h"
+#include "runtime/texture_overlays.h"
+#include "runtime/script_patch.h"
+#include "runtime/firstparty.h"
 #endif
 #if MEMENU_FEATURE_TAS
 #include "tas/tas.h"
@@ -70,6 +74,7 @@ static void Run(HMODULE module)
 #if MEMENU_GAME
     // Mirage mods (mods\<id>\mod.toml): found and ordered now, the early phase loaded before the config and the
     // scheduler see the modules. The self-test also loads its test mods (selftest-mods, put there by `memenu game-test`).
+    STARTUP_STEP(mirage::firstparty::Install(paths::Dir() / "mods"));   // The menu's own mods, at this DLL's version
     STARTUP_STEP(mirage::mods::Discover(selfTest ? std::vector{paths::Dir() / "mods", paths::Dir() / "selftest-mods"}
                                                  : std::vector{paths::Dir() / "mods"}));
     STARTUP_STEP(mirage::mods::LoadPhase(mirage::mods::Phase::Early));
@@ -81,6 +86,11 @@ static void Run(HMODULE module)
     STARTUP_STEP(sched::Init());              // Run order of the modules' OnTick
 
     const bool installed = STARTUP_STEP(hooks::Install());
+#if MEMENU_GAME
+    // Package opens are followed from now on (a package keeps the file it first got: runtime/file_redirect.h), before
+    // the engine-phase mods turn their content on
+    if (installed) STARTUP_STEP(mirage::files::Install());
+#endif
     spdlog::info("Hardware: {}", hw::Get().Summary());   // After the hooks: they add the GPU
     if (installed)
     {
@@ -166,6 +176,8 @@ static void Run(HMODULE module)
 #if MEMENU_GAME
         mirage::hooks::RemoveAll();  // Functions back to their own code before this DLL goes
         mirage::detours::RemoveAll();   // Mods' detours, before MinHook is shut down
+        mirage::textures::Shutdown();   // Its worker, and the package file redirects (MinHook too)
+        mirage::scripts::RestoreAll();  // Patched functions back to their own bytecode
 #endif
         hooks::Uninstall();
 #if MEMENU_GAME

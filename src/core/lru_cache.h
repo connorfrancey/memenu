@@ -1,5 +1,6 @@
 #pragma once
 #include "core/cache.h"
+#include "core/cache_evict.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -20,13 +21,29 @@
 // Without optimizations (MEMENU_OPTIMIZATIONS off) nothing is ever found: Get() computes every time.
 namespace cache
 {
+	// Under the eviction manager (core/cache_evict.h): it gives back its least recently used entries first.
 	template <class K, class V, class Hash = std::hash<K>, class Eq = std::equal_to<K>>
-	class Lru
+	class Lru : public Evictor::Member
 	{
 	public:
 		Lru(std::string name, std::size_t capacity) : Lru(Register(std::move(name), Scope::Lru), capacity) {}
 		// Counted into existing statistics (a cache built on top of this one).
-		Lru(Stats& stats, std::size_t capacity) : stats_(&stats), capacity_(std::max<std::size_t>(capacity, 1)) {}
+		Lru(Stats& stats, std::size_t capacity)
+			: Evictor::Member(stats.name), stats_(&stats), capacity_(std::max<std::size_t>(capacity, 1)) {}
+
+		// ---- Evictable: an estimate per entry (the list and hash nodes, the key and value themselves)
+		static constexpr std::size_t kEntryBytes = sizeof(std::pair<K, V>) + sizeof(K) + 6 * sizeof(void*);
+		std::size_t Bytes() const override { return order_.size() * kEntryBytes; }
+		std::size_t Trim(std::size_t bytes) override
+		{
+			std::size_t freed = 0;
+			while (freed < bytes && !order_.empty()) {
+				EvictOne();
+				freed += kEntryBytes;
+			}
+			return freed;
+		}
+		std::uint64_t Hits() const override { return stats_->hits.load(std::memory_order_relaxed); }
 
 		// The value for `key`, computed with `compute()` (returns a V) when missing. The reference is valid until the
 		// next call that stores or drops entries.

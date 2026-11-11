@@ -85,6 +85,13 @@ list(APPEND SOURCE_FILES ${MEMENU_FEATURE_SOURCES})
 if(MEMENU_GAME)   # The Mirage runtime (src/runtime/): UnrealLib and Lua, linked with the game layer
   file(GLOB_RECURSE _runtime_sources CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/*.cpp)
   list(APPEND SOURCE_FILES ${_runtime_sources})
+  # The first-party mods (mods/): embedded in the DLL, written to the mods folder at startup (runtime/firstparty.h)
+  file(GLOB_RECURSE _firstparty_files CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/mods/*)
+  set(_firstparty_cpp ${CMAKE_BINARY_DIR}/generated/firstparty_mods.cpp)
+  add_custom_command(OUTPUT ${_firstparty_cpp}
+          COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}/mods -DOUT=${_firstparty_cpp} -P ${CMAKE_SOURCE_DIR}/cmake/EmbedMods.cmake
+          DEPENDS ${_firstparty_files} ${CMAKE_SOURCE_DIR}/cmake/EmbedMods.cmake
+          COMMENT "Embedding the first-party mods (mods/)")   # Added to the target below (generated: outside src/)
 endif()
 if(NOT MEMENU_GAME)   # Keep the IDE tree to what is built
   list(FILTER HEADER_FILES EXCLUDE REGEX "/src/(tas|game|runtime)/")
@@ -106,6 +113,9 @@ endif()
 
 # Injected mod => DLL, not an executable
 add_library(${PROJECT_NAME} SHARED ${HEADER_FILES} ${SOURCE_FILES})
+if(MEMENU_GAME)
+  target_sources(${PROJECT_NAME} PRIVATE ${_firstparty_cpp})
+endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
 
 # build_info.cpp: a new build identifier (UUID, commit, build time) on every build, logged at startup

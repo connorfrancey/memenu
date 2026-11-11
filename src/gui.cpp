@@ -12,6 +12,9 @@
 #include <cctype>
 #include <cfloat>
 #include <map>
+#include <mutex>
+
+#include <imgui_internal.h>
 #include <string>
 #include <imgui.h>
 
@@ -171,6 +174,10 @@ namespace
         return false;
     }
 
+    std::mutex g_testColumnLock;
+    std::string g_testColumn;       // gui::OpenColumnForTest
+    std::map<std::string, bool> g_testCollapsed;    // Columns the test opened: collapsed before? Put back when cleared
+
     // A column never grows past the bottom of the screen: taller content scrolls with the mouse wheel.
     bool BeginColumn(const std::string& name, float width, ImVec2 defaultPos, ImGuiWindowFlags flags)
     {
@@ -180,6 +187,19 @@ namespace
         const float maxH = display.y > 0.f ? std::max(120.f, display.y - top - 8.f) : FLT_MAX;
         ImGui::SetNextWindowPos(defaultPos, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSizeConstraints({width, 0.f}, {width, maxH});
+        {
+            std::lock_guard lock(g_testColumnLock);
+            if (!g_testColumn.empty() && g_testColumn == name) {
+                if (!g_testCollapsed.count(name)) {
+                    const ImGuiWindow* w = ImGui::FindWindowByName(name.c_str());
+                    g_testCollapsed[name] = w && w->Collapsed;
+                }
+                ImGui::SetNextWindowCollapsed(false, ImGuiCond_Always);
+            } else if (const auto was = g_testCollapsed.find(name); was != g_testCollapsed.end()) {
+                ImGui::SetNextWindowCollapsed(was->second, ImGuiCond_Always);   // As the player left it
+                g_testCollapsed.erase(was);
+            }
+        }
         return ImGui::Begin(name.c_str(), nullptr, flags);   // EndColumn either way
     }
 
@@ -357,4 +377,10 @@ void gui::Render()
     theme::End(); // must be popped before ImGui::EndFrame()
 
     keybinds::EndFrame(); // clicking anywhere except a bind button cancels a pending binding
+}
+
+void gui::OpenColumnForTest(const char* tab)
+{
+    std::lock_guard lock(g_testColumnLock);
+    g_testColumn = tab ? tab : "";
 }

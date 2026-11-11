@@ -194,6 +194,7 @@ namespace mirage::mods
 		mod.subscriptions.clear();
 		for (int id : mod.detours) detours::Remove(id);
 		mod.detours.clear();
+		ReleaseScripts(mod);
 	}
 
 	void DispatchTick(float seconds)

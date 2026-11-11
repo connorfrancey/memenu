@@ -281,15 +281,30 @@ from before Mirage.
 no game file touched; turning them off restores the original on the next level load; UnrealLib's corpus sweeps still
 pass.
 
-**Status (2026-11-11): half done.** Default property overrides work, as data applied at runtime rather than baked
-into overlay packages. `content/defaults.toml` holds the overrides (`runtime/content`). They are applied through
-reflection on the game thread, re-applied after level loads and undone exactly, and a module named after the mod turns
-them on and off. `examples/mods/high-steps` and the self-test "Mirage content" show this, with no game file touched.
-Left: texture replacement. A rewritten package moves every byte, but other packages' streamed mips point into it by
-raw file offset. The plan is an append-only overlay: keep the original file's bytes, write the changed chunk(s) and
-the new texture (all mips inline) at the end, and redirect the engine's opens of that file. That needs a Texture2D
-native-data writer (layout: UnrealLib `read_texture2d`) and a DXT encoder. Sounds, meshes and T3D map edits come after
-that.
+**Status (2026-11-11): done for defaults and textures.** Default property overrides work, as data applied at runtime
+rather than baked into overlay packages. `content/defaults.toml` holds the overrides (`runtime/content`). They are
+applied through reflection on the game thread, re-applied after level loads and undone exactly, and a module named after
+the mod turns them on and off (`examples/mods/high-steps`, self-test "Mirage content").
+
+Textures: `content/textures/<full texture path>.png` (or `.tga/.bmp/.jpg`, encoded to the texture's own format with a
+mip chain; `.dds` as stored). A survey of the Prologue and menu maps settled the design: maps hold *copies* of the
+textures they use, which stream their large mips from uncompressed storage packages by raw offset, and every texture
+whose mips are all inline is NeverStream or resident. So a replaced texture is written as NeverStream with every mip
+inline into each package that holds a copy (`runtime/texture_files`), and storage packages are never touched: the
+append-only overlay planned above isn't needed. In the game (`runtime/texture_overlays`, `runtime/file_redirect`):
+
+- An index of which packages hold which texture, from the package headers only (2,406 packages in 2.7 s, then cached
+  by size and time: 0.2 s).
+- A copy is made the first time the game opens a package that holds a replaced texture, in the opening thread
+  (126-297 ms per Prologue map, written uncompressed: LZO took seconds), then cached by a hash of the original and the
+  images. Building them all up front was tried and dropped: one rooftop texture is in 98 packages (1.35 GB).
+- kernelbase `CreateFileW` / `GetFileAttributesExW` hooks open the copy instead. A package keeps the file it first got
+  for the whole session: switching it under the engine, which keeps its files open by name, hung the loader. Turning
+  textures on or off applies to packages not loaded yet, and to all of them after a restart.
+- Uncompressed copies must clear `PKG_StoreCompressed`, or the engine crashes reading the summary.
+
+`examples/mods/retexture` and the self-test "Mirage textures" show it (the live texture object has the image's size).
+Left for later in this step: sounds, meshes and T3D map edits.
 
 ### 8. Script mods: bytecode assembly and patching
 
@@ -302,6 +317,15 @@ that.
 **Milestone:** 100% byte-identical encode round trip over the Mirror's Edge corpus; an example mod changes a script
 function's behaviour (for example the jump logic in TdPawn) with no native detour, and turning it off restores it.
 
+**Status (2026-11-11): done.** UnrealLib (branch `bytecode-encoder`) has `encode_script`, the decoder's inverse: all
+13,770 scripts of the game (477,343 tokens) round-trip byte-identical, and `assemble_script`, which lays an edited tree
+out again (jump targets follow their statements, relative skips keep the compiler's own slack; checked over the corpus by
+inserting and removing tokens everywhere). In the game, `runtime/script_patch` decodes a live function's bytecode, and
+mods edit it through the API (`script_open` ... `script_apply`, Lua `mirage.script`). `examples/mods/higher-jumps`
+patches `TdMove_Jump.StartMove` and a standing jump goes 2.25 times as high (self-test "Mirage script patch"); off, the
+original bytecode is back. Not done: mixin-style injection (calling a mod's code from inside bytecode; function hooks
+cover before/after), and patches baked into packages.
+
 ### 9. The menu becomes mods, and a mod manager
 
 - The current features move into first-party mods (`memenu-trainer`, `memenu-tas`, `memenu-visual`, ...) that use only
@@ -313,6 +337,12 @@ function's behaviour (for example the jump logic in TdPawn) with no native detou
 
 **Milestone:** the first-party mods compile against `api/` headers only (enforced by the build: no runtime include
 paths); every one of today's self-test checks passes with the features loaded as mods.
+
+**Status (2026-11-11): started.** First-party mods live in `mods/`, are embedded in the DLL (`cmake/EmbedMods.cmake`)
+and written to the mods folder at startup (`runtime/firstparty`), so every install has them. `mods/memenu-trainer`
+(Lua) replaces the native God Mode, Teleport to Spawn and Game Speed, with the same names and settings, and the
+self-test's checks pass on it. API: `notify` appended. Measured: a Lua module's tick costs 20-30 us in release (native
+~1 us), worth bringing down before many features move. Next: the mod manager, then more features.
 
 ### 10. Tooling, docs and distribution
 

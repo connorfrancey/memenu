@@ -12,6 +12,14 @@
 //
 //   Values are TOML booleans, integers, floats and strings (names); a table sets a struct's members.
 //
+//   textures/       replacement textures, one image per texture, named by the texture's full path:
+//
+//       textures/M_Rooftops.Textures.T_Roof_02_D.png     # PNG, TGA, BMP or JPG: encoded to the texture's format,
+//       textures/B_C_01.Facade.T_Window_01.dds           # with a full mip chain; DDS: used as stored (DXT1/3/5, ARGB, L8)
+//
+//   Every package holding a copy of the texture opens as a rewritten copy (runtime/texture_overlays.h): the new
+//   texture shows from the next level load on, and turning the content off gives the original on the one after.
+//
 // Applied on the game thread, re-applied after every level load (objects that came with the level), and undone
 // exactly (each value's bytes as they were) when the content is turned off or the mod unloads. The game's files are
 // never written.
@@ -44,6 +52,7 @@ namespace mirage::content
 	struct Stats
 	{
 		int objects = 0, values = 0, missing = 0;	// Values applied; missing: objects or properties not found
+		int textures = 0;							// Replacement textures the content has
 		std::vector<std::string> notes;				// The first problems
 	};
 	Stats GetStats(const Set& set);

@@ -1,0 +1,15 @@
+id = "higher-jumps"
+name = "Higher Jumps"
+version = "1.0.0"
+description = "A script patch example: TdMove_Jump.StartMove's bytecode multiplies the jump's speed. No native code"
+authors = ["Mirror's Edge Menu"]
+mirage = "^0.1"
+
+[settings.multiplier]
+type = "float"
+name = "Jump speed"
+description = "How much faster the jump starts upwards (the height goes with its square)"
+default = 1.5
+min = 1.0
+max = 3.0
+format = "x%.2f"

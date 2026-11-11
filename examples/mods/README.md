@@ -123,3 +123,20 @@ function, and they run by priority.
 
 Hooks run on the game thread. A mod's hooks, events and detours go away when it unloads, reloads or crashes. A TAS
 rewind puts the game's memory back but never a mod's: after `state_restored`, look game objects up again.
+
+## Content mods: data, no code
+
+A mod with `content = ["content"]` in its `mod.toml` changes the game through files in that folder, and gets a module
+named after it that turns them on and off.
+
+| Folder        | What it shows                                                                   |
+|---------------|---------------------------------------------------------------------------------|
+| `high-steps/` | `content/defaults.toml`: default property overrides (the player steps up higher) |
+| `retexture/`  | `content/textures/M_Rooftops.Textures.T_Roof_02_D.png`: a replaced texture       |
+
+A replacement texture is named by the texture's full path (outer packages and groups, dots between them). PNG, TGA, BMP
+and JPG images are encoded to the original's format with a full mip chain; a DDS (DXT1/3/5, 32-bit ARGB or 8-bit
+luminance) is used as stored. Sides must be powers of two. The game's files are never written: the packages holding the
+texture are opened as rewritten copies kept in `memenu\cache\textures`. A change shows on the next load of a level not
+loaded yet this session, and everywhere after a restart.
+

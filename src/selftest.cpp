@@ -22,6 +22,12 @@
 #include "runtime/call.h"
 #include "runtime/engine_calls.h"
 #include "runtime/fhooks.h"
+#include "runtime/file_redirect.h"
+#include "runtime/texture_overlays.h"
+#include "core/cache_evict.h"
+#include "core/cache_sched.h"
+#include "game/object_query.h"
+#include "runtime/script_patch.h"
 #include "runtime/reflect.h"
 #include "runtime/layout.h"
 #include "runtime/lua_vm.h"
@@ -202,7 +208,13 @@ void WriteResult(bool finished)
         std::ofstream out(tmp, std::ios::trunc);
         out << root.dump(2);
     }
-    MoveFileExA(tmp.c_str(), path.string().c_str(), MOVEFILE_REPLACE_EXISTING);
+    // `memenu game-test` reads the file several times a second: a replace while it is open fails, so try again (the
+    // last write, finished = true, once got lost that way and the run waited for nothing)
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (MoveFileExA(tmp.c_str(), path.string().c_str(), MOVEFILE_REPLACE_EXISTING)) return;
+        Sleep(25);
+    }
+    spdlog::warn("Self-test: {} couldn't be written ({})", path.string(), GetLastError());
 }
 
 // ---- Waiting --------------------------------------------------------------------------------------------------------
@@ -3407,6 +3419,105 @@ void TestMirageModHooks()
     End(s);
 }
 
+// The cache system (core/cache_evict.h, core/cache_sched.h, game/object_query.h): the object index is built in slices by
+// the cache scheduler; its answers are the same as a scan of the whole object list, and faster (timed here against the
+// scans it replaced); the actor cache reads the levels' own actor lists; everything is under the eviction manager.
+void TestCacheSystem()
+{
+    Step& s = Begin("Cache system");
+    Probe p(s);
+    // A pass made in slices by the cache scheduler (not one a query made at once)
+    if (!WaitFor(20.0, [] { const auto st = game::GetQueryStats(); return st.passes > st.exactPasses; }))
+        p.Problem("the cache scheduler didn't complete an object index pass in 20 s");
+    const auto ms = [](clk::Ticks t) { return clk::Seconds(t) * 1000.0; };
+    char line[240];
+    OnGameThread([&] {
+        const auto& objects = Classes::UObject::GetGlobalObjects();
+        // ---- By class: every UFunction
+        Classes::UClass* fnClass = Classes::UFunction::StaticClass();
+        clk::Ticks t0 = clk::Now();
+        std::size_t scanned = 0;
+        for (std::size_t i = 0; i < objects.Num(); ++i)
+            if (auto* o = objects.GetByIndex(i); o && o->Class == fnClass) ++scanned;
+        const double scanMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        std::size_t indexed = 0;
+        for (auto* o : game::ObjectsOf(fnClass)) indexed += o->Class == fnClass;
+        const double indexMs = ms(clk::Now() - t0);
+        if (indexed != scanned) p.Problem("ObjectsOf(Function) found " + std::to_string(indexed) + ", a scan " + std::to_string(scanned));
+        std::snprintf(line, sizeof line, "by class: %zu functions in %.3f ms (a scan: %.3f ms)", indexed, indexMs, scanMs);
+        s.notes.push_back(line);
+
+        // ---- By path: the old fallback built every object's name
+        const std::string path = "TdGame.Default__TdPawn";
+        t0 = clk::Now();
+        Classes::UObject* slow = nullptr;
+        for (std::size_t i = 0; i < objects.Num() && !slow; ++i)
+            if (auto* o = objects.GetByIndex(i); o && o->GetName() == "Default__TdPawn" && o->GetPathName() == path) slow = o;
+        const double slowMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        Classes::UObject* fast = game::FindByPath(path);
+        const double fastMs = ms(clk::Now() - t0);
+        if (!slow || fast != slow) p.Problem("FindByPath(" + path + ") isn't what a scan finds");
+        std::snprintf(line, sizeof line, "by path: %s in %.3f ms (a name scan: %.3f ms, x%.0f)", path.c_str(), fastMs, slowMs,
+                      fastMs > 0 ? slowMs / fastMs : 0.0);
+        s.notes.push_back(line);
+
+        // ---- Actors: the pawns in play
+        Classes::UClass* pawnClass = Classes::APawn::StaticClass();
+        t0 = clk::Now();
+        std::vector<Classes::UObject*> all;
+        for (std::size_t i = 0; i < objects.Num(); ++i)
+            if (auto* o = objects.GetByIndex(i); o && game::IsA(o, pawnClass) && o->GetName().rfind("Default__", 0) != 0) all.push_back(o);
+        const double pawnScanMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        const auto pawns = game::ActorsOf(pawnClass);
+        const double actorsMs = ms(clk::Now() - t0);
+        t0 = clk::Now();
+        game::ActorsOf(pawnClass);
+        const double againMs = ms(clk::Now() - t0);
+        const auto st = game::GetQueryStats();
+        if (!st.levelListsOk) p.Problem("the levels' actor lists weren't usable (ULevel::Actors at 0x3C, WorldInfo first)");
+        if (std::find(pawns.begin(), pawns.end(), static_cast<Classes::AActor*>(game::Pawn())) == pawns.end())
+            p.Problem("ActorsOf(Pawn) hasn't the player's pawn");
+        for (auto* a : pawns) {
+            if (!game::IsA(a, pawnClass)) { p.Problem("ActorsOf(Pawn) returned a " + a->Class->GetName()); break; }
+            if (std::find(all.begin(), all.end(), a) == all.end()) { p.Problem("ActorsOf(Pawn) returned an object a scan doesn't find"); break; }
+        }
+        std::snprintf(line, sizeof line, "actors: %zu pawns of %zu actors in %zu levels in %.3f ms, %.4f ms again this tick (a scan: "
+                      "%.3f ms, %zu pawn objects)", pawns.size(), st.actors, st.levels, actorsMs, againMs, pawnScanMs, all.size());
+        s.notes.push_back(line);
+        std::snprintf(line, sizeof line, "index: %zu slots, %zu classes, %zu names; %llu passes (%llu at once for a query, "
+                      "%llu sliced ones restarted), the last %.2f ms of scanning", st.slots, st.classes, st.names,
+                      static_cast<unsigned long long>(st.passes), static_cast<unsigned long long>(st.exactPasses),
+                      static_cast<unsigned long long>(st.restarts), st.lastPassMs);
+        s.notes.push_back(line);
+
+        // ---- The managers
+        const auto pass = cache::Evictions().Enforce();
+        const auto caches = cache::Evictions().Snapshot();
+        if (std::none_of(caches.begin(), caches.end(), [](const auto& v) { return v.name == "Object index"; }))
+            p.Problem("the object index isn't under the eviction manager");
+        if (pass.after > cache::Evictions().Budget()) p.Problem("over the cache budget after an eviction pass");
+        std::snprintf(line, sizeof line, "eviction: %zu caches, %.1f KB of %.0f KB budget", caches.size(), pass.after / 1024.0,
+                      cache::Evictions().Budget() / 1024.0);
+        s.notes.push_back(line);
+    });
+    const auto jobs = cache::Maintenance().Snapshot(clk::Seconds(clk::Now()));
+    for (const char* name : {"Object index", "Eviction"}) {
+        const auto it = std::find_if(jobs.begin(), jobs.end(), [&](const auto& j) { return j.name == name; });
+        if (it == jobs.end() || it->runs == 0) p.Problem(std::string("the cache scheduler never ran ") + name);
+        else {
+            std::snprintf(line, sizeof line, "job %s: %llu runs, %llu done, %.2f ms in total", name,
+                          static_cast<unsigned long long>(it->runs), static_cast<unsigned long long>(it->completions), it->totalMs);
+            s.notes.push_back(line);
+        }
+    }
+    WaitTicks(5);       // The measurements ran in one game-thread call: frames go on meanwhile
+    p.Check(1, true);
+    End(s);
+}
+
 // Mirage step 7: a content mod (examples/mods/high-steps, data only) overrides a default property. Its module turns it
 // on and off: on, the class's default object and the player's pawn have the mod's value, and a respawned pawn gets it;
 // off, the exact original is back, on the pawn now and on the next one. No game file is written.
@@ -3473,6 +3584,177 @@ void TestMirageContent()
     p.Check(1, true);
     End(s);
 }
+
+// Mirage step 7: a texture replaced by a content mod (examples/mods/retexture: one PNG, on from the start). The level
+// loaded before this step opened the packages holding the texture as rewritten copies, made on demand: the texture
+// object has the image's size. Turned off, a package the game already opened keeps its copy for the session (the
+// engine keeps its files open: switching one under it hung the loader), so reloading the level works and still shows
+// the mod; a package not opened yet is the original again, and turned back on, it would be a copy.
+void TestMirageTextures()
+{
+    Step& s = Begin("Mirage textures");
+    Probe p(s);
+    Module* m = modules::Find("Retexture");
+    if (!m) {
+        p.Problem("the Retexture module (examples/mods/retexture) is missing");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    constexpr const char* kTexture = "Texture2D M_Rooftops.Textures.T_Roof_02_D";
+    const auto size = [&] {
+        int w = -1, h = -1;
+        OnGameThread([&] {
+            auto* t = game::FindObject<Classes::UObject>(kTexture);
+            if (!t) return;
+            w = mirage::reflect::GetInt(mirage::reflect::Resolve(t->Class, t, "SizeX"));
+            h = mirage::reflect::GetInt(mirage::reflect::Resolve(t->Class, t, "SizeY"));
+        });
+        return std::pair{w, h};
+    };
+    const auto describe = [](std::pair<int, int> wh) { return std::to_string(wh.first) + "x" + std::to_string(wh.second); };
+    const auto set = [&](bool on) {
+        OnRenderThread([m, on] { m->SetEnabled(on); });
+        WaitTicks(3);
+        return mirage::textures::WaitIdle(120.0);
+    };
+    const auto reload = [&] {
+        const int loads = g_loadsFinished.load();
+        const auto maps = levels::Maps();
+        for (int i = 0; i < static_cast<int>(maps.size()); ++i)
+            if (Lower(maps[i].label).find(Lower(g_options.map)) != std::string::npos) {
+                OnGameThread([i] { levels::Load(i, g_options.checkpoint, levels::Method::Game, false); });
+                break;
+            }
+        if (!WaitFor(120.0, [&] { return g_loadsFinished.load() > loads && !game::IsLoading(); })) return false;
+        WaitPlayerReady(30.0);
+        return true;
+    };
+    const std::filesystem::path unopened = mirage::packages::CookedDir() / "Maps" / "SP09" / "Scraper_Roof.me1";
+
+    if (!set(true)) p.Problem("the texture index took more than 2 minutes");
+    const auto st = mirage::textures::GetStatus("retexture");
+    for (const auto& problem : st.problems) p.Problem(problem);
+    char line[200];
+    std::snprintf(line, sizeof line, "index: %zu packages (%.1f s); the texture is in %d of them; %llu copies made "
+                  "(%.1f s), %llu package opens from copies", st.indexedPackages, st.indexSeconds, st.packages,
+                  static_cast<unsigned long long>(mirage::files::Built()), st.buildSeconds,
+                  static_cast<unsigned long long>(mirage::files::Redirected()));
+    s.notes.push_back(line);
+    if (st.textures != 1 || st.packages < 1) p.Problem("the texture should be found in at least one package");
+
+    const auto on = size();
+    if (on != std::pair{256, 256}) p.Problem("on: the texture is " + describe(on) + ", not the mod's 256x256");
+    if (mirage::files::Redirected() == 0) p.Problem("the game opened no package from a mod copy");
+
+    set(false);
+    if (mirage::files::Redirects(unopened)) p.Problem("off: a package not opened yet (Scraper_Roof) is still redirected");
+    if (mirage::files::Held() == 0) p.Problem("off: no opened package is held (the level's packages should keep their copies)");
+    if (!reload()) p.Problem("off: the level didn't reload (the loader must not see a package change files)");
+    const auto held = size();
+    if (held != std::pair{256, 256}) p.Problem("off, reloaded: the texture is " + describe(held) + ", not the held copy's 256x256");
+    s.notes.push_back("off: " + std::to_string(mirage::files::Held()) + " opened packages keep their copies until a restart; "
+                      "reloaded fine, texture " + describe(held));
+
+    set(true);      // As the player would have it
+    if (!mirage::files::Redirects(unopened)) p.Problem("on again: Scraper_Roof (not opened yet) would not be redirected");
+    p.Check(1, true);
+    End(s);
+}
+
+#if MEMENU_FEATURE_TAS
+// Mirage step 8: a script patch from a Lua mod (examples/mods/higher-jumps). On, TdMove_Jump.StartMove's bytecode
+// multiplies the jump's upward speed by 1.5: a standing jump goes about 2.25 times as high, with no native detour.
+// Off, the function's own bytecode is back and the jump is as before.
+void TestMirageScriptPatch()
+{
+    Step& s = Begin("Mirage script patch");
+    Probe p(s);
+    Module* m = modules::Find("Higher Jumps");
+    if (!m) {
+        p.Problem("the Higher Jumps module (examples/mods/higher-jumps) is missing");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    Classes::UStruct* fn = nullptr;
+    OnGameThread([&] { fn = mirage::scripts::Find("TdGame.TdMove_Jump.StartMove"); });
+    if (!fn) {
+        p.Problem("TdGame.TdMove_Jump.StartMove wasn't found");
+        p.Check(1, true);
+        End(s);
+        return;
+    }
+    const auto patched = [&] {
+        bool on = false;
+        OnGameThread([&] { on = mirage::scripts::Patched(fn); });
+        return on;
+    };
+    const auto set = [&](bool on) {
+        OnRenderThread([m, on] { m->SetEnabled(on); });
+        WaitTicks(10);      // The mod patches or restores on its next tick
+    };
+    // A standing jump, by TAS macro: how high the player gets above where it started
+    std::string jumpKey;
+    OnGameThread([&] { jumpKey = KeyFor(game::Controller(), "GBA_Jump", "SpaceBar"); });
+    const auto jump = [&]() -> float {
+        WaitGrounded();
+        float startZ = 0.f, topZ = 0.f;
+        bool ok = false;
+        OnGameThread([&] {
+            if (auto* pawn = game::Pawn()) startZ = topZ = pawn->Location.Z, ok = true;
+        });
+        if (!ok) return -1.f;
+        tas::Macro mac(60.f);
+        mac.Describe("memenu self-test: standing jump").Wait(5).Hold(jumpKey, 2).Wait(80);
+        tas::Replay saved;
+        tas::WithReplay([&](tas::Replay& r) { saved = r; r = mac.Build(); });
+        tas::Play();
+        bool started = false;
+        const ULONGLONG deadline = GetTickCount64() + 20000;
+        while (GetTickCount64() < deadline && !g_aborted) {
+            const tas::Status st = tas::GetStatus();
+            if (st.mode == tas::Mode::Playing) started = true;
+            if (started && (st.mode != tas::Mode::Playing || st.frame >= st.frames)) break;
+            OnGameThread([&] {
+                if (auto* pawn = game::Pawn()) topZ = std::max(topZ, pawn->Location.Z);
+            }, 0.5);
+        }
+        tas::Stop();
+        WaitFor(5.0, [] { return tas::GetStatus().mode == tas::Mode::Idle; });
+        tas::WithReplay([&](tas::Replay& r) { r = saved; });
+        WaitGrounded();
+        return started ? topZ - startZ : -1.f;
+    };
+
+    OnGameThread([] { player_state::Save(); });
+    set(false);
+    if (patched()) p.Problem("off: the function is still patched");
+    const float before = jump();
+    set(true);
+    if (!patched()) p.Problem("on: the function wasn't patched (the mod's log says why)");
+    const float on = jump();
+    set(false);
+    if (patched()) p.Problem("off again: the function is still patched");
+    const float after = jump();
+    OnGameThread([] { player_state::Load(); });
+    WaitGrounded();
+
+    char line[200];
+    std::snprintf(line, sizeof line, "standing jump: %.0f units high, %.0f with the patch (x%.2f), %.0f after it",
+                  before, on, before > 0 ? on / before : 0.0, after);
+    s.notes.push_back(line);
+    if (before <= 10.f) p.Problem("the player didn't jump (" + std::to_string(before) + " units)");
+    else {
+        if (on < before * 1.6f) p.Problem("with the patch the jump isn't higher enough: " + std::to_string(on) + " vs " + std::to_string(before));
+        if (std::abs(after - before) > before * 0.15f)
+            p.Problem("after the patch the jump is " + std::to_string(after) + ", not the " + std::to_string(before) + " of before");
+    }
+    set(true);      // As the player would have it
+    p.Check(1, true);
+    End(s);
+}
+#endif
 
 // Mirage step 5, with the self-test's own mods (tests/mods, put in selftest-mods by `memenu game-test`): load order and
 // what is left out, the world phase, a crashing mod caught and named while the rest go on (and left out next time),
@@ -3650,6 +3932,9 @@ void TestMirageLifecycle()
 void TestModule(Module& m)
 {
     Step& s = Begin("module " + m.Tab() + "/" + m.Name());
+    // Its column drawn open, however the player left it (a collapsed column draws none of its panels)
+    gui::OpenColumnForTest(m.Tab().c_str());
+    struct CloseColumn { ~CloseColumn() { gui::OpenColumnForTest(""); } } closeColumn;
     const unsigned n = g_options.ticks;
     Probe p(s);
     const bool drawsHud = kDrawsHud.count(m.Name()) != 0;
@@ -3891,7 +4176,12 @@ const Named* FeatureList()
         {"Mirage mods", &TestMirageMods, false},
         {"Mirage lifecycle", &TestMirageLifecycle, false},
         {"Mirage hooks from mods", &TestMirageModHooks, false},
+        {"Cache system", &TestCacheSystem, false},
         {"Mirage content", &TestMirageContent, false},
+        {"Mirage textures", &TestMirageTextures, false},
+#if MEMENU_FEATURE_TAS
+        {"Mirage script patch", &TestMirageScriptPatch, true},
+#endif
         {"Engine script events", &TestEngineScriptEvents, false},
 #if MEMENU_FEATURE_FRAME_RATE
         {"Frame rate limit", &TestFrameRate, false},

@@ -3,6 +3,7 @@
 
 add_executable(memenu_tests
         test_math.cpp
+        test_cache_system.cpp
         test_mesh.cpp
         test_replay.cpp
         test_timeline.cpp
@@ -45,6 +46,8 @@ add_executable(memenu_tests
         ${CMAKE_SOURCE_DIR}/src/core/scheduler.cpp
         ${CMAKE_SOURCE_DIR}/src/core/clock.cpp
         ${CMAKE_SOURCE_DIR}/src/core/cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cache_evict.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cache_sched.cpp
         ${CMAKE_SOURCE_DIR}/src/core/memory_cache.cpp
         ${CMAKE_SOURCE_DIR}/src/core/signature_cache.cpp
         ${CMAKE_SOURCE_DIR}/src/core/address_cache.cpp
@@ -92,10 +95,13 @@ gtest_discover_tests(installer_tests DISCOVERY_MODE PRE_TEST)
 if(MEMENU_UNREALLIB)
   add_executable(unreallib_tests
           test_unreallib.cpp
+          test_textures.cpp
+          ${CMAKE_SOURCE_DIR}/src/runtime/texture_files.cpp
+          ${CMAKE_SOURCE_DIR}/src/runtime/stb_impl.cpp
           ${CMAKE_SOURCE_DIR}/launcher/src/detect.cpp)
-  target_include_directories(unreallib_tests PRIVATE ${CMAKE_SOURCE_DIR}/launcher/src)
+  target_include_directories(unreallib_tests PRIVATE ${CMAKE_SOURCE_DIR}/launcher/src ${CMAKE_SOURCE_DIR}/src)
   target_compile_definitions(unreallib_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-  target_link_libraries(unreallib_tests PRIVATE GTest::gtest_main UnrealLib::UnrealLib shell32 advapi32)
+  target_link_libraries(unreallib_tests PRIVATE GTest::gtest_main UnrealLib::UnrealLib stb_headers shell32 advapi32)
   if(MSVC)
     target_compile_options(unreallib_tests PRIVATE /W4 /permissive- /utf-8)
   endif()
